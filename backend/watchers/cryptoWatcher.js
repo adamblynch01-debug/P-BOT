@@ -1,6 +1,6 @@
 const cron = require('node-cron');
 const axios = require('axios');
-const { supabase } = require('../server');
+const { supabase } = require('../db');
 
 function start() {
   if (!process.env.BLOCKCYPHER_TOKEN) {
