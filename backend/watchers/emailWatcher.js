@@ -1,7 +1,7 @@
 const Imap = require('imap');
 const { simpleParser } = require('mailparser');
 const axios = require('axios');
-const { supabase } = require('../server');
+const { supabase } = require('../db');
 
 let imapClient = null;
 let failCount = 0;
