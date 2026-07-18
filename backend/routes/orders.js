@@ -1,7 +1,7 @@
 const express = require('express');
 const router = express.Router();
 const { v4: uuidv4 } = require('uuid');
-const { supabase } = require('../server');
+const { supabase } = require('../db');
 const { generateNote } = require('../utils/noteGenerator');
 const { generateCryptoAddress } = require('../utils/cryptoUtils');
 const { notifyBot } = require('../utils/botNotify');
