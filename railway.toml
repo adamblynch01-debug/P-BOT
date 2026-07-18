@@ -1,0 +1,11 @@
+# Deploy backend and bot as two separate Railway services
+# in the same project so they can communicate internally
+
+[build]
+builder = "NIXPACKS"
+
+# Backend service — set this in the backend Railway service
+[deploy]
+startCommand = "node server.js"
+restartPolicyType = "ON_FAILURE"
+restartPolicyMaxRetries = 5
