@@ -1,6 +1,6 @@
 const express = require('express');
 const router = express.Router();
-const { supabase } = require('../server');
+const { supabase } = require('../db');
 
 // GET /api/stock/:product_id — get stock count
 router.get('/:product_id', async (req, res) => {
