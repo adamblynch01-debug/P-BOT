@@ -1,5 +1,5 @@
 const axios = require('axios');
-const { supabase } = require('../server');
+const { supabase } = require('../db');
 const { notifyBot } = require('./botNotify');
 
 async function deliver(order) {
