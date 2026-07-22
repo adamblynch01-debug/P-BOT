@@ -2,7 +2,7 @@ const express = require('express');
 const router = express.Router();
 const { query } = require('../db');
 const {
-  hashPassword, verifyPassword, createSession, requireAuth, publicUser,
+  hashPassword, verifyPassword, createSession, requireAuth, requireAdmin, publicUser,
 } = require('../utils/auth');
 
 const GUILD_ID = process.env.GUILD_ID;
@@ -146,6 +146,118 @@ router.post('/ban', async (req, res) => {
     res.json({ success: true, user: rows[0] });
   } catch (err) {
     res.status(500).json({ error: 'Failed to update ban state' });
+  }
+});
+
+// ─── GET /api/auth/admin/users ───────────────────────────
+// Admin panel user list — reads the real web_users table (replaces the old
+// localStorage `ghostUsers`). Passwords are scrypt-hashed and NEVER returned;
+// "view login" is no longer possible by design, so the panel shows metadata
+// and offers a reset instead.
+router.get('/admin/users', requireAdmin, async (req, res) => {
+  try {
+    const { rows } = await query(
+      `SELECT u.id, u.username, u.email, u.role, u.discord_id, u.discord_verified,
+              u.banned, u.created_at, u.last_login_at, COALESCE(b.balance_cents, 0) AS balance_cents
+       FROM web_users u
+       LEFT JOIN balances b ON b.web_user_id = u.id
+       WHERE u.guild_id = $1
+       ORDER BY u.created_at DESC`,
+      [GUILD_ID]
+    );
+    res.json({
+      users: rows.map(r => ({
+        id: String(r.id),
+        username: r.username,
+        email: r.email,
+        role: r.role,
+        discord_id: r.discord_id,
+        discord_verified: r.discord_verified,
+        banned: r.banned,
+        created_at: r.created_at,
+        last_login_at: r.last_login_at,
+        balance: Number(r.balance_cents) / 100,
+      })),
+    });
+  } catch (err) {
+    console.error('[Auth] Admin users error:', err);
+    res.status(500).json({ error: 'Failed to fetch users' });
+  }
+});
+
+// ─── POST /api/auth/admin/reset-password ─────────────────
+// Admin sets a new password for a user by id. Hashes it, and invalidates all
+// of that user's sessions so the old credentials stop working immediately.
+router.post('/admin/reset-password', requireAdmin, async (req, res) => {
+  try {
+    const { user_id, new_password } = req.body;
+    if (!user_id || !new_password) return res.status(400).json({ error: 'user_id and new_password are required' });
+    if (String(new_password).length < 6) return res.status(400).json({ error: 'Password must be at least 6 characters' });
+
+    const password_hash = hashPassword(String(new_password));
+    const { rows } = await query(
+      `UPDATE web_users SET password_hash = $1 WHERE id = $2 AND guild_id = $3 RETURNING id, username`,
+      [password_hash, user_id, GUILD_ID]
+    );
+    if (!rows.length) return res.status(404).json({ error: 'User not found' });
+    await query('DELETE FROM web_sessions WHERE web_user_id = $1', [user_id]);
+    res.json({ success: true, user: { id: String(rows[0].id), username: rows[0].username } });
+  } catch (err) {
+    console.error('[Auth] Admin reset-password error:', err);
+    res.status(500).json({ error: 'Failed to reset password' });
+  }
+});
+
+// ─── POST /api/auth/admin/set-role ───────────────────────
+// Session-gated (admin) counterpart to the secret-gated /set-role above, by
+// user id, so the panel can promote/demote without the API_SECRET.
+router.post('/admin/set-role', requireAdmin, async (req, res) => {
+  try {
+    const { user_id, role } = req.body;
+    if (!['member', 'staff', 'admin', 'reseller'].includes(role)) {
+      return res.status(400).json({ error: 'Invalid role' });
+    }
+    const { rows } = await query(
+      `UPDATE web_users SET role = $1 WHERE id = $2 AND guild_id = $3 RETURNING id, username, role`,
+      [role, user_id, GUILD_ID]
+    );
+    if (!rows.length) return res.status(404).json({ error: 'User not found' });
+    res.json({ success: true, user: { ...rows[0], id: String(rows[0].id) } });
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to set role' });
+  }
+});
+
+// ─── POST /api/auth/admin/ban ────────────────────────────
+router.post('/admin/ban', requireAdmin, async (req, res) => {
+  try {
+    const { user_id, banned } = req.body;
+    const { rows } = await query(
+      `UPDATE web_users SET banned = $1 WHERE id = $2 AND guild_id = $3 RETURNING id, username, banned`,
+      [!!banned, user_id, GUILD_ID]
+    );
+    if (!rows.length) return res.status(404).json({ error: 'User not found' });
+    if (banned) await query('DELETE FROM web_sessions WHERE web_user_id = $1', [user_id]);
+    res.json({ success: true, user: { ...rows[0], id: String(rows[0].id) } });
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to update ban state' });
+  }
+});
+
+// ─── DELETE /api/auth/admin/user/:id ─────────────────────
+router.delete('/admin/user/:id', requireAdmin, async (req, res) => {
+  try {
+    if (String(req.params.id) === String(req.user.id)) {
+      return res.status(400).json({ error: 'You cannot delete your own account' });
+    }
+    const { rows } = await query(
+      `DELETE FROM web_users WHERE id = $1 AND guild_id = $2 RETURNING id`,
+      [req.params.id, GUILD_ID]
+    );
+    if (!rows.length) return res.status(404).json({ error: 'User not found' });
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to delete user' });
   }
 });
 
