@@ -19,6 +19,10 @@ app.use('/api/products', require('./routes/products'));
 app.use('/api/stock',    require('./routes/stock'));
 app.use('/api/config',   require('./routes/config'));
 app.use('/api/webhooks', require('./routes/webhooks'));
+app.use('/api/auth',     require('./routes/auth'));
+app.use('/api/balance',  require('./routes/balance'));
+app.use('/api/reviews',  require('./routes/reviews'));
+app.use('/api/status',   require('./routes/status'));
 
 // ─── Health ─────────────────────────────────────────────
 app.get('/health', (req, res) => res.json({ status: 'ok', store: process.env.STORE_NAME || 'H8ED Shop' }));

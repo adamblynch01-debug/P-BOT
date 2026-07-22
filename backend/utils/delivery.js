@@ -34,6 +34,24 @@ async function deliver(order) {
     const deliveredGoods = [];
 
     for (const item of items) {
+      if (item.id === 'balance-topup') {
+        if (order.web_user_id) {
+          await query(
+            `UPDATE balances SET balance_cents = balance_cents + $1, updated_at = now() WHERE web_user_id = $2`,
+            [Math.round((item.price || 0) * 100), order.web_user_id]
+          );
+          await query(
+            `INSERT INTO transactions (guild_id, web_user_id, kind, amount_cents, description, order_id)
+             VALUES ($1,$2,'credit',$3,$4,$5)`,
+            [GUILD_ID, order.web_user_id, Math.round((item.price || 0) * 100), `Balance top-up (order #${order.id})`, order.id]
+          );
+          deliveredGoods.push({ product: 'Balance Top-Up', items: [`+$${(item.price || 0).toFixed(2)} credited`] });
+        } else {
+          deliveredGoods.push({ product: 'Balance Top-Up', items: ['NO_ACCOUNT_LINKED'] });
+        }
+        continue;
+      }
+
       const tier = await lookupTier(item.id);
 
       if (!tier) {

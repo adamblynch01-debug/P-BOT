@@ -1,0 +1,127 @@
+const express = require('express');
+const router = express.Router();
+const { query } = require('../db');
+const { requireAuth, publicUser } = require('../utils/auth');
+
+const GUILD_ID = process.env.GUILD_ID;
+
+// ─── GET /api/balance/mine ───────────────────────────────
+router.get('/mine', requireAuth, async (req, res) => {
+  try {
+    const { rows } = await query(
+      `SELECT kind, amount_cents, description, order_id, created_at
+       FROM transactions WHERE web_user_id = $1 ORDER BY created_at DESC LIMIT 100`,
+      [req.user.id]
+    );
+    res.json({
+      balance_cents: req.user.balance_cents || 0,
+      balance: (req.user.balance_cents || 0) / 100,
+      transactions: rows.map(r => ({
+        kind: r.kind,
+        amount: r.amount_cents / 100,
+        description: r.description,
+        order_id: r.order_id ? String(r.order_id) : null,
+        created_at: r.created_at,
+      })),
+    });
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to fetch balance' });
+  }
+});
+
+// ─── POST /api/balance/topup/create ─────────────────────
+// Uses the same order pipeline as checkout (fees, crypto address, Discord
+// notify) with a single synthetic "balance top-up" line item; delivery.js
+// recognizes item.id === 'balance-topup' and credits the wallet instead of
+// claiming stock once the order is confirmed paid.
+router.post('/topup/create', requireAuth, async (req, res) => {
+  try {
+    const { amount, payment_method } = req.body;
+    const amt = parseFloat(amount);
+    if (!amt || amt <= 0) return res.status(400).json({ error: 'Invalid amount' });
+    if (!['cashapp', 'paypal', 'btc', 'ltc'].includes(payment_method)) {
+      return res.status(400).json({ error: 'Invalid payment method for top-up' });
+    }
+
+    const { createOrder } = require('./orders');
+    const { order, payment_info, total, fee_note } = await createOrder({
+      items: [{ id: 'balance-topup', name: 'Balance Top-Up', price: amt, qty: 1 }],
+      email: req.user.email,
+      discord_id: req.user.discord_id,
+      payment_method,
+      web_user_id: req.user.id,
+    });
+
+    res.json({
+      success: true,
+      order_id: String(order.id),
+      payment_method,
+      payment_info,
+      total,
+      fee_note,
+      expires_at: order.expires_at,
+    });
+  } catch (err) {
+    console.error('[Balance] Topup create error:', err);
+    res.status(500).json({ error: 'Failed to start top-up' });
+  }
+});
+
+// ─── GET /api/balance/by-discord/:discordId ──────────────
+// Used by SUPERBOT's /web-balance command.
+router.get('/by-discord/:discordId', async (req, res) => {
+  try {
+    const { secret } = req.query;
+    if (secret !== process.env.API_SECRET) return res.status(401).json({ error: 'Unauthorized' });
+    const { rows } = await query(
+      `SELECT u.username, u.email, b.balance_cents FROM web_users u
+       LEFT JOIN balances b ON b.web_user_id = u.id
+       WHERE u.guild_id = $1 AND u.discord_id = $2`,
+      [GUILD_ID, req.params.discordId]
+    );
+    if (!rows.length) return res.status(404).json({ error: 'No linked account for that Discord user' });
+    const r = rows[0];
+    res.json({ username: r.username, email: r.email, balance_cents: r.balance_cents || 0, balance: (r.balance_cents || 0) / 100 });
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to fetch balance' });
+  }
+});
+
+// ─── POST /api/balance/adjust ────────────────────────────
+// Admin/bot-driven credit or debit, e.g. manual top-up confirmation or a
+// refund. Gated by API_SECRET like the rest of this backend's internal ops.
+router.post('/adjust', async (req, res) => {
+  try {
+    const { secret, username, discord_id, amount_cents, description } = req.body;
+    if (secret !== process.env.API_SECRET) return res.status(401).json({ error: 'Unauthorized' });
+    if (!amount_cents || !Number.isInteger(amount_cents)) {
+      return res.status(400).json({ error: 'amount_cents must be a non-zero integer (negative to debit)' });
+    }
+    if (!username && !discord_id) return res.status(400).json({ error: 'username or discord_id is required' });
+
+    const { rows: userRows } = await query(
+      `SELECT id FROM web_users WHERE guild_id = $1 AND ${username ? 'lower(username) = lower($2)' : 'discord_id = $2'}`,
+      [GUILD_ID, username || discord_id]
+    );
+    if (!userRows.length) return res.status(404).json({ error: 'User not found' });
+    const webUserId = userRows[0].id;
+
+    const { rows } = await query(
+      `UPDATE balances SET balance_cents = balance_cents + $1, updated_at = now()
+       WHERE web_user_id = $2 RETURNING balance_cents`,
+      [amount_cents, webUserId]
+    );
+    await query(
+      `INSERT INTO transactions (guild_id, web_user_id, kind, amount_cents, description)
+       VALUES ($1,$2,$3,$4,$5)`,
+      [GUILD_ID, webUserId, amount_cents >= 0 ? 'credit' : 'debit', Math.abs(amount_cents), description || 'Manual adjustment']
+    );
+
+    res.json({ success: true, balance_cents: rows[0].balance_cents, balance: rows[0].balance_cents / 100 });
+  } catch (err) {
+    console.error('[Balance] Adjust error:', err);
+    res.status(500).json({ error: 'Failed to adjust balance' });
+  }
+});
+
+module.exports = router;
