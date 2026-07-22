@@ -25,12 +25,13 @@ async function isAuthorizedOrAdmin(req) {
 router.get('/', async (req, res) => {
   try {
     const { rows } = await query(
-      `SELECT t.id, t.label, t.price_cents, t.stock_type, t.delivery_type,
-              p.id AS product_id, p.name, p.game_name, p.tag, p.specs, p.platforms,
-              p.spoofer, p.sections, p.media, p.status, p.hidden
-       FROM product_tiers t
-       JOIN products p ON p.id = t.product_id
-       WHERE t.guild_id = $1 AND p.hidden = false
+      `SELECT t.id, t.label, t.price_cents, t.period, t.stock_type, t.delivery_type, t.sort_order AS tier_sort,
+              p.id AS product_id, p.name, p.game_name, p.subtitle, p.description,
+              p.tag, p.specs, p.platforms, p.spoofer, p.sections, p.media,
+              p.tab, p.dropdown, p.status, p.hidden
+       FROM products p
+       LEFT JOIN product_tiers t ON t.product_id = p.id
+       WHERE p.guild_id = $1 AND p.hidden = false
        ORDER BY p.sort_order DESC, t.sort_order ASC`,
       [GUILD_ID]
     );
@@ -38,10 +39,12 @@ router.get('/', async (req, res) => {
       id: r.id,
       product_id: r.product_id,
       tier_label: r.label,
-      name: `${r.name} (${r.label})`,
+      tier_period: r.period,
+      name: r.label ? `${r.name} (${r.label})` : r.name,
       product_name: r.name,
-      description: `${r.game_name} — ${r.label}`,
-      price: r.price_cents / 100,
+      subtitle: r.subtitle,
+      description: r.description || `${r.game_name}${r.label ? ' — ' + r.label : ''}`,
+      price: r.price_cents != null ? r.price_cents / 100 : null,
       category: r.game_name,
       tag: r.tag,
       specs: r.specs,
@@ -49,6 +52,8 @@ router.get('/', async (req, res) => {
       spoofer: r.spoofer,
       sections: r.sections,
       media: r.media,
+      tab: r.tab,
+      dropdown: r.dropdown,
       status: r.status,
       stock_type: r.stock_type,
       delivery_type: r.delivery_type,
@@ -113,7 +118,7 @@ router.get('/:id', async (req, res) => {
 router.post('/new', async (req, res) => {
   try {
     if (!(await isAuthorizedOrAdmin(req))) return res.status(401).json({ error: 'Unauthorized' });
-    const { game_name, name, tag, specs, platforms, spoofer, sections, media, status } = req.body;
+    const { game_name, name, subtitle, description, tag, specs, platforms, spoofer, sections, media, tab, dropdown, status } = req.body;
     if (!game_name || !name) return res.status(400).json({ error: 'game_name and name are required' });
 
     const { rows: maxRows } = await query(
@@ -121,11 +126,13 @@ router.post('/new', async (req, res) => {
       [GUILD_ID]
     );
     const { rows } = await query(
-      `INSERT INTO products (guild_id, game_name, name, tag, specs, platforms, spoofer, sections, media, status, sort_order)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) RETURNING *`,
+      `INSERT INTO products (guild_id, game_name, name, subtitle, description, tag, specs, platforms, spoofer, sections, media, tab, dropdown, status, sort_order)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15) RETURNING *`,
       [
-        GUILD_ID, game_name, name, tag || null, specs || null, platforms || null,
-        !!spoofer, JSON.stringify(sections || []), JSON.stringify(media || {}),
+        GUILD_ID, game_name, name, subtitle || null, description || null, tag || null,
+        specs || null, platforms || null, !!spoofer,
+        JSON.stringify(sections || []), JSON.stringify(media || {}),
+        tab || null, dropdown ? JSON.stringify(dropdown) : null,
         status || 'undetected', maxRows[0].next,
       ]
     );
@@ -141,28 +148,35 @@ router.post('/new', async (req, res) => {
 router.patch('/product/:id', async (req, res) => {
   try {
     if (!(await isAuthorizedOrAdmin(req))) return res.status(401).json({ error: 'Unauthorized' });
-    const { game_name, name, tag, specs, platforms, spoofer, sections, media, status, hidden, sort_order } = req.body;
+    const { game_name, name, subtitle, description, tag, specs, platforms, spoofer, sections, media, tab, dropdown, status, hidden, sort_order } = req.body;
     const { rows } = await query(
       `UPDATE products SET
-         game_name  = COALESCE($1, game_name),
-         name       = COALESCE($2, name),
-         tag        = COALESCE($3, tag),
-         specs      = COALESCE($4, specs),
-         platforms  = COALESCE($5, platforms),
-         spoofer    = COALESCE($6, spoofer),
-         sections   = COALESCE($7, sections),
-         media      = COALESCE($8, media),
-         status     = COALESCE($9, status),
-         hidden     = COALESCE($10, hidden),
-         sort_order = COALESCE($11, sort_order),
-         updated_at = now()
-       WHERE id = $12 AND guild_id = $13
+         game_name   = COALESCE($1, game_name),
+         name        = COALESCE($2, name),
+         subtitle    = COALESCE($3, subtitle),
+         description = COALESCE($4, description),
+         tag         = COALESCE($5, tag),
+         specs       = COALESCE($6, specs),
+         platforms   = COALESCE($7, platforms),
+         spoofer     = COALESCE($8, spoofer),
+         sections    = COALESCE($9, sections),
+         media       = COALESCE($10, media),
+         tab         = COALESCE($11, tab),
+         dropdown    = COALESCE($12, dropdown),
+         status      = COALESCE($13, status),
+         hidden      = COALESCE($14, hidden),
+         sort_order  = COALESCE($15, sort_order),
+         updated_at  = now()
+       WHERE id = $16 AND guild_id = $17
        RETURNING *`,
       [
-        game_name || null, name || null, tag || null, specs || null, platforms || null,
+        game_name || null, name || null, subtitle || null, description || null,
+        tag || null, specs || null, platforms || null,
         spoofer != null ? !!spoofer : null,
         sections ? JSON.stringify(sections) : null,
         media ? JSON.stringify(media) : null,
+        tab || null,
+        dropdown ? JSON.stringify(dropdown) : null,
         status || null, hidden != null ? !!hidden : null, sort_order != null ? sort_order : null,
         req.params.id, GUILD_ID,
       ]
@@ -191,12 +205,12 @@ router.delete('/product/:id', async (req, res) => {
 // tiers/pricing, matching what p-bot's flat model called a "product".
 router.post('/', async (req, res) => {
   try {
-    const { secret, product_id, name, price, stock_type, delivery_type } = req.body;
+    const { secret, product_id, name, price, period, stock_type, delivery_type } = req.body;
     if (!(await isAuthorizedOrAdmin(req))) return res.status(401).json({ error: 'Unauthorized' });
     const { rows } = await query(
-      `INSERT INTO product_tiers (product_id, guild_id, label, price_cents, stock_type, delivery_type)
-       VALUES ($1,$2,$3,$4,$5,$6) RETURNING *`,
-      [product_id, GUILD_ID, name, Math.round(parseFloat(price) * 100), stock_type || 'auto', delivery_type || 'auto']
+      `INSERT INTO product_tiers (product_id, guild_id, label, price_cents, period, stock_type, delivery_type)
+       VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING *`,
+      [product_id, GUILD_ID, name, Math.round(parseFloat(price) * 100), period || null, stock_type || 'auto', delivery_type || 'auto']
     );
     res.json({ success: true, product: rows[0] });
   } catch (err) {
@@ -206,19 +220,21 @@ router.post('/', async (req, res) => {
 
 router.patch('/:id', async (req, res) => {
   try {
-    const { secret, name, price, stock_type, delivery_type } = req.body;
+    const { secret, name, price, period, stock_type, delivery_type } = req.body;
     if (!(await isAuthorizedOrAdmin(req))) return res.status(401).json({ error: 'Unauthorized' });
     const { rows } = await query(
       `UPDATE product_tiers SET
          label = COALESCE($1, label),
          price_cents = COALESCE($2, price_cents),
-         stock_type = COALESCE($3, stock_type),
-         delivery_type = COALESCE($4, delivery_type)
-       WHERE id = $5 AND guild_id = $6
+         period = COALESCE($3, period),
+         stock_type = COALESCE($4, stock_type),
+         delivery_type = COALESCE($5, delivery_type)
+       WHERE id = $6 AND guild_id = $7
        RETURNING *`,
       [
         name || null,
         price != null ? Math.round(parseFloat(price) * 100) : null,
+        period || null,
         stock_type || null, delivery_type || null,
         req.params.id, GUILD_ID,
       ]
