@@ -52,6 +52,18 @@ async function deliver(order) {
         continue;
       }
 
+      // Donation / custom-amount: a user-set payment with no catalog product
+      // behind it (custom orders negotiated with staff, or tips). Record it
+      // cleanly and let the bot notify staff for manual fulfillment instead of
+      // running it through tier lookup (which would log PRODUCT_NOT_FOUND).
+      if (item.id === 'donation' || item.id === 'custom-amount') {
+        deliveredGoods.push({
+          product: item.name || 'Custom Payment',
+          items: [`$${(item.price || 0).toFixed(2)} received — manual fulfillment`],
+        });
+        continue;
+      }
+
       const tier = await lookupTier(item.id);
 
       if (!tier) {
