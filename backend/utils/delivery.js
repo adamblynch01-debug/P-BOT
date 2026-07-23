@@ -1,6 +1,7 @@
 const axios = require('axios');
 const { query } = require('../db');
 const { notifyBot } = require('./botNotify');
+const { sendOrderConfirmation } = require('./email');
 
 const GUILD_ID = process.env.GUILD_ID;
 
@@ -102,6 +103,11 @@ async function deliver(order) {
       discord_id: order.discord_id,
       goods: deliveredGoods,
     });
+
+    // Email confirmation — best-effort, never blocks the delivered state.
+    await sendOrderConfirmation(order, deliveredGoods).catch(e =>
+      console.error('[Delivery] Email notify failed:', e.message)
+    );
 
     console.log(`[Delivery] Order ${order.id} delivered`);
   } catch (err) {

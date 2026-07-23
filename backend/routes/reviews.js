@@ -2,6 +2,7 @@ const express = require('express');
 const router = express.Router();
 const { query } = require('../db');
 const { requireAuth, requireAdmin, getSessionUser, bearerToken } = require('../utils/auth');
+const { notifyBot } = require('../utils/botNotify');
 
 const GUILD_ID = process.env.GUILD_ID;
 
@@ -65,11 +66,36 @@ router.get('/admin/all', requireAdminOrBot, async (req, res) => {
 router.patch('/:id/approve', requireAdminOrBot, async (req, res) => {
   try {
     const { approved } = req.body;
+    const makeApproved = approved !== false;
+
+    // Guard the UPDATE on the *prior* approved state so a row is only returned
+    // on an actual transition — this makes the Discord vouch post fire exactly
+    // once, never again on repeated approve toggles.
     const { rows } = await query(
-      `UPDATE reviews SET approved = $1 WHERE id = $2 AND guild_id = $3 RETURNING *`,
-      [approved !== false, req.params.id, GUILD_ID]
+      `UPDATE reviews SET approved = $1
+       WHERE id = $2 AND guild_id = $3 AND approved IS DISTINCT FROM $1
+       RETURNING *`,
+      [makeApproved, req.params.id, GUILD_ID]
     );
-    if (!rows.length) return res.status(404).json({ error: 'Review not found' });
+    // No transition (already in that state) — still a success, just nothing to do.
+    if (!rows.length) return res.json({ success: true, unchanged: true });
+
+    const review = rows[0];
+    // Newly approved + came from the website → post it as a Discord vouch.
+    // Discord-sourced reviews are already visible in the server, so skip those.
+    if (makeApproved && review.source === 'website') {
+      notifyBot('web_review', {
+        guild_id: GUILD_ID,
+        review: {
+          id: String(review.id),
+          display_name: review.display_name,
+          rating: review.rating,
+          body: review.body,
+          product_id: review.product_id ? String(review.product_id) : null,
+          discord_id: review.discord_id || null,
+        },
+      }).catch(() => {});
+    }
     res.json({ success: true });
   } catch (err) {
     res.status(500).json({ error: 'Failed to update review' });

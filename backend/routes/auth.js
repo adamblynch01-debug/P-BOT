@@ -1,11 +1,29 @@
 const express = require('express');
 const router = express.Router();
+const axios = require('axios');
 const { query } = require('../db');
 const {
   hashPassword, verifyPassword, createSession, requireAuth, requireAdmin, publicUser,
 } = require('../utils/auth');
 
 const GUILD_ID = process.env.GUILD_ID;
+
+// SUPERBOT (Discord 2FA server) base URL — same service the storefront's 2FA
+// modal talks to, but here we call it server-to-server so the browser never
+// mediates the trust decision.
+const SUPERBOT_URL = process.env.SUPERBOT_URL || 'https://superbot-production-fcd7.up.railway.app';
+
+// In-memory map for passwordless Discord login: the SUPERBOT verification
+// session id (pending_id) → the web_user id we'll mint a token for once that
+// DM is confirmed. Lives only in this process (Railway single instance). The
+// browser is given pending_id but NEVER the user id or email, and can't forge
+// a login because only the real Discord account owner can click Authenticate
+// in the DM — that's what flips SUPERBOT's verify-token to verified.
+const discordLoginPending = new Map();
+function reapDiscordPending() {
+  const now = Date.now();
+  for (const [id, v] of discordLoginPending) if (v.expiresAt < now) discordLoginPending.delete(id);
+}
 
 // ─── POST /api/auth/signup ──────────────────────────────
 router.post('/signup', async (req, res) => {
@@ -244,6 +262,24 @@ router.post('/admin/ban', requireAdmin, async (req, res) => {
   }
 });
 
+// ─── POST /api/auth/panel-unlock ─────────────────────────
+// Backup gate for the admin panel's static unlock code. The website ships a
+// hardcoded fallback ('GHOST2024'), but if PANEL_PASSWORD is set on Railway
+// this endpoint lets you rotate that code WITHOUT re-uploading the HTML —
+// change the env var, redeploy, and the old code stops working. Returns only
+// a boolean; never echoes the configured value. Public (no session yet — this
+// IS the gate), but constant-info: same shape whether or not it matches.
+router.post('/panel-unlock', async (req, res) => {
+  try {
+    const { password } = req.body;
+    if (!password) return res.status(400).json({ error: 'password is required' });
+    const configured = process.env.PANEL_PASSWORD || 'GHOST2024';
+    res.json({ ok: String(password) === String(configured) });
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to verify panel password' });
+  }
+});
+
 // ─── DELETE /api/auth/admin/user/:id ─────────────────────
 router.delete('/admin/user/:id', requireAdmin, async (req, res) => {
   try {
@@ -258,6 +294,98 @@ router.delete('/admin/user/:id', requireAdmin, async (req, res) => {
     res.json({ success: true });
   } catch (err) {
     res.status(500).json({ error: 'Failed to delete user' });
+  }
+});
+
+// ─── POST /api/auth/discord-login/initiate ───────────────
+// Passwordless "Login with Discord" from the storefront login page. Given a
+// Discord User ID (or username), we look up the matching web_users row, then
+// ask SUPERBOT to DM that account an Authenticate button. We hand the browser
+// back only an opaque pending_id — never the account's email or user id — so
+// the page can poll for completion without learning anything about the target.
+router.post('/discord-login/initiate', async (req, res) => {
+  try {
+    reapDiscordPending();
+    const { discord_id } = req.body;
+    if (!discord_id) return res.status(400).json({ error: 'discord_id is required' });
+
+    // Match a linked account by discord_id. Login only proceeds for accounts
+    // that have actually linked + verified their Discord — otherwise anyone
+    // could type a stranger's Discord ID and DM-bomb them.
+    const { rows } = await query(
+      `SELECT id, email, username, banned FROM web_users
+       WHERE guild_id = $1 AND discord_id = $2 AND discord_verified = true`,
+      [GUILD_ID, String(discord_id).trim()]
+    );
+    const user = rows[0];
+    // Uniform response whether or not the account exists, so this endpoint
+    // can't be used to enumerate which Discord IDs have accounts. The DM
+    // simply never arrives for a non-account, which reads as "check your DMs".
+    if (!user || user.banned) {
+      const fakeId = require('crypto').randomUUID();
+      return res.json({ pending_id: fakeId, message: 'If that Discord account is linked, a verification DM has been sent.' });
+    }
+
+    let sbSessionId;
+    try {
+      const sb = await axios.post(`${SUPERBOT_URL}/api/auth/initiate-2fa`, {
+        email: user.email,
+        discordId: String(discord_id).trim(),
+      });
+      sbSessionId = sb.data && sb.data.userId;
+    } catch (e) {
+      return res.status(502).json({ error: 'Could not reach the Discord verification service. Try again.' });
+    }
+    if (!sbSessionId) return res.status(502).json({ error: 'Verification service did not start a session.' });
+
+    discordLoginPending.set(sbSessionId, { webUserId: user.id, expiresAt: Date.now() + 10 * 60 * 1000 });
+    res.json({ pending_id: sbSessionId, message: 'Verification DM sent — check your Discord.' });
+  } catch (err) {
+    console.error('[Auth] discord-login initiate error:', err);
+    res.status(500).json({ error: 'Failed to start Discord login' });
+  }
+});
+
+// ─── POST /api/auth/discord-login/poll ───────────────────
+// The page polls this with the pending_id. We ask SUPERBOT whether that DM was
+// clicked; only when it reports verified do we mint a real web_sessions token
+// and return the public user. The browser proved nothing itself — the trust
+// comes entirely from SUPERBOT confirming the Discord DM click.
+router.post('/discord-login/poll', async (req, res) => {
+  try {
+    reapDiscordPending();
+    const { pending_id } = req.body;
+    if (!pending_id) return res.status(400).json({ error: 'pending_id is required' });
+
+    const pending = discordLoginPending.get(pending_id);
+    if (!pending) return res.json({ verified: false }); // unknown/expired/decoy id
+
+    let verified = false;
+    try {
+      const sb = await axios.post(`${SUPERBOT_URL}/api/auth/verify-token`, { userId: pending_id });
+      verified = !!(sb.data && sb.data.verified);
+    } catch (e) {
+      return res.json({ verified: false });
+    }
+    if (!verified) return res.json({ verified: false });
+
+    // Confirmed — consume the pending entry and mint a session.
+    discordLoginPending.delete(pending_id);
+    const { rows } = await query(
+      `SELECT u.*, b.balance_cents FROM web_users u
+       LEFT JOIN balances b ON b.web_user_id = u.id
+       WHERE u.id = $1 AND u.guild_id = $2`,
+      [pending.webUserId, GUILD_ID]
+    );
+    const user = rows[0];
+    if (!user || user.banned) return res.json({ verified: false });
+
+    await query(`UPDATE web_users SET last_login_at = now() WHERE id = $1`, [user.id]);
+    const token = await createSession(user.id, GUILD_ID);
+    res.json({ verified: true, token, user: publicUser(user) });
+  } catch (err) {
+    console.error('[Auth] discord-login poll error:', err);
+    res.status(500).json({ error: 'Failed to verify Discord login' });
   }
 });
 
