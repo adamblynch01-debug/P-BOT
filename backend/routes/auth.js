@@ -69,7 +69,7 @@ const OAUTH_REDIRECT_URI = `${BACKEND_PUBLIC_URL}/api/auth/discord-oauth/callbac
 // Origins the callback is allowed to redirect the browser back to. Prevents an
 // attacker from using our OAuth start as an open redirect. First entry is the
 // default when no valid return_to is supplied.
-const STOREFRONT_ORIGINS = (process.env.STOREFRONT_ORIGINS || 'https://ghost-store.netlify.app')
+const STOREFRONT_ORIGINS = (process.env.STOREFRONT_ORIGINS || 'https://resonant-puppy-49484b.netlify.app')
   .split(',').map(s => s.trim().replace(/\/$/, '')).filter(Boolean);
 const oauthStates = new Map(); // state → { returnTo, expiresAt }
 function reapOauthStates() {
