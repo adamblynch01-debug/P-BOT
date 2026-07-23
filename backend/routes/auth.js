@@ -25,6 +25,130 @@ function reapDiscordPending() {
   for (const [id, v] of discordLoginPending) if (v.expiresAt < now) discordLoginPending.delete(id);
 }
 
+// Shared by both login paths (typed Discord ID + OAuth callback): given a real,
+// trusted Discord user id, look up the linked+verified web_users row and ask
+// SUPERBOT to DM it an Authenticate button. Returns an opaque pending_id the
+// browser can poll — never the account email/id. Returns { pending_id } on a
+// decoy too (unknown/banned account) so nothing is enumerable; only a real
+// linked account actually receives the DM.
+async function beginDiscordLogin(discordId) {
+  const id = String(discordId).trim();
+  const { rows } = await query(
+    `SELECT id, email, username, banned FROM web_users
+     WHERE guild_id = $1 AND discord_id = $2 AND discord_verified = true`,
+    [GUILD_ID, id]
+  );
+  const user = rows[0];
+  if (!user || user.banned) {
+    return { pending_id: require('crypto').randomUUID(), decoy: true };
+  }
+  const sb = await axios.post(`${SUPERBOT_URL}/api/auth/initiate-2fa`, {
+    email: user.email,
+    discordId: id,
+  });
+  const sbSessionId = sb.data && sb.data.userId;
+  if (!sbSessionId) throw new Error('Verification service did not start a session.');
+  discordLoginPending.set(sbSessionId, { webUserId: user.id, expiresAt: Date.now() + 10 * 60 * 1000 });
+  return { pending_id: sbSessionId };
+}
+
+// ─── Discord OAuth login (passwordless, no typed ID) ─────
+// The storefront is a static page on Netlify, so the OAuth client secret can't
+// live there — the whole exchange happens here on the backend. Flow:
+//   1. Browser → GET /discord-oauth/start?return_to=<origin>
+//   2. We redirect to Discord's authorize page (scope=identify only).
+//   3. Discord → GET /discord-oauth/callback?code&state
+//   4. We swap the code for a token, read the REAL discord id from /users/@me
+//      (the browser never gets to assert its own id), start the DM 2FA, then
+//      bounce the browser back to the storefront with ?discord_login=<pending_id>
+//      so the existing poll loop finishes the login on the DM click.
+const OAUTH_CLIENT_ID = process.env.DISCORD_CLIENT_ID || process.env.CLIENT_ID;
+const OAUTH_CLIENT_SECRET = process.env.DISCORD_CLIENT_SECRET;
+const BACKEND_PUBLIC_URL = (process.env.BACKEND_PUBLIC_URL || 'https://captivating-happiness-production-c944.up.railway.app').replace(/\/$/, '');
+const OAUTH_REDIRECT_URI = `${BACKEND_PUBLIC_URL}/api/auth/discord-oauth/callback`;
+// Origins the callback is allowed to redirect the browser back to. Prevents an
+// attacker from using our OAuth start as an open redirect. First entry is the
+// default when no valid return_to is supplied.
+const STOREFRONT_ORIGINS = (process.env.STOREFRONT_ORIGINS || 'https://ghost-store.netlify.app')
+  .split(',').map(s => s.trim().replace(/\/$/, '')).filter(Boolean);
+const oauthStates = new Map(); // state → { returnTo, expiresAt }
+function reapOauthStates() {
+  const now = Date.now();
+  for (const [s, v] of oauthStates) if (v.expiresAt < now) oauthStates.delete(s);
+}
+function pickReturnTo(raw) {
+  if (raw) {
+    try {
+      const origin = new URL(raw).origin;
+      if (STOREFRONT_ORIGINS.includes(origin)) return origin;
+    } catch (_) { /* fall through to default */ }
+  }
+  return STOREFRONT_ORIGINS[0];
+}
+
+router.get('/discord-oauth/start', (req, res) => {
+  reapOauthStates();
+  if (!OAUTH_CLIENT_ID || !OAUTH_CLIENT_SECRET) {
+    return res.status(500).send('Discord OAuth is not configured on the server.');
+  }
+  const state = require('crypto').randomBytes(16).toString('hex');
+  const returnTo = pickReturnTo(req.query.return_to);
+  oauthStates.set(state, { returnTo, expiresAt: Date.now() + 10 * 60 * 1000 });
+  const url = 'https://discord.com/oauth2/authorize?' + new URLSearchParams({
+    client_id: OAUTH_CLIENT_ID,
+    redirect_uri: OAUTH_REDIRECT_URI,
+    response_type: 'code',
+    scope: 'identify',
+    state,
+    prompt: 'consent',
+  }).toString();
+  res.redirect(url);
+});
+
+router.get('/discord-oauth/callback', async (req, res) => {
+  reapOauthStates();
+  const { code, state } = req.query;
+  const entry = state && oauthStates.get(state);
+  const returnTo = entry ? entry.returnTo : STOREFRONT_ORIGINS[0];
+  if (state) oauthStates.delete(state);
+
+  const bounce = (params) => res.redirect(`${returnTo}/?${new URLSearchParams(params).toString()}`);
+
+  if (!code || !entry) {
+    return bounce({ discord_login_error: 'Login was cancelled or the request expired. Please try again.' });
+  }
+
+  try {
+    const tokenRes = await axios.post('https://discord.com/api/oauth2/token',
+      new URLSearchParams({
+        client_id: OAUTH_CLIENT_ID,
+        client_secret: OAUTH_CLIENT_SECRET,
+        grant_type: 'authorization_code',
+        code: String(code),
+        redirect_uri: OAUTH_REDIRECT_URI,
+      }).toString(),
+      { headers: { 'Content-Type': 'application/x-www-form-urlencoded' } }
+    );
+    const accessToken = tokenRes.data && tokenRes.data.access_token;
+    if (!accessToken) return bounce({ discord_login_error: 'Discord did not return an access token.' });
+
+    const me = await axios.get('https://discord.com/api/users/@me', {
+      headers: { Authorization: `Bearer ${accessToken}` },
+    });
+    const discordId = me.data && me.data.id;
+    if (!discordId) return bounce({ discord_login_error: 'Could not read your Discord account.' });
+
+    const { pending_id, decoy } = await beginDiscordLogin(discordId);
+    // A verified linked account gets the DM; a decoy (no linked account) still
+    // returns a pending_id that will simply never verify. Either way the page
+    // shows "check your DMs", so this can't be used to probe who has an account.
+    return bounce({ discord_login: pending_id, ...(decoy ? { discord_login_hint: 'no_account' } : {}) });
+  } catch (err) {
+    console.error('[Auth] discord-oauth callback error:', err.response?.data || err.message);
+    return bounce({ discord_login_error: 'Discord login failed. Please try again.' });
+  }
+});
+
 // ─── POST /api/auth/signup ──────────────────────────────
 router.post('/signup', async (req, res) => {
   try {
@@ -309,37 +433,15 @@ router.post('/discord-login/initiate', async (req, res) => {
     const { discord_id } = req.body;
     if (!discord_id) return res.status(400).json({ error: 'discord_id is required' });
 
-    // Match a linked account by discord_id. Login only proceeds for accounts
-    // that have actually linked + verified their Discord — otherwise anyone
-    // could type a stranger's Discord ID and DM-bomb them.
-    const { rows } = await query(
-      `SELECT id, email, username, banned FROM web_users
-       WHERE guild_id = $1 AND discord_id = $2 AND discord_verified = true`,
-      [GUILD_ID, String(discord_id).trim()]
-    );
-    const user = rows[0];
-    // Uniform response whether or not the account exists, so this endpoint
-    // can't be used to enumerate which Discord IDs have accounts. The DM
-    // simply never arrives for a non-account, which reads as "check your DMs".
-    if (!user || user.banned) {
-      const fakeId = require('crypto').randomUUID();
-      return res.json({ pending_id: fakeId, message: 'If that Discord account is linked, a verification DM has been sent.' });
-    }
-
-    let sbSessionId;
+    let result;
     try {
-      const sb = await axios.post(`${SUPERBOT_URL}/api/auth/initiate-2fa`, {
-        email: user.email,
-        discordId: String(discord_id).trim(),
-      });
-      sbSessionId = sb.data && sb.data.userId;
+      result = await beginDiscordLogin(discord_id);
     } catch (e) {
       return res.status(502).json({ error: 'Could not reach the Discord verification service. Try again.' });
     }
-    if (!sbSessionId) return res.status(502).json({ error: 'Verification service did not start a session.' });
-
-    discordLoginPending.set(sbSessionId, { webUserId: user.id, expiresAt: Date.now() + 10 * 60 * 1000 });
-    res.json({ pending_id: sbSessionId, message: 'Verification DM sent — check your Discord.' });
+    // Uniform response whether or not the account exists (decoy pending_id),
+    // so this endpoint can't enumerate which Discord IDs have accounts.
+    res.json({ pending_id: result.pending_id, message: 'If that Discord account is linked, a verification DM has been sent.' });
   } catch (err) {
     console.error('[Auth] discord-login initiate error:', err);
     res.status(500).json({ error: 'Failed to start Discord login' });
