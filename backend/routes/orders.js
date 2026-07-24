@@ -181,6 +181,22 @@ router.get('/admin/list', requireAdmin, async (req, res) => {
   }
 });
 
+// ─── GET /api/orders/admin/user/:userId ─────────────────
+// One user's order history for the admin panel's per-user detail view.
+// The admin Users tab reads real accounts from web_users, which carry no
+// embedded purchase list — their orders live only in the `orders` table.
+router.get('/admin/user/:userId', requireAdmin, async (req, res) => {
+  try {
+    const { rows } = await query(
+      `SELECT * FROM orders WHERE guild_id = $1 AND web_user_id = $2 ORDER BY created_at DESC LIMIT 200`,
+      [GUILD_ID, req.params.userId]
+    );
+    res.json({ orders: rows.map(formatOrder) });
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to fetch user orders' });
+  }
+});
+
 function formatOrder(data) {
   return {
     order_id: String(data.id),
