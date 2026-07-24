@@ -149,6 +149,12 @@ router.patch('/product/:id', async (req, res) => {
   try {
     if (!(await isAuthorizedOrAdmin(req))) return res.status(401).json({ error: 'Unauthorized' });
     const { game_name, name, subtitle, description, tag, specs, platforms, spoofer, sections, media, tab, dropdown, status, hidden, sort_order } = req.body;
+    // `tab` (subtab / game-title) must be clearable, not just settable. COALESCE
+    // can never write NULL, so an admin moving a product back to "no subtab"
+    // could never un-assign it. When the caller includes a `tab` key we honor it
+    // verbatim (empty string → NULL); when the key is absent we keep the column.
+    const tabProvided = Object.prototype.hasOwnProperty.call(req.body, 'tab');
+    const tabValue = tab ? tab : null;
     const { rows } = await query(
       `UPDATE products SET
          game_name   = COALESCE($1, game_name),
@@ -161,13 +167,13 @@ router.patch('/product/:id', async (req, res) => {
          spoofer     = COALESCE($8, spoofer),
          sections    = COALESCE($9, sections),
          media       = COALESCE($10, media),
-         tab         = COALESCE($11, tab),
-         dropdown    = COALESCE($12, dropdown),
-         status      = COALESCE($13, status),
-         hidden      = COALESCE($14, hidden),
-         sort_order  = COALESCE($15, sort_order),
+         tab         = CASE WHEN $11 THEN $12 ELSE tab END,
+         dropdown    = COALESCE($13, dropdown),
+         status      = COALESCE($14, status),
+         hidden      = COALESCE($15, hidden),
+         sort_order  = COALESCE($16, sort_order),
          updated_at  = now()
-       WHERE id = $16 AND guild_id = $17
+       WHERE id = $17 AND guild_id = $18
        RETURNING *`,
       [
         game_name || null, name || null, subtitle || null, description || null,
@@ -175,7 +181,7 @@ router.patch('/product/:id', async (req, res) => {
         spoofer != null ? !!spoofer : null,
         sections ? JSON.stringify(sections) : null,
         media ? JSON.stringify(media) : null,
-        tab || null,
+        tabProvided, tabValue,
         dropdown ? JSON.stringify(dropdown) : null,
         status || null, hidden != null ? !!hidden : null, sort_order != null ? sort_order : null,
         req.params.id, GUILD_ID,
