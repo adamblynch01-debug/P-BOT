@@ -30,7 +30,7 @@ router.post('/update', async (req, res) => {
       'CASHAPP_CASHTAG', 'PAYPAL_EMAIL', 'GMAIL_USER', 'GMAIL_PASSWORD',
       'DISCORD_GUILD_ID', 'CASHAPP_FEE_PERCENT', 'PAYPAL_FEE_PERCENT',
       'CRYPTO_DISCOUNT_PERCENT', 'STORE_NAME', 'BTC_XPUB', 'LTC_XPUB',
-      'ORDER_LOG_CHANNEL_ID',
+      'ORDER_LOG_CHANNEL_ID', 'PANEL_PASSWORD', 'VAULT_PASSWORD',
     ];
 
     if (!allowed_keys.includes(key.toUpperCase())) {

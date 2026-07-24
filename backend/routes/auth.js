@@ -386,18 +386,35 @@ router.post('/admin/ban', requireAdmin, async (req, res) => {
   }
 });
 
+// ─── POST /api/auth/vault-unlock ─────────────────────────
+// Gate for the hidden vault's master password. Single source of truth is the
+// VAULT_PASSWORD env var (rotatable via Railway or POST /api/config/update,
+// which persists it to Supabase). No hardcoded fallback — if VAULT_PASSWORD is
+// unset the vault cannot be opened. Returns only a boolean; never echoes the value.
+router.post('/vault-unlock', async (req, res) => {
+  try {
+    const { password } = req.body;
+    if (!password) return res.status(400).json({ error: 'password is required' });
+    const configured = process.env.VAULT_PASSWORD;
+    if (!configured) return res.json({ ok: false });
+    res.json({ ok: String(password) === String(configured) });
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to verify vault password' });
+  }
+});
+
 // ─── POST /api/auth/panel-unlock ─────────────────────────
-// Backup gate for the admin panel's static unlock code. The website ships a
-// hardcoded fallback ('GHOST2024'), but if PANEL_PASSWORD is set on Railway
-// this endpoint lets you rotate that code WITHOUT re-uploading the HTML —
-// change the env var, redeploy, and the old code stops working. Returns only
-// a boolean; never echoes the configured value. Public (no session yet — this
-// IS the gate), but constant-info: same shape whether or not it matches.
+// Gate for the admin panel's static unlock code. Single source of truth is the
+// PANEL_PASSWORD env var (rotatable via Railway or POST /api/config/update,
+// which persists it to Supabase). No hardcoded fallback — if PANEL_PASSWORD is
+// unset the panel cannot be unlocked. Returns only a boolean; never echoes the
+// value. Public (no session yet — this IS the gate), constant-shape response.
 router.post('/panel-unlock', async (req, res) => {
   try {
     const { password } = req.body;
     if (!password) return res.status(400).json({ error: 'password is required' });
-    const configured = process.env.PANEL_PASSWORD || 'GHOST2024';
+    const configured = process.env.PANEL_PASSWORD;
+    if (!configured) return res.json({ ok: false });
     res.json({ ok: String(password) === String(configured) });
   } catch (err) {
     res.status(500).json({ error: 'Failed to verify panel password' });
