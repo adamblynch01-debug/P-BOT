@@ -158,6 +158,14 @@ router.post('/new', async (req, res) => {
     res.json({ success: true, product: rows[0] });
   } catch (err) {
     console.error('[Products] Create product error:', err);
+    // A duplicate (guild, game_name, name[, vault]) is an admin-correctable
+    // mistake, not a server fault — say so instead of a blank 500.
+    if (err.code === '23505') {
+      return res.status(409).json({
+        error: `A product named "${req.body.name}" already exists under "${req.body.game_name}"` +
+               (req.body.vault ? ' in the vault.' : '.'),
+      });
+    }
     res.status(500).json({ error: 'Failed to create product' });
   }
 });
@@ -241,6 +249,10 @@ router.post('/', async (req, res) => {
     );
     res.json({ success: true, product: rows[0] });
   } catch (err) {
+    console.error('[Products] Create tier error:', err);
+    if (err.code === '23505') {
+      return res.status(409).json({ error: `Tier "${req.body.name}" already exists on that product.` });
+    }
     res.status(500).json({ error: 'Failed to create product' });
   }
 });
