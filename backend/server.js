@@ -24,6 +24,7 @@ app.use('/api/balance',  require('./routes/balance'));
 app.use('/api/reviews',  require('./routes/reviews'));
 app.use('/api/status',   require('./routes/status'));
 app.use('/api/state',    require('./routes/state'));
+app.use('/api/reseller', require('./routes/reseller'));
 
 // ─── Health ─────────────────────────────────────────────
 app.get('/health', (req, res) => res.json({ status: 'ok', store: process.env.STORE_NAME || 'H8ED Shop' }));
