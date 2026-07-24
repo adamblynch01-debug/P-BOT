@@ -15,6 +15,33 @@ async function isAuthorizedOrAdmin(req) {
   return !!(user && ['admin', 'staff'].includes(user.role));
 }
 
+// ─── GET /api/stock/bulk?ids=1,2,3 ───────────────────────
+// One round-trip stock lookup for the whole catalog, so the storefront can
+// badge every tier without firing a request per card. Returns a map keyed by
+// tier_id → available count (only tiers that HAVE unused rows appear; callers
+// treat a missing id as 0). MUST be declared before '/:product_id' or Express
+// routes "bulk" into the catch-all param.
+router.get('/bulk', async (req, res) => {
+  try {
+    const ids = String(req.query.ids || '')
+      .split(',')
+      .map(s => parseInt(s.trim(), 10))
+      .filter(n => Number.isInteger(n));
+    if (!ids.length) return res.json({ stock: {} });
+    const { rows } = await query(
+      `SELECT tier_id, COUNT(*)::int AS n FROM product_stock
+       WHERE guild_id = $1 AND used = false AND tier_id = ANY($2::int[])
+       GROUP BY tier_id`,
+      [GUILD_ID, ids]
+    );
+    const stock = {};
+    for (const r of rows) stock[r.tier_id] = r.n;
+    res.json({ stock });
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to fetch bulk stock' });
+  }
+});
+
 router.get('/:product_id', async (req, res) => {
   try {
     const { rows } = await query(

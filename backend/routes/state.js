@@ -33,6 +33,7 @@ const KEY_ACL = {
   ghostStatuses:           'public',
   ghostStatusHidden:       'public',
   ghostNFALoaderURL:       'public',
+  ghostDiscordInvite:      'public',
 
   // ── admin-only site records ──
   ghostInventory:          'admin',
