@@ -31,6 +31,7 @@ const KEY_ACL = {
   ghostDownloads:          'public',
   ghostVaultDownloads:     'public',
   ghostStatuses:           'public',
+  ghostStatusHidden:       'public',
   ghostNFALoaderURL:       'public',
 
   // ── admin-only site records ──
