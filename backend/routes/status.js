@@ -17,7 +17,7 @@ router.get('/', async (req, res) => {
               COALESCE(ps.status, p.status) AS status, ps.note, COALESCE(ps.updated_at, p.updated_at) AS updated_at
        FROM products p
        LEFT JOIN product_status ps ON ps.product_id = p.id
-       WHERE p.guild_id = $1 AND p.hidden = false
+       WHERE p.guild_id = $1 AND p.hidden = false AND p.vault = false
        ORDER BY p.game_name ASC, p.sort_order DESC`,
       [GUILD_ID]
     );
@@ -33,6 +33,35 @@ router.get('/', async (req, res) => {
     });
   } catch (err) {
     res.status(500).json({ error: 'Failed to fetch status' });
+  }
+});
+
+// ─── GET /api/status/vault ───────────────────────────────
+// Vault-side product status (vault = true). Backs the /post-status-vault bot
+// command and any vault status view. Same shape as GET /.
+router.get('/vault', async (req, res) => {
+  try {
+    const { rows } = await query(
+      `SELECT p.id AS product_id, p.game_name, p.name AS product_name,
+              COALESCE(ps.status, p.status) AS status, ps.note, COALESCE(ps.updated_at, p.updated_at) AS updated_at
+       FROM products p
+       LEFT JOIN product_status ps ON ps.product_id = p.id
+       WHERE p.guild_id = $1 AND p.hidden = false AND p.vault = true
+       ORDER BY p.game_name ASC, p.sort_order DESC`,
+      [GUILD_ID]
+    );
+    res.json({
+      statuses: rows.map(r => ({
+        product_id: String(r.product_id),
+        game_name: r.game_name,
+        product_name: r.product_name,
+        status: r.status,
+        note: r.note,
+        updated_at: r.updated_at,
+      })),
+    });
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to fetch vault status' });
   }
 });
 

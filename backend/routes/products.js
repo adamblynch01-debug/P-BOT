@@ -22,45 +22,64 @@ async function isAuthorizedOrAdmin(req) {
 // so it's kept working but adapted minimally: a "product" here is really a
 // priced tier (product_tiers row) joined with its parent product for context.
 
+// Shared catalog projection so GET / (main) and GET /vault return the exact
+// same shape; only the `vault` filter differs.
+function mapCatalogRow(r) {
+  return {
+    id: r.id,
+    product_id: r.product_id,
+    tier_label: r.label,
+    tier_period: r.period,
+    name: r.label ? `${r.name} (${r.label})` : r.name,
+    product_name: r.name,
+    subtitle: r.subtitle,
+    description: r.description || `${r.game_name}${r.label ? ' — ' + r.label : ''}`,
+    price: r.price_cents != null ? r.price_cents / 100 : null,
+    category: r.game_name,
+    tag: r.tag,
+    specs: r.specs,
+    platforms: r.platforms,
+    spoofer: r.spoofer,
+    sections: r.sections,
+    media: r.media,
+    tab: r.tab,
+    dropdown: r.dropdown,
+    status: r.status,
+    stock_type: r.stock_type,
+    delivery_type: r.delivery_type,
+    active: !r.hidden,
+  };
+}
+
+const CATALOG_SELECT =
+  `SELECT t.id, t.label, t.price_cents, t.period, t.stock_type, t.delivery_type, t.sort_order AS tier_sort,
+          p.id AS product_id, p.name, p.game_name, p.subtitle, p.description,
+          p.tag, p.specs, p.platforms, p.spoofer, p.sections, p.media,
+          p.tab, p.dropdown, p.status, p.hidden
+   FROM products p
+   LEFT JOIN product_tiers t ON t.product_id = p.id
+   WHERE p.guild_id = $1 AND p.hidden = false AND p.vault = $2
+   ORDER BY p.sort_order DESC, t.sort_order ASC`;
+
 router.get('/', async (req, res) => {
   try {
-    const { rows } = await query(
-      `SELECT t.id, t.label, t.price_cents, t.period, t.stock_type, t.delivery_type, t.sort_order AS tier_sort,
-              p.id AS product_id, p.name, p.game_name, p.subtitle, p.description,
-              p.tag, p.specs, p.platforms, p.spoofer, p.sections, p.media,
-              p.tab, p.dropdown, p.status, p.hidden
-       FROM products p
-       LEFT JOIN product_tiers t ON t.product_id = p.id
-       WHERE p.guild_id = $1 AND p.hidden = false
-       ORDER BY p.sort_order DESC, t.sort_order ASC`,
-      [GUILD_ID]
-    );
-    res.json(rows.map(r => ({
-      id: r.id,
-      product_id: r.product_id,
-      tier_label: r.label,
-      tier_period: r.period,
-      name: r.label ? `${r.name} (${r.label})` : r.name,
-      product_name: r.name,
-      subtitle: r.subtitle,
-      description: r.description || `${r.game_name}${r.label ? ' — ' + r.label : ''}`,
-      price: r.price_cents != null ? r.price_cents / 100 : null,
-      category: r.game_name,
-      tag: r.tag,
-      specs: r.specs,
-      platforms: r.platforms,
-      spoofer: r.spoofer,
-      sections: r.sections,
-      media: r.media,
-      tab: r.tab,
-      dropdown: r.dropdown,
-      status: r.status,
-      stock_type: r.stock_type,
-      delivery_type: r.delivery_type,
-      active: !r.hidden,
-    })));
+    const { rows } = await query(CATALOG_SELECT, [GUILD_ID, false]);
+    res.json(rows.map(mapCatalogRow));
   } catch (err) {
     res.status(500).json({ error: 'Failed to fetch products' });
+  }
+});
+
+// ─── GET /api/products/vault ─────────────────────────────
+// Same shape as GET /, but the vault side of the catalog (vault = true).
+// Public read (statuses/prices/stock aren't secret; purchase is still gated by
+// a logged-in balance checkout).
+router.get('/vault', async (req, res) => {
+  try {
+    const { rows } = await query(CATALOG_SELECT, [GUILD_ID, true]);
+    res.json(rows.map(mapCatalogRow));
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to fetch vault products' });
   }
 });
 
@@ -118,7 +137,7 @@ router.get('/:id', async (req, res) => {
 router.post('/new', async (req, res) => {
   try {
     if (!(await isAuthorizedOrAdmin(req))) return res.status(401).json({ error: 'Unauthorized' });
-    const { game_name, name, subtitle, description, tag, specs, platforms, spoofer, sections, media, tab, dropdown, status } = req.body;
+    const { game_name, name, subtitle, description, tag, specs, platforms, spoofer, sections, media, tab, dropdown, status, vault } = req.body;
     if (!game_name || !name) return res.status(400).json({ error: 'game_name and name are required' });
 
     const { rows: maxRows } = await query(
@@ -126,14 +145,14 @@ router.post('/new', async (req, res) => {
       [GUILD_ID]
     );
     const { rows } = await query(
-      `INSERT INTO products (guild_id, game_name, name, subtitle, description, tag, specs, platforms, spoofer, sections, media, tab, dropdown, status, sort_order)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15) RETURNING *`,
+      `INSERT INTO products (guild_id, game_name, name, subtitle, description, tag, specs, platforms, spoofer, sections, media, tab, dropdown, status, vault, sort_order)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16) RETURNING *`,
       [
         GUILD_ID, game_name, name, subtitle || null, description || null, tag || null,
         specs || null, platforms || null, !!spoofer,
         JSON.stringify(sections || []), JSON.stringify(media || {}),
         tab || null, dropdown ? JSON.stringify(dropdown) : null,
-        status || 'undetected', maxRows[0].next,
+        status || 'undetected', !!vault, maxRows[0].next,
       ]
     );
     res.json({ success: true, product: rows[0] });
@@ -148,7 +167,7 @@ router.post('/new', async (req, res) => {
 router.patch('/product/:id', async (req, res) => {
   try {
     if (!(await isAuthorizedOrAdmin(req))) return res.status(401).json({ error: 'Unauthorized' });
-    const { game_name, name, subtitle, description, tag, specs, platforms, spoofer, sections, media, tab, dropdown, status, hidden, sort_order } = req.body;
+    const { game_name, name, subtitle, description, tag, specs, platforms, spoofer, sections, media, tab, dropdown, status, hidden, sort_order, vault } = req.body;
     // `tab` (subtab / game-title) must be clearable, not just settable. COALESCE
     // can never write NULL, so an admin moving a product back to "no subtab"
     // could never un-assign it. When the caller includes a `tab` key we honor it
@@ -172,6 +191,7 @@ router.patch('/product/:id', async (req, res) => {
          status      = COALESCE($14, status),
          hidden      = COALESCE($15, hidden),
          sort_order  = COALESCE($16, sort_order),
+         vault       = COALESCE($19, vault),
          updated_at  = now()
        WHERE id = $17 AND guild_id = $18
        RETURNING *`,
@@ -185,6 +205,7 @@ router.patch('/product/:id', async (req, res) => {
         dropdown ? JSON.stringify(dropdown) : null,
         status || null, hidden != null ? !!hidden : null, sort_order != null ? sort_order : null,
         req.params.id, GUILD_ID,
+        vault != null ? !!vault : null,
       ]
     );
     if (!rows.length) return res.status(404).json({ error: 'Product not found' });
