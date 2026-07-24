@@ -1,7 +1,7 @@
 const express = require('express');
 const router = express.Router();
 const { query } = require('../db');
-const { requireAuth, publicUser } = require('../utils/auth');
+const { requireAuth, requireAdmin, publicUser } = require('../utils/auth');
 
 const GUILD_ID = process.env.GUILD_ID;
 
@@ -120,6 +120,61 @@ router.post('/adjust', async (req, res) => {
     res.json({ success: true, balance_cents: rows[0].balance_cents, balance: rows[0].balance_cents / 100 });
   } catch (err) {
     console.error('[Balance] Adjust error:', err);
+    res.status(500).json({ error: 'Failed to adjust balance' });
+  }
+});
+
+// ─── POST /api/balance/admin/adjust ──────────────────────
+// Same as /adjust but gated by a logged-in admin/staff SESSION instead of the
+// API_SECRET, so the website's admin panel can credit/debit a member's main
+// site balance (the static site can never hold the secret). Looks the user up
+// by web_users id, username, or discord_id; upserts the balances row so it
+// works even for accounts that predate the signup balance seed.
+router.post('/admin/adjust', requireAdmin, async (req, res) => {
+  try {
+    const { user_id, username, discord_id, amount_cents, description } = req.body;
+    if (!amount_cents || !Number.isInteger(amount_cents)) {
+      return res.status(400).json({ error: 'amount_cents must be a non-zero integer (negative to debit)' });
+    }
+    if (!user_id && !username && !discord_id) {
+      return res.status(400).json({ error: 'user_id, username, or discord_id is required' });
+    }
+
+    let webUserId = user_id || null;
+    if (!webUserId) {
+      const { rows: userRows } = await query(
+        `SELECT id FROM web_users WHERE guild_id = $1 AND ${username ? 'lower(username) = lower($2)' : 'discord_id = $2'}`,
+        [GUILD_ID, username || discord_id]
+      );
+      if (!userRows.length) return res.status(404).json({ error: 'User not found' });
+      webUserId = userRows[0].id;
+    } else {
+      const { rows: exists } = await query('SELECT id FROM web_users WHERE guild_id = $1 AND id = $2', [GUILD_ID, webUserId]);
+      if (!exists.length) return res.status(404).json({ error: 'User not found' });
+    }
+
+    // Ensure a balances row exists (some accounts may predate the signup seed),
+    // then apply the delta. Debits are floored at 0 so an admin can't push a
+    // wallet negative. Avoids ON CONFLICT since balances has no guaranteed
+    // unique constraint on web_user_id in this schema.
+    const { rows: balRows } = await query('SELECT web_user_id FROM balances WHERE web_user_id = $1', [webUserId]);
+    if (!balRows.length) {
+      await query('INSERT INTO balances (web_user_id, guild_id, balance_cents) VALUES ($1,$2,0)', [webUserId, GUILD_ID]);
+    }
+    const { rows } = await query(
+      `UPDATE balances SET balance_cents = GREATEST(0, balance_cents + $1), updated_at = now()
+       WHERE web_user_id = $2 RETURNING balance_cents`,
+      [amount_cents, webUserId]
+    );
+    await query(
+      `INSERT INTO transactions (guild_id, web_user_id, kind, amount_cents, description)
+       VALUES ($1,$2,$3,$4,$5)`,
+      [GUILD_ID, webUserId, amount_cents >= 0 ? 'credit' : 'debit', Math.abs(amount_cents), description || 'Admin adjustment']
+    );
+
+    res.json({ success: true, balance_cents: rows[0].balance_cents, balance: rows[0].balance_cents / 100 });
+  } catch (err) {
+    console.error('[Balance] Admin adjust error:', err);
     res.status(500).json({ error: 'Failed to adjust balance' });
   }
 });
