@@ -53,8 +53,9 @@ async function beginDiscordLogin(discordId) {
 }
 
 // ─── Discord OAuth login (passwordless, no typed ID) ─────
-// The storefront is a static page on Netlify, so the OAuth client secret can't
-// live there — the whole exchange happens here on the backend. Flow:
+// The storefront is a static page (Cloudflare Pages at uhservices.xyz), so the
+// OAuth client secret can't live there — the whole exchange happens here on
+// the backend. Flow:
 //   1. Browser → GET /discord-oauth/start?return_to=<origin>
 //   2. We redirect to Discord's authorize page (scope=identify only).
 //   3. Discord → GET /discord-oauth/callback?code&state
@@ -69,7 +70,7 @@ const OAUTH_REDIRECT_URI = `${BACKEND_PUBLIC_URL}/api/auth/discord-oauth/callbac
 // Origins the callback is allowed to redirect the browser back to. Prevents an
 // attacker from using our OAuth start as an open redirect. First entry is the
 // default when no valid return_to is supplied.
-const STOREFRONT_ORIGINS = (process.env.STOREFRONT_ORIGINS || 'https://resonant-puppy-49484b.netlify.app')
+const STOREFRONT_ORIGINS = (process.env.STOREFRONT_ORIGINS || 'https://uhservices.xyz,https://www.uhservices.xyz')
   .split(',').map(s => s.trim().replace(/\/$/, '')).filter(Boolean);
 const oauthStates = new Map(); // state → { returnTo, expiresAt }
 function reapOauthStates() {
