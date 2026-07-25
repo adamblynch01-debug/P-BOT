@@ -84,8 +84,13 @@ async function deriveBTCAddress(order_id) {
   return deriveWithRetry('btc', order_id, (index) => {
     // Derive child key at m/0/index (external chain)
     const child = hdkey.derive(`m/0/${index}`);
-    // Generate P2PKH address (legacy) — compatible with most wallets
-    const { address } = bitcoin.payments.p2pkh({
+    // Native SegWit (bc1q…, BIP84). This MUST match the script type the
+    // merchant's wallet derives, not merely be "widely compatible": a wallet
+    // only scans the address type it generates. The same pubkey rendered as
+    // P2PKH is a different address, so legacy addresses here were invisible to
+    // a SegWit wallet — the customer pays, BlockCypher confirms, the bot
+    // delivers, and the funds sit at an address the merchant never watches.
+    const { address } = bitcoin.payments.p2wpkh({
       pubkey: child.publicKey,
       network: bitcoin.networks.bitcoin,
     });
@@ -127,7 +132,8 @@ async function deriveLTCAddress(order_id) {
 
   return deriveWithRetry('ltc', order_id, (index) => {
     const child = hdkey.derive(`m/0/${index}`);
-    const { address } = bitcoin.payments.p2pkh({
+    // Native SegWit (ltc1q…) via the bech32 prefix above — same reasoning as BTC.
+    const { address } = bitcoin.payments.p2wpkh({
       pubkey: child.publicKey,
       network: litecoin,
     });
