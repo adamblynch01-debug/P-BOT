@@ -8,6 +8,66 @@ const { attachUser, requireAuth, requireAdmin } = require('../utils/auth');
 
 const GUILD_ID = process.env.GUILD_ID;
 
+// Per-line qty ceiling, so a crafted cart can't ask delivery to claim an
+// unbounded number of keys in one order.
+const MAX_ITEM_QTY = 25;
+
+// Re-price a cart against product_tiers. The browser sends a price so it can
+// render a total, but that number is worthless as an authority: this is the
+// public checkout route, and `price` flows straight into the wallet debit.
+// A negative price would turn that debit into a credit, so every catalog line
+// is re-read from the DB and anything unpriceable is rejected outright when
+// the wallet is paying.
+async function repriceItems(items, { paidFromBalance }) {
+  const ids = items
+    .filter(i => /^\d+$/.test(String(i.id)))
+    .map(i => parseInt(String(i.id), 10));
+
+  const priced = {};
+  if (ids.length) {
+    const { rows } = await query(
+      `SELECT t.id, t.price_cents, t.label, p.name AS product_name
+       FROM product_tiers t JOIN products p ON p.id = t.product_id
+       WHERE t.guild_id = $1 AND t.id = ANY($2::bigint[])`,
+      [GUILD_ID, ids]
+    );
+    for (const r of rows) priced[String(r.id)] = r;
+  }
+
+  const out = [];
+  for (const item of items) {
+    const qty = parseInt(item.qty, 10) || 1;
+    if (!Number.isInteger(qty) || qty < 1 || qty > MAX_ITEM_QTY) {
+      return { error: `qty must be between 1 and ${MAX_ITEM_QTY}` };
+    }
+
+    const id = String(item.id);
+    const row = priced[id];
+
+    if (row) {
+      const cents = Number(row.price_cents) || 0;
+      if (cents <= 0) return { error: `"${row.product_name}" is quote-only and cannot be bought online` };
+      out.push({
+        id, qty,
+        name: row.label ? `${row.product_name} (${row.label})` : row.product_name,
+        price: cents / 100,
+      });
+      continue;
+    }
+
+    // Not a catalog tier: a user-set amount, or a legacy synthetic slug from
+    // the embedded catalog. Those still carry a client price, so they may only
+    // be paid for externally where a human confirms the amount received.
+    if (paidFromBalance) {
+      return { error: 'This item is not available for balance checkout. Please contact support.' };
+    }
+    const price = Number(item.price);
+    if (!Number.isFinite(price) || price <= 0) return { error: 'Invalid item price' };
+    out.push({ id, qty, name: item.name || 'Item', price });
+  }
+  return { items: out };
+}
+
 // Shared by POST /create and balance top-ups (backend/routes/balance.js) so
 // both paths go through the exact same fee/note/crypto-address/notify logic.
 async function createOrder({ items, email, discord_id, payment_method, web_user_id }) {
@@ -88,10 +148,20 @@ async function createOrder({ items, email, discord_id, payment_method, web_user_
   if (payment_method === 'balance') {
     // Paid instantly from wallet — deduct + mark paid, then hand off to the
     // normal delivery pipeline exactly like a confirmed cashapp/paypal order.
-    await query(
-      `UPDATE balances SET balance_cents = balance_cents - $1, updated_at = now() WHERE web_user_id = $2`,
+    // The guard lives in the UPDATE itself: a plain `balance_cents - $1` lets
+    // two concurrent checkouts each pass the earlier read and drive the wallet
+    // negative, handing out keys that were never paid for.
+    const { rows: debited } = await query(
+      `UPDATE balances SET balance_cents = balance_cents - $1, updated_at = now()
+       WHERE web_user_id = $2 AND balance_cents >= $1 RETURNING balance_cents`,
       [Math.round(total * 100), web_user_id]
     );
+    if (!debited.length) {
+      await query(`UPDATE orders SET status = 'cancelled' WHERE id = $1`, [order.id]);
+      const err = new Error('Insufficient balance');
+      err.statusCode = 400;
+      throw err;
+    }
     await query(
       `INSERT INTO transactions (guild_id, web_user_id, kind, amount_cents, description, order_id)
        VALUES ($1,$2,'debit',$3,$4,$5)`,
@@ -112,13 +182,23 @@ router.post('/create', attachUser, async (req, res) => {
   try {
     const { items, email, discord_id, payment_method } = req.body;
 
-    if (!items || !items.length || !payment_method) {
+    if (!items || !Array.isArray(items) || !items.length || !payment_method) {
       return res.status(400).json({ error: 'Missing required fields' });
     }
+    if (items.length > 50) return res.status(400).json({ error: 'Too many items' });
 
-    if (payment_method === 'balance') {
-      if (!req.user) return res.status(401).json({ error: 'Log in to pay with balance' });
-      const subtotal = items.reduce((sum, item) => sum + (item.price * item.qty), 0);
+    const paidFromBalance = payment_method === 'balance';
+    if (paidFromBalance && !req.user) {
+      return res.status(401).json({ error: 'Log in to pay with balance' });
+    }
+
+    // Prices come from product_tiers, never from the request body.
+    const repriced = await repriceItems(items, { paidFromBalance });
+    if (repriced.error) return res.status(400).json({ error: repriced.error });
+    const safeItems = repriced.items;
+
+    if (paidFromBalance) {
+      const subtotal = safeItems.reduce((sum, item) => sum + (item.price * item.qty), 0);
       if ((req.user.balance_cents || 0) < Math.round(subtotal * 100)) {
         return res.status(400).json({ error: 'Insufficient balance' });
       }
@@ -129,7 +209,7 @@ router.post('/create', attachUser, async (req, res) => {
     }
 
     const { order, payment_info, total, fee_note } = await createOrder({
-      items,
+      items: safeItems,
       email: email || req.user.email,
       discord_id: discord_id || (req.user && req.user.discord_id) || null,
       payment_method,
@@ -148,6 +228,7 @@ router.post('/create', attachUser, async (req, res) => {
     });
 
   } catch (err) {
+    if (err && err.statusCode === 400) return res.status(400).json({ error: err.message });
     console.error('[Orders] Create error:', err);
     res.status(500).json({ error: 'Failed to create order' });
   }
