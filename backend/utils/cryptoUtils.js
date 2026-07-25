@@ -31,15 +31,31 @@ async function claimDerivedAddress(coin, order_id, deriveAt) {
   const index = await getNextAddressIndex(coin);
   const address = deriveAt(index);
   if (!address) return null;
+
+  // Record what the address had already received BEFORE we hand it to a
+  // customer. The xpub can belong to a wallet that is also used by hand, so an
+  // address may carry history that has nothing to do with this order; without a
+  // baseline the poller reads that history as payment. Throwing here (rather
+  // than returning null) skips the retry loop and fails the whole derivation:
+  // generateCryptoAddress catches it and the order gets no address, so nobody
+  // can pay into one whose funds we could not attribute.
+  const baseline = await fetchTotalReceived(coin, address);
+  if (baseline === null) {
+    throw new Error(`could not establish a chain baseline for ${coin.toUpperCase()} address`);
+  }
+
   try {
     await query(
-      `INSERT INTO crypto_addresses (guild_id, address, order_id, coin, address_index)
-       VALUES ($1,$2,$3,$4,$5)`,
-      [GUILD_ID, address, order_id, coin.toUpperCase(), index]
+      `INSERT INTO crypto_addresses (guild_id, address, order_id, coin, address_index, baseline_received)
+       VALUES ($1,$2,$3,$4,$5,$6)`,
+      [GUILD_ID, address, order_id, coin.toUpperCase(), index, baseline]
     );
   } catch (err) {
     if (err && err.code === '23505') return null; // index or address raced — retry
     throw err;
+  }
+  if (baseline > 0) {
+    console.warn(`[Crypto] ${coin.toUpperCase()} address #${index} has prior history (${baseline} received) — baselined`);
   }
   console.log(`[Crypto] Derived ${coin.toUpperCase()} address #${index}: ${address}`);
   return address;
@@ -216,7 +232,70 @@ async function quoteCrypto(coin, usdTotal) {
   };
 }
 
+// ─── Chain reads ─────────────────────────────────────────
+// `total_received` is the right figure to build on: BlockCypher reports it
+// confirmed-only (so the 1-confirmation guarantee is preserved) and it only
+// ever grows, unlike `balance`, which drops when the merchant sweeps the
+// address. Returns null when the value cannot be read — callers must treat that
+// as "unknown", never as zero.
+async function fetchTotalReceived(coin, address) {
+  try {
+    const chain = String(coin).toLowerCase() === 'btc' ? 'btc/main' : 'ltc/main';
+    const token = process.env.BLOCKCYPHER_TOKEN;
+    const { data } = await axios.get(
+      `https://api.blockcypher.com/v1/${chain}/addrs/${address}/balance${token ? `?token=${token}` : ''}`,
+      { timeout: 10000 }
+    );
+    const total = Number(data && data.total_received);
+    return Number.isFinite(total) && total >= 0 ? total : null;
+  } catch (err) {
+    console.error('[Crypto] Baseline/total read error:', err.message);
+    return null;
+  }
+}
+
 // ─── Payment validation ──────────────────────────────────
+
+// How much arrived for THIS order, as opposed to how much the address holds.
+//
+// Confirming on absolute balance breaks in both directions on an address with a
+// life outside this order: money already sitting there settles an order nobody
+// paid for, and a sweep between payment and poll drops the balance to zero so a
+// real payment is never seen. The delta in confirmed total_received since the
+// address was issued is immune to both.
+//
+// Fails CLOSED — an unreadable total or a missing baseline returns ok:false, so
+// the order waits for review instead of being handed out.
+function receivedSinceBaseline(totalReceived, baseline) {
+  // `Number(null)` and `Number('')` are 0, so these have to be rejected before
+  // coercion. A NULL baseline is precisely the unattributable case the column
+  // leaves NULL for — silently reading it as 0 would credit the order with the
+  // address's entire history, which is the hole this function exists to close.
+  const missing = (v) => v === null || v === undefined || v === '';
+  if (missing(totalReceived)) {
+    return { ok: false, reason: 'chain returned no usable total_received' };
+  }
+  const total = Number(totalReceived);
+  if (!Number.isFinite(total) || total < 0) {
+    return { ok: false, reason: 'chain returned no usable total_received' };
+  }
+  if (missing(baseline)) {
+    return { ok: false, reason: 'address has no recorded baseline — cannot attribute funds to this order' };
+  }
+  const base = Number(baseline);
+  if (!Number.isFinite(base) || base < 0) {
+    return { ok: false, reason: 'address has no recorded baseline — cannot attribute funds to this order' };
+  }
+  if (total < base) {
+    // total_received never decreases. If it has, the baseline is not comparable
+    // to this reading (reorg, or a row baselined against a different address),
+    // and the shortfall must not be read as a payment.
+    return { ok: false, reason: `total_received ${total} is below the recorded baseline ${base}` };
+  }
+  return { ok: true, sats: total - base };
+}
+
+
 // Underpayment tolerance covers rounding and wallet fee quirks only. It is NOT
 // meant to absorb price movement — the quote is locked for the order's 24h
 // window and that risk is the store's, not a reason to widen the gate.
@@ -258,4 +337,6 @@ module.exports = {
   getUsdRate,
   quoteCrypto,
   verifyCryptoPayment,
+  fetchTotalReceived,
+  receivedSinceBaseline,
 };

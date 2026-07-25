@@ -1,7 +1,7 @@
 const cron = require('node-cron');
 const axios = require('axios');
 const { query } = require('../db');
-const { verifyCryptoPayment } = require('../utils/cryptoUtils');
+const { verifyCryptoPayment, receivedSinceBaseline } = require('../utils/cryptoUtils');
 const { raiseAlert } = require('../utils/alerts');
 
 const GUILD_ID = process.env.GUILD_ID;
@@ -17,9 +17,16 @@ function start() {
 
 async function checkPendingCryptoOrders() {
   try {
+    // baseline_received comes along for the ride: what the address had already
+    // received when it was issued, which is what makes "paid for this order"
+    // distinguishable from "this address has a past".
     const { rows: orders } = await query(
-      `SELECT * FROM orders
-       WHERE guild_id = $1 AND payment_method IN ('btc','ltc') AND status = 'waiting' AND expires_at > now()`,
+      `SELECT o.*, ca.baseline_received
+         FROM orders o
+         LEFT JOIN crypto_addresses ca
+           ON ca.guild_id = o.guild_id AND ca.address = o.crypto_address
+        WHERE o.guild_id = $1 AND o.payment_method IN ('btc','ltc')
+          AND o.status = 'waiting' AND o.expires_at > now()`,
       [GUILD_ID]
     );
     for (const order of orders) {
@@ -41,7 +48,16 @@ async function checkAddress(order) {
       `https://api.blockcypher.com/v1/${chain}/addrs/${order.crypto_address}/balance?token=${token}`
     );
 
-    const confirmed = res.data.balance || 0;
+    // Count only what arrived AFTER this address was issued. Reading
+    // `res.data.balance` meant an address with a prior balance settled an order
+    // instantly on the merchant's own coins, and a sweep before the next poll
+    // hid a genuine payment. See receivedSinceBaseline.
+    const delta = receivedSinceBaseline(res.data.total_received, order.baseline_received);
+    if (!delta.ok) {
+      console.warn(`[CryptoWatcher] Order ${order.id} not auto-confirmable: ${delta.reason}`);
+      return;
+    }
+    const confirmed = delta.sats;
     if (confirmed <= 0) return;
 
     // Previously any balance > 0 confirmed the order, so a single satoshi paid
