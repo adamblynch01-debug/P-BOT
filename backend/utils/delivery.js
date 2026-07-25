@@ -1,5 +1,5 @@
 const axios = require('axios');
-const { query } = require('../db');
+const { query, withTransaction } = require('../db');
 const { notifyBot } = require('./botNotify');
 const { raiseAlert } = require('./alerts');
 const { sendOrderConfirmation } = require('./email');
@@ -62,12 +62,28 @@ async function deliver(order) {
           // 23505 instead of silently topping the wallet up again, so a
           // duplicate delivery can no longer mint money even if it gets this
           // far. The balance UPDATE only runs once the row is ours.
+          // Both statements are one transaction. Separately, a failure after
+          // the INSERT left a credit row with no money behind it — a wallet
+          // that disagrees with its own history, which is exactly what
+          // balance_audit.sql #5 flags. Now the ledger row only survives if the
+          // money actually moved.
           try {
-            await query(
-              `INSERT INTO transactions (guild_id, web_user_id, kind, amount_cents, description, order_id)
-               VALUES ($1,$2,'credit',$3,$4,$5)`,
-              [GUILD_ID, order.web_user_id, credit, `Balance top-up (order #${order.id})`, order.id]
-            );
+            await withTransaction(async (exec) => {
+              await exec(
+                `INSERT INTO transactions (guild_id, web_user_id, kind, amount_cents, description, order_id)
+                 VALUES ($1,$2,'credit',$3,$4,$5)`,
+                [GUILD_ID, order.web_user_id, credit, `Balance top-up (order #${order.id})`, order.id]
+              );
+              const { rowCount } = await exec(
+                `UPDATE balances SET balance_cents = balance_cents + $1, updated_at = now() WHERE web_user_id = $2`,
+                [credit, order.web_user_id]
+              );
+              if (!rowCount) {
+                const err = new Error('no balances row to credit');
+                err.noWallet = true;
+                throw err; // rolls the credit row back rather than orphaning it
+              }
+            });
           } catch (err) {
             if (err && err.code === '23505') {
               await raiseAlert('duplicate_topup_credit',
@@ -76,22 +92,14 @@ async function deliver(order) {
               deliveredGoods.push({ product: 'Balance Top-Up', items: ['ALREADY_CREDITED'] });
               continue;
             }
+            if (err && err.noWallet) {
+              await raiseAlert('topup_credit_lost',
+                `Order ${order.id} could not be credited $${(credit / 100).toFixed(2)} — no balances row for that user; the credit was rolled back`,
+                { severity: 'error', order_id: order.id, context: { web_user_id: order.web_user_id, credit_cents: credit } });
+              deliveredGoods.push({ product: 'Balance Top-Up', items: ['CREDIT_FAILED'] });
+              continue;
+            }
             throw err;
-          }
-
-          const { rowCount } = await query(
-            `UPDATE balances SET balance_cents = balance_cents + $1, updated_at = now() WHERE web_user_id = $2`,
-            [credit, order.web_user_id]
-          );
-          if (!rowCount) {
-            // A ledger row now exists with no matching money. Say so loudly —
-            // this silently no-opped before, which is the shape of a balance
-            // that disagrees with its own transaction history.
-            await raiseAlert('topup_credit_lost',
-              `Order ${order.id} logged a $${(credit / 100).toFixed(2)} credit but no balances row was updated`,
-              { severity: 'error', order_id: order.id, context: { web_user_id: order.web_user_id, credit_cents: credit } });
-            deliveredGoods.push({ product: 'Balance Top-Up', items: ['CREDIT_FAILED'] });
-            continue;
           }
           deliveredGoods.push({ product: 'Balance Top-Up', items: [`+$${(credit / 100).toFixed(2)} credited`] });
         } else {

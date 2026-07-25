@@ -70,14 +70,89 @@ async function deriveWithRetry(coin, order_id, deriveAt) {
   return null;
 }
 
+// ─── Address recycling ───────────────────────────────────
+// Every checkout burns a derivation index whether or not the customer pays, and
+// abandoned crypto carts are normal. Wallets only scan a fixed run of unused
+// addresses ahead of the last one they have seen — around 20 — so a streak of
+// unpaid orders pushes new addresses past the merchant wallet's horizon. The
+// customer pays, the chain confirms, the bot delivers, and the coins land
+// somewhere the wallet will not display until it is forced to rescan.
+//
+// Reusing the address of an order that died unpaid keeps the sequence dense.
+// This is only safe because addresses are baselined: reuse used to mean
+// inheriting whatever the address had received.
+const RECYCLE_GRACE_HOURS = () => {
+  const h = parseFloat(process.env.CRYPTO_RECYCLE_GRACE_HOURS);
+  return Number.isFinite(h) && h >= 1 ? h : 24;
+};
+
+async function claimRecycledAddress(coin, order_id) {
+  const { rows } = await query(
+    `SELECT ca.id, ca.address, ca.address_index, ca.order_id, ca.baseline_received
+       FROM crypto_addresses ca
+       JOIN orders o ON o.id = ca.order_id
+      WHERE ca.guild_id = $1 AND ca.coin = $2
+        AND ca.baseline_received IS NOT NULL
+        AND o.status IN ('waiting','cancelled')
+        AND o.expires_at IS NOT NULL
+        AND o.expires_at < now() - ($3 || ' hours')::interval
+      ORDER BY ca.address_index ASC
+      LIMIT 5`,
+    [GUILD_ID, coin.toUpperCase(), String(RECYCLE_GRACE_HOURS())]
+  );
+
+  for (const cand of rows) {
+    // A NULL baseline means we never established what this address had already
+    // received, so "unchanged since issue" is not a question we can answer. The
+    // WHERE clause above filters these out, but `Number(null)` is 0 and would
+    // compare equal to a virgin address, so the guard is repeated here rather
+    // than trusted to the query.
+    const base = cand.baseline_received;
+    if (base === null || base === undefined || base === '') continue;
+    const baseNum = Number(base);
+    if (!Number.isFinite(baseNum) || baseNum < 0) continue;
+
+    const activity = await fetchAddressActivity(coin, cand.address);
+    // Unreadable chain state is not "clean" — skip rather than guess.
+    if (!activity) continue;
+    // Anything at all happened here since we issued it: a late payment, or one
+    // still in the mempool. Leave it alone; it belongs to the old order and
+    // handing it to a new customer would misattribute the funds.
+    if (Number(activity.total_received) !== baseNum) continue;
+    if (activity.unconfirmed_balance > 0 || activity.unconfirmed_n_tx > 0) continue;
+
+    // Compare-and-swap on the previous owner so two concurrent checkouts cannot
+    // both claim the same recycled address.
+    const { rowCount } = await query(
+      `UPDATE crypto_addresses
+          SET order_id = $1, baseline_received = $2, created_at = now()
+        WHERE id = $3 AND order_id = $4`,
+      [order_id, activity.total_received, cand.id, cand.order_id]
+    );
+    if (rowCount) {
+      console.log(`[Crypto] Recycled ${coin.toUpperCase()} address #${cand.address_index} from order ${cand.order_id} → ${order_id}`);
+      return cand.address;
+    }
+  }
+  return null;
+}
+
 async function generateCryptoAddress(coin, order_id) {
   try {
+    if (coin !== 'btc' && coin !== 'ltc') return null;
+
+    // Prefer an address left over from an order that expired unpaid, so the
+    // index only advances for checkouts that actually consumed one.
+    const recycled = await claimRecycledAddress(coin, order_id).catch((err) => {
+      console.error('[Crypto] Recycle attempt failed:', err.message);
+      return null;
+    });
+    if (recycled) return recycled;
+
     if (coin === 'btc') {
       return await deriveBTCAddress(order_id);
-    } else if (coin === 'ltc') {
-      return await deriveLTCAddress(order_id);
     }
-    return null;
+    return await deriveLTCAddress(order_id);
   } catch (err) {
     // Returning null is the safe failure: createOrder leaves the order without
     // an address so nobody can pay into one we cannot spend from.
@@ -238,7 +313,7 @@ async function quoteCrypto(coin, usdTotal) {
 // ever grows, unlike `balance`, which drops when the merchant sweeps the
 // address. Returns null when the value cannot be read — callers must treat that
 // as "unknown", never as zero.
-async function fetchTotalReceived(coin, address) {
+async function fetchAddressActivity(coin, address) {
   try {
     const chain = String(coin).toLowerCase() === 'btc' ? 'btc/main' : 'ltc/main';
     const token = process.env.BLOCKCYPHER_TOKEN;
@@ -247,11 +322,25 @@ async function fetchTotalReceived(coin, address) {
       { timeout: 10000 }
     );
     const total = Number(data && data.total_received);
-    return Number.isFinite(total) && total >= 0 ? total : null;
+    if (!Number.isFinite(total) || total < 0) return null;
+    return {
+      total_received: total,
+      // Unconfirmed activity matters for recycling: a payment broadcast but not
+      // yet mined is invisible in total_received, and reassigning that address
+      // to another order would credit the new order with the old customer's
+      // money once it confirms.
+      unconfirmed_balance: Number(data.unconfirmed_balance) || 0,
+      unconfirmed_n_tx: Number(data.unconfirmed_n_tx) || 0,
+    };
   } catch (err) {
-    console.error('[Crypto] Baseline/total read error:', err.message);
+    console.error('[Crypto] Address activity read error:', err.message);
     return null;
   }
+}
+
+async function fetchTotalReceived(coin, address) {
+  const activity = await fetchAddressActivity(coin, address);
+  return activity ? activity.total_received : null;
 }
 
 // ─── Payment validation ──────────────────────────────────
@@ -338,5 +427,7 @@ module.exports = {
   quoteCrypto,
   verifyCryptoPayment,
   fetchTotalReceived,
+  fetchAddressActivity,
   receivedSinceBaseline,
+  claimRecycledAddress,
 };

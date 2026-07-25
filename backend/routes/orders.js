@@ -1,6 +1,6 @@
 const express = require('express');
 const router = express.Router();
-const { query } = require('../db');
+const { query, withTransaction } = require('../db');
 const { generateNote } = require('../utils/noteGenerator');
 const { generateCryptoAddress, registerWebhook, quoteCrypto } = require('../utils/cryptoUtils');
 const { notifyBot } = require('../utils/botNotify');
@@ -185,29 +185,49 @@ async function createOrder({ items, email, discord_id, payment_method, web_user_
     // The guard lives in the UPDATE itself: a plain `balance_cents - $1` lets
     // two concurrent checkouts each pass the earlier read and drive the wallet
     // negative, handing out keys that were never paid for.
-    const { rows: debited } = await query(
-      `UPDATE balances SET balance_cents = balance_cents - $1, updated_at = now()
-       WHERE web_user_id = $2 AND balance_cents >= $1 RETURNING balance_cents`,
-      [totalCents, web_user_id]
-    );
-    if (!debited.length) {
-      await query(`UPDATE orders SET status = 'cancelled' WHERE id = $1`, [order.id]);
-      const err = new Error('Insufficient balance');
-      err.statusCode = 400;
+    //
+    // The three writes are one transaction because they were previously
+    // independent: a failure after the debit but before the status flip left
+    // the customer charged for an order still sitting at `waiting`, which then
+    // expired. Money taken, nothing delivered, nothing logged as wrong.
+    let paidOrder = null;
+    try {
+      paidOrder = await withTransaction(async (exec) => {
+        const { rows: debited } = await exec(
+          `UPDATE balances SET balance_cents = balance_cents - $1, updated_at = now()
+           WHERE web_user_id = $2 AND balance_cents >= $1 RETURNING balance_cents`,
+          [totalCents, web_user_id]
+        );
+        if (!debited.length) {
+          const err = new Error('Insufficient balance');
+          err.statusCode = 400;
+          err.insufficient = true;
+          throw err;
+        }
+        await exec(
+          `INSERT INTO transactions (guild_id, web_user_id, kind, amount_cents, description, order_id)
+           VALUES ($1,$2,'debit',$3,$4,$5)`,
+          [GUILD_ID, web_user_id, totalCents, `Order #${order.id}`, order.id]
+        );
+        const { rows: paidRows } = await exec(
+          `UPDATE orders SET status = 'paid', paid_at = now(),
+                  amount_received_cents = $1, amount_received_unit = 'usd'
+            WHERE id = $2 AND status = 'waiting' RETURNING *`,
+          [totalCents, order.id]
+        );
+        return paidRows[0] || null;
+      });
+    } catch (err) {
+      // Cancelling the order is deliberately OUTSIDE the transaction: the
+      // rollback has already undone the debit, and this write must survive.
+      await query(`UPDATE orders SET status = 'cancelled' WHERE id = $1`, [order.id]).catch(() => {});
       throw err;
     }
-    await query(
-      `INSERT INTO transactions (guild_id, web_user_id, kind, amount_cents, description, order_id)
-       VALUES ($1,$2,'debit',$3,$4,$5)`,
-      [GUILD_ID, web_user_id, totalCents, `Order #${order.id}`, order.id]
-    );
-    const { rows: paidRows } = await query(
-      `UPDATE orders SET status = 'paid', paid_at = now(),
-              amount_received_cents = $1, amount_received_unit = 'usd'
-        WHERE id = $2 AND status = 'waiting' RETURNING *`,
-      [totalCents, order.id]
-    );
-    if (paidRows.length) await require('../utils/delivery').deliver(paidRows[0]);
+
+    // Delivery only after COMMIT. Inside the transaction a later rollback would
+    // un-charge the customer while the keys were already sent — the one failure
+    // mode worse than the one being fixed.
+    if (paidOrder) await require('../utils/delivery').deliver(paidOrder);
   } else {
     await notifyBot('new_order', { order: { ...freshOrder, id: String(order.id) }, payment_info });
   }

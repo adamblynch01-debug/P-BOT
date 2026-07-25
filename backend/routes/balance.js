@@ -1,6 +1,6 @@
 const express = require('express');
 const router = express.Router();
-const { query } = require('../db');
+const { query, withTransaction } = require('../db');
 const { requireAuth, requireAdmin, publicUser } = require('../utils/auth');
 
 const GUILD_ID = process.env.GUILD_ID;
@@ -14,31 +14,40 @@ const GUILD_ID = process.env.GUILD_ID;
 // exact drift that makes a reconciliation report untrustworthy. Now the guard
 // is in the UPDATE's own WHERE clause: either the whole delta applies and gets
 // logged, or nothing happens and the caller gets an error.
+// The sufficiency guard lives in the UPDATE's WHERE clause and is race-safe on
+// its own: Postgres re-evaluates it after taking the row lock, so two
+// concurrent debits cannot both pass. What it does NOT give is atomicity with
+// the ledger INSERT that follows — a failure between the two left the wallet
+// moved with nothing recording why, which is precisely the drift
+// balance_audit.sql #5 exists to detect. Both statements now commit together or
+// not at all.
 async function applyBalanceDelta(webUserId, amountCents, description, kindLabel) {
-  const { rows: balRows } = await query('SELECT web_user_id FROM balances WHERE web_user_id = $1', [webUserId]);
-  if (!balRows.length) {
-    await query('INSERT INTO balances (web_user_id, guild_id, balance_cents) VALUES ($1,$2,0)', [webUserId, GUILD_ID]);
-  }
+  return withTransaction(async (exec) => {
+    const { rows: balRows } = await exec('SELECT web_user_id FROM balances WHERE web_user_id = $1', [webUserId]);
+    if (!balRows.length) {
+      await exec('INSERT INTO balances (web_user_id, guild_id, balance_cents) VALUES ($1,$2,0)', [webUserId, GUILD_ID]);
+    }
 
-  const { rows } = await query(
-    `UPDATE balances SET balance_cents = balance_cents + $1, updated_at = now()
-      WHERE web_user_id = $2 AND balance_cents + $1 >= 0
-      RETURNING balance_cents`,
-    [amountCents, webUserId]
-  );
-  if (!rows.length) {
-    const err = new Error('Insufficient balance for that debit');
-    err.statusCode = 400;
-    throw err;
-  }
+    const { rows } = await exec(
+      `UPDATE balances SET balance_cents = balance_cents + $1, updated_at = now()
+        WHERE web_user_id = $2 AND balance_cents + $1 >= 0
+        RETURNING balance_cents`,
+      [amountCents, webUserId]
+    );
+    if (!rows.length) {
+      const err = new Error('Insufficient balance for that debit');
+      err.statusCode = 400;
+      throw err; // rolls back the balances row created above
+    }
 
-  await query(
-    `INSERT INTO transactions (guild_id, web_user_id, kind, amount_cents, description)
-     VALUES ($1,$2,$3,$4,$5)`,
-    [GUILD_ID, webUserId, amountCents >= 0 ? 'credit' : 'debit', Math.abs(amountCents), description || kindLabel]
-  );
+    await exec(
+      `INSERT INTO transactions (guild_id, web_user_id, kind, amount_cents, description)
+       VALUES ($1,$2,$3,$4,$5)`,
+      [GUILD_ID, webUserId, amountCents >= 0 ? 'credit' : 'debit', Math.abs(amountCents), description || kindLabel]
+    );
 
-  return rows[0].balance_cents;
+    return rows[0].balance_cents;
+  });
 }
 
 // ─── GET /api/balance/mine ───────────────────────────────
