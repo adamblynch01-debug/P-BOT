@@ -5,6 +5,10 @@ const { requireAuth, requireAdmin, getSessionUser, bearerToken } = require('../u
 
 const GUILD_ID = process.env.GUILD_ID;
 
+// Matches the panel's own qty cap. Bounded server-side too, so a crafted
+// request can't insert a million-key order row.
+const MAX_KEYGEN_QTY = 50;
+
 // Bot (secret) and admin panel (logged-in admin/staff session) both manage
 // reseller wallets — same dual-gate pattern as routes/stock.js.
 async function isAuthorizedOrAdmin(req) {
@@ -177,45 +181,75 @@ router.post('/adjust', async (req, res) => {
 
 // ─── POST /api/reseller/purchase ─────────────────────────
 // The reseller keygen-buy: debit the reseller wallet by the discounted total,
-// record a reseller_orders row with the delivered keys, and log the debit.
-// Server-authoritative: the wallet balance and the discount both come from the
-// DB, so the client can't spoof a cheaper price or overdraw.
+// record a reseller_orders row with the generated keys, and log the debit.
+// Server-authoritative: role, discount, list price, and balance ALL come from
+// the DB. tier_id identifies what is being bought; any client-sent price is
+// ignored, because the browser's tier <option> value is the price itself and a
+// reseller could edit it in devtools to mint keys for a cent.
 router.post('/purchase', requireAuth, async (req, res) => {
   try {
+    // A wallet debit must never be available to a non-reseller. requireAuth
+    // only proves "logged in", so gate on the role the admin actually granted.
+    const isReseller = req.user.role === 'reseller' || !!req.user.reseller_role;
+    if (!isReseller) return res.status(403).json({ error: 'Not a reseller account' });
     if (req.user.reseller_suspended) return res.status(403).json({ error: 'Reseller account suspended' });
-    const { product, tier, qty, unit_price, keys } = req.body;
+
+    const { product, tier, tier_id, qty, keys } = req.body;
     const q = parseInt(qty, 10);
-    const unit = parseFloat(unit_price);
-    if (!product || !q || q < 1 || isNaN(unit) || unit < 0) {
-      return res.status(400).json({ error: 'product, qty, and unit_price are required' });
+    if (!Number.isInteger(q) || q < 1 || q > MAX_KEYGEN_QTY) {
+      return res.status(400).json({ error: `qty must be between 1 and ${MAX_KEYGEN_QTY}` });
     }
     if (!Array.isArray(keys) || keys.length !== q) {
       return res.status(400).json({ error: 'keys[] must be provided and match qty' });
     }
-    const discount = Number(req.user.reseller_discount) || 0;
-    const unitCents = Math.round(unit * 100 * (1 - discount / 100));
+    if (!keys.every(k => typeof k === 'string' && k.trim() && k.length <= 128)) {
+      return res.status(400).json({ error: 'keys[] must be non-empty strings' });
+    }
+
+    // Price comes from product_tiers, never from the request.
+    const { rows: tierRows } = await query(
+      `SELECT t.id, t.label, t.price_cents, p.name AS product_name
+       FROM product_tiers t JOIN products p ON p.id = t.product_id
+       WHERE t.id = $1 AND t.guild_id = $2`,
+      [tier_id, GUILD_ID]
+    );
+    if (!tierRows.length) return res.status(400).json({ error: 'Unknown tier_id' });
+    const tierRow = tierRows[0];
+    const listCents = Number(tierRow.price_cents) || 0;
+    if (listCents <= 0) return res.status(400).json({ error: 'Tier has no price set' });
+
+    const discount = Math.max(0, Math.min(99, Number(req.user.reseller_discount) || 0));
+    const unitCents = Math.round(listCents * (1 - discount / 100));
     const totalCents = unitCents * q;
 
     const bal = await ensureResellerWallet(req.user.id);
     if (bal < totalCents) return res.status(400).json({ error: 'Insufficient reseller balance' });
 
+    // Debit and re-check the balance in ONE statement. A plain
+    // `balance_cents - $1` lets two concurrent keygens each pass the read above
+    // and drive the wallet negative; the WHERE clause makes the guard atomic.
     const { rows } = await query(
       `UPDATE reseller_balances SET balance_cents = balance_cents - $1, updated_at = now()
-       WHERE web_user_id = $2 RETURNING balance_cents`,
+       WHERE web_user_id = $2 AND balance_cents >= $1 RETURNING balance_cents`,
       [totalCents, req.user.id]
     );
+    if (!rows.length) return res.status(400).json({ error: 'Insufficient reseller balance' });
+
+    const productName = tierRow.product_name || product || 'Item';
+    const tierLabel = tierRow.label || tier || null;
     const { rows: ord } = await query(
       `INSERT INTO reseller_orders (guild_id, web_user_id, product, tier, qty, unit_cents, total_cents, keys)
        VALUES ($1,$2,$3,$4,$5,$6,$7,$8) RETURNING id`,
-      [GUILD_ID, req.user.id, product, tier || null, q, unitCents, totalCents, JSON.stringify(keys)]
+      [GUILD_ID, req.user.id, productName, tierLabel, q, unitCents, totalCents, JSON.stringify(keys)]
     );
     await query(
       `INSERT INTO reseller_transactions (guild_id, web_user_id, kind, amount_cents, description)
        VALUES ($1,$2,'debit',$3,$4)`,
-      [GUILD_ID, req.user.id, totalCents, `Key Gen: ${product}${tier ? ' (' + tier + ')' : ''} × ${q}`]
+      [GUILD_ID, req.user.id, totalCents, `Key Gen: ${productName}${tierLabel ? ' (' + tierLabel + ')' : ''} × ${q}`]
     );
     res.json({
       success: true, order_id: String(ord[0].id),
+      unit: unitCents / 100, total: totalCents / 100, discount,
       balance_cents: Number(rows[0].balance_cents), balance: Number(rows[0].balance_cents) / 100,
     });
   } catch (err) {
