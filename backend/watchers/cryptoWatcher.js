@@ -2,6 +2,7 @@ const cron = require('node-cron');
 const axios = require('axios');
 const { query } = require('../db');
 const { verifyCryptoPayment } = require('../utils/cryptoUtils');
+const { raiseAlert } = require('../utils/alerts');
 
 const GUILD_ID = process.env.GUILD_ID;
 
@@ -50,13 +51,24 @@ async function checkAddress(order) {
     const check = verifyCryptoPayment(order, confirmed);
     if (!check.ok) {
       console.warn(`[CryptoWatcher] Order ${order.id} NOT confirmed: ${check.reason}`);
+      // `confirmed` is satoshis. Writing it into amount_received_cents claimed
+      // 4,000,000 sats was $40,000.00 — the native figure goes in the native
+      // column, and the USD conversion is left to whoever has the rate.
       await query(
-        `UPDATE orders SET status = 'underpaid', amount_received_cents = $1 WHERE id = $2 AND status = 'waiting'`,
+        `UPDATE orders SET status = 'underpaid', amount_received_native = $1, amount_received_unit = 'sats'
+          WHERE id = $2 AND status = 'waiting'`,
         [confirmed, order.id]
       ).catch(() => {});
+      await raiseAlert('order_underpaid',
+        `Order ${order.id} underpaid via ${coin.toUpperCase()}: ${check.reason}`,
+        { severity: 'error', order_id: order.id, context: { received_sats: confirmed, reason: check.reason } }).catch(() => {});
       return;
     }
 
+    // No provider_txn_id: the balance endpoint does not report which tx paid.
+    // /confirm's conditional status transition is the idempotency guard, and
+    // leaving the column null lets the webhook's real chain hash fill it in
+    // later via COALESCE.
     await axios.post(`http://localhost:${process.env.PORT || 3000}/api/orders/confirm`, {
       secret: process.env.API_SECRET,
       order_id: order.id,
@@ -66,6 +78,9 @@ async function checkAddress(order) {
     console.log(`[CryptoWatcher] Order ${order.id} confirmed — ${confirmed} sats`);
   } catch (err) {
     console.error(`[CryptoWatcher] Address check error:`, err.message);
+    await raiseAlert('crypto_poll_failed',
+      `Could not check ${order.payment_method.toUpperCase()} address for order ${order.id}: ${err.message}`,
+      { severity: 'warn', order_id: order.id, context: { address: order.crypto_address } }).catch(() => {});
   }
 }
 

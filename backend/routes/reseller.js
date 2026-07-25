@@ -150,7 +150,7 @@ router.get('/orders', requireAdmin, async (req, res) => {
 
 // ─── POST /api/reseller/adjust ───────────────────────────
 // Admin credit/debit of a reseller's wallet (the panel's MANAGE RESELLER
-// BALANCE). Debits floored at 0. Logs a reseller_transactions row.
+// BALANCE). Logs a reseller_transactions row.
 router.post('/adjust', async (req, res) => {
   try {
     if (!(await isAuthorizedOrAdmin(req))) return res.status(401).json({ error: 'Unauthorized' });
@@ -162,11 +162,17 @@ router.post('/adjust', async (req, res) => {
     if (!webUserId) return res.status(404).json({ error: 'User not found' });
 
     await ensureResellerWallet(webUserId);
+    // `GREATEST(0, …)` clamped an over-large debit to zero while the ledger row
+    // below still recorded the full amount, so the wallet and its own
+    // transaction history drifted apart with no error anywhere. The guard now
+    // lives in the WHERE clause: the delta applies in full or not at all.
     const { rows } = await query(
-      `UPDATE reseller_balances SET balance_cents = GREATEST(0, balance_cents + $1), updated_at = now()
-       WHERE web_user_id = $2 RETURNING balance_cents`,
+      `UPDATE reseller_balances SET balance_cents = balance_cents + $1, updated_at = now()
+        WHERE web_user_id = $2 AND balance_cents + $1 >= 0
+        RETURNING balance_cents`,
       [amount_cents, webUserId]
     );
+    if (!rows.length) return res.status(400).json({ error: 'Insufficient reseller balance for that debit' });
     await query(
       `INSERT INTO reseller_transactions (guild_id, web_user_id, kind, amount_cents, description)
        VALUES ($1,$2,$3,$4,$5)`,
@@ -215,7 +221,13 @@ router.post('/purchase', requireAuth, async (req, res) => {
     if (listCents <= 0) return res.status(400).json({ error: 'Tier has no price set' });
 
     const discount = Math.max(0, Math.min(99, Number(req.user.reseller_discount) || 0));
-    const unitCents = Math.round(listCents * (1 - discount / 100));
+    // Integer basis points. `listCents * (1 - discount/100)` computes the
+    // multiplier in binary floating point first, so a 12.5% discount on some
+    // prices landed a hair under the half-cent and rounded the wrong way —
+    // systematically in the reseller's favour. Scaling by an integer keeps it
+    // exact for any discount with two decimal places.
+    const discountBp = Math.round(discount * 100);
+    const unitCents = Math.round(listCents * (10000 - discountBp) / 10000);
     const totalCents = unitCents * q;
 
     // Refuse early if the reseller pool can't cover the order, so we don't

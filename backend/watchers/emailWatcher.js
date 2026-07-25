@@ -2,13 +2,26 @@ const Imap = require('imap');
 const { simpleParser } = require('mailparser');
 const axios = require('axios');
 const { query } = require('../db');
+const { raiseAlert } = require('../utils/alerts');
 
 const GUILD_ID = process.env.GUILD_ID;
 
 let imapClient = null;
 let failCount = 0;
 let reconnectTimer = null;
-const MAX_FAILS = 5;
+let heartbeatTimer = null;
+let lastActivityAt = Date.now();
+let deadAlertSent = false;
+let scanning = false;
+
+// Backoff caps at 5 minutes and never gives up. The watcher used to stop
+// permanently after 5 failures with only a console.error — after which every
+// Cash App and PayPal payment went unconfirmed until somebody happened to
+// redeploy. A payment processor that switches itself off silently is worse than
+// one that is noisily broken.
+const BACKOFF_MS = [10000, 30000, 60000, 120000, 300000];
+const HEARTBEAT_CHECK_MS = 5 * 60 * 1000;
+const SILENCE_ALERT_MS = 20 * 60 * 1000;
 
 function start() {
   if (!process.env.GMAIL_USER || !process.env.GMAIL_PASSWORD) {
@@ -16,23 +29,44 @@ function start() {
     return;
   }
   failCount = 0;
+  lastActivityAt = Date.now();
   connectImap();
+  startHeartbeat();
   console.log('[EmailWatcher] Started');
 }
 
-function connectImap() {
-  if (failCount >= MAX_FAILS) {
-    console.error('[EmailWatcher] Too many failures — stopped');
-    return;
-  }
+// Being connected is not the same as being alive: a wedged IDLE keeps the socket
+// open while delivering nothing. Alert on silence, not just on errors.
+function startHeartbeat() {
+  if (heartbeatTimer) clearInterval(heartbeatTimer);
+  heartbeatTimer = setInterval(async () => {
+    const silentFor = Date.now() - lastActivityAt;
+    if (silentFor > SILENCE_ALERT_MS && !deadAlertSent) {
+      deadAlertSent = true;
+      await raiseAlert('email_watcher_silent',
+        `Payment email watcher has had no IMAP activity for ${Math.round(silentFor / 60000)} minutes — Cash App/PayPal payments may not be confirming`,
+        { severity: 'error', context: { failCount } }).catch(() => {});
+    }
+  }, HEARTBEAT_CHECK_MS);
+  if (heartbeatTimer.unref) heartbeatTimer.unref();
+}
 
+function markAlive() {
+  lastActivityAt = Date.now();
+  deadAlertSent = false;
+}
+
+function connectImap() {
   imapClient = new Imap({
     user: process.env.GMAIL_USER,
     password: process.env.GMAIL_PASSWORD,
     host: 'imap.gmail.com',
     port: 993,
     tls: true,
-    tlsOptions: { rejectUnauthorized: false },
+    // Gmail presents a valid certificate. Skipping validation would let anyone
+    // able to intercept the connection feed us forged "payment" mail and
+    // harvest the mailbox password.
+    tlsOptions: { servername: 'imap.gmail.com' },
     authTimeout: 15000,
     connTimeout: 15000,
     keepalive: {
@@ -44,29 +78,34 @@ function connectImap() {
 
   imapClient.once('ready', () => {
     failCount = 0;
+    markAlive();
     console.log('[EmailWatcher] IMAP connected');
     openInbox();
   });
 
   imapClient.once('error', (err) => {
     failCount++;
-    console.error(`[EmailWatcher] IMAP error (${failCount}/${MAX_FAILS}):`, err.message);
-    scheduleReconnect(30000);
+    console.error(`[EmailWatcher] IMAP error (attempt ${failCount}):`, err.message);
+    if (failCount === 3) {
+      raiseAlert('email_watcher_failing',
+        `Payment email watcher has failed to connect ${failCount} times: ${err.message}`,
+        { severity: 'warn' }).catch(() => {});
+    }
+    scheduleReconnect();
   });
 
   imapClient.once('end', () => {
     console.log('[EmailWatcher] IMAP disconnected — reconnecting...');
-    scheduleReconnect(10000);
+    scheduleReconnect();
   });
 
   imapClient.connect();
 }
 
-function scheduleReconnect(delay) {
+function scheduleReconnect() {
   if (reconnectTimer) clearTimeout(reconnectTimer);
-  if (failCount < MAX_FAILS) {
-    reconnectTimer = setTimeout(connectImap, delay);
-  }
+  const delay = BACKOFF_MS[Math.min(failCount, BACKOFF_MS.length - 1)];
+  reconnectTimer = setTimeout(connectImap, delay);
 }
 
 function openInbox() {
@@ -77,6 +116,7 @@ function openInbox() {
     }
     console.log('[EmailWatcher] Inbox open — watching for payments');
     imapClient.on('mail', (numNew) => {
+      markAlive();
       console.log(`[EmailWatcher] ${numNew} new email(s) — checking for payments`);
       fetchRecent();
     });
@@ -85,31 +125,58 @@ function openInbox() {
 }
 
 function fetchRecent() {
-  const today = new Date();
-  const dd = String(today.getDate()).padStart(2, '0');
-  const months = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
-  const mm = months[today.getMonth()];
-  const yyyy = today.getFullYear();
-  const sinceDate = `${dd}-${mm}-${yyyy}`;
+  // Serialised deliberately. Overlapping scans used to hand the same UID to two
+  // parallel processEmail calls, and PayPal sends more than one notification per
+  // payment, so concurrent confirmations of a single order were routine.
+  if (scanning) return;
+  scanning = true;
 
-  imapClient.search(['UNSEEN', ['SINCE', sinceDate]], (err, results) => {
-    if (err || !results || results.length === 0) return;
-    console.log(`[EmailWatcher] Found ${results.length} unread email(s) from today`);
+  // Two days back, and NOT filtered on UNSEEN. The old `UNSEEN SINCE today`
+  // window dropped mail permanently in two ways: a restart just after local
+  // midnight abandoned everything from the previous day, and anyone glancing at
+  // the mailbox on their phone marked a payment read before we ever saw it.
+  // processed_emails is what prevents rework now, so a wider net is free.
+  const since = new Date(Date.now() - 2 * 24 * 60 * 60 * 1000);
+  const dd = String(since.getDate()).padStart(2, '0');
+  const months = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+  const sinceDate = `${dd}-${months[since.getMonth()]}-${since.getFullYear()}`;
+
+  imapClient.search([['SINCE', sinceDate]], (err, results) => {
+    if (err || !results || results.length === 0) { scanning = false; return; }
+    markAlive();
 
     const fetch = imapClient.fetch(results, { bodies: '' });
+    const pending = [];
+
     fetch.on('message', (msg) => {
-      msg.on('body', (stream) => {
-        simpleParser(stream, async (err, parsed) => {
-          if (err) return;
-          await processEmail(parsed);
+      pending.push(new Promise((resolve) => {
+        msg.on('body', (stream) => {
+          simpleParser(stream, async (parseErr, parsed) => {
+            if (parseErr) {
+              console.error('[EmailWatcher] Parse error:', parseErr.message);
+              return resolve();
+            }
+            try {
+              await processEmail(parsed);
+            } catch (e) {
+              console.error('[EmailWatcher] processEmail threw:', e.message);
+            }
+            resolve();
+          });
         });
-      });
-      msg.once('attributes', (attrs) => {
-        imapClient.addFlags(attrs.uid, ['\\Seen'], () => {});
-      });
+      }));
     });
-    fetch.once('error', (err) => {
-      console.error('[EmailWatcher] Fetch error:', err.message);
+
+    fetch.once('error', (fetchErr) => {
+      console.error('[EmailWatcher] Fetch error:', fetchErr.message);
+      scanning = false;
+    });
+
+    fetch.once('end', async () => {
+      // Sequential, so two messages quoting the same note can never race each
+      // other into /confirm.
+      for (const p of pending) await p;
+      scanning = false;
     });
   });
 }
@@ -150,13 +217,177 @@ function verifiedSenderDomain(parsed) {
   // The verdict must be Gmail's own, not one the sender wrote themselves.
   if (!/^mx\.google\.com\b/i.test(body.split(';')[0].trim())) return null;
 
+  // DMARC only. The old dkim=pass fallback was strictly weaker: DKIM alone
+  // accepts a signature that is not aligned with the From domain, which is
+  // exactly the gap DMARC exists to close.
   const dmarc = body.match(/dmarc=pass[^;]*?header\.from=([a-z0-9.-]+)/i);
-  if (dmarc) return dmarc[1].toLowerCase();
+  return dmarc ? dmarc[1].toLowerCase().replace(/\.$/, '') : null;
+}
 
-  const dkim = body.match(/dkim=pass[^;]*?header\.(?:i=@|d=)([a-z0-9.-]+)/i);
-  if (dkim) return dkim[1].toLowerCase();
+// ─── Was the payment actually to US, and is it final? ────
+// A passing DMARC verdict answers "did PayPal send this?" — not "did I get
+// paid?". Those come apart badly: an attacker can PayPal themselves, receive a
+// genuine paypal.com-signed "You received $19.99" naming our order note, and
+// forward that raw message here. DKIM signs headers and body, not the envelope
+// recipient, so it still verifies. The body must therefore be checked for our
+// own receiving identity, and for evidence the money has actually settled.
 
-  return null;
+function merchantIdentities(method) {
+  const ids = [];
+  if (method === 'paypal') {
+    for (const v of [process.env.PAYPAL_EMAIL, process.env.PAYPAL_MERCHANT_NAME]) {
+      if (v && v.trim()) ids.push(v.trim().toLowerCase());
+    }
+  } else if (method === 'cashapp') {
+    // GMAIL_USER is deliberately NOT here. Gmail stamps `Delivered-To:
+    // <GMAIL_USER>` on every message it accepts, so accepting our own mailbox
+    // address as proof of receipt made the check tautological: it passed for any
+    // email that had ever arrived, including a forwarded third-party receipt.
+    for (const v of [process.env.CASHAPP_CASHTAG, process.env.CASHAPP_DISPLAY_NAME]) {
+      if (v && v.trim()) ids.push(v.trim().toLowerCase());
+    }
+  }
+  return ids;
+}
+
+// Where the payer's own words begin. Everything from here down is chosen by
+// whoever sent the money — the memo is free text and may contain newlines — so
+// it must not count as evidence of who was paid.
+const MEMO_MARKERS = [
+  /^note from\b/i, /^note[:\s]*$/i, /^note[:\s]/i, /^memo[:\s]/i,
+  /^message from\b/i, /^message[:\s]/i, /^for[:\s]/i,
+];
+
+// The provider's own text, with the payer-controlled memo block stripped off.
+function providerPortion(text) {
+  const lines = String(text).split('\n');
+  const cut = lines.findIndex(l => MEMO_MARKERS.some(m => m.test(l.trim())));
+  return cut === -1 ? text : lines.slice(0, cut).join('\n');
+}
+
+// The forwarded-receipt attack fails here: a notification generated for someone
+// else's account never names our cashtag or receiving email.
+//
+// Only the DKIM-signed body counts, and only the part above the memo. The To and
+// Delivered-To headers are excluded on purpose: a forwarder rewrites To freely,
+// and Delivered-To is always our own mailbox, so neither distinguishes a
+// receipt addressed to us from one merely delivered to us. Searching the whole
+// body was the same mistake one level down — an attacker could pay their own
+// account with the memo "redfox1234\nstore@ghost.example" and our address would
+// appear inside genuinely-signed content.
+function addressedToUs(email, text, method) {
+  const ids = merchantIdentities(method);
+  if (!ids.length) return { ok: false, reason: `no merchant identity configured for ${method}` };
+
+  const haystack = [providerPortion(text), email.subject || ''].join('\n').toLowerCase();
+
+  const hit = ids.find(id => haystack.includes(id));
+  return hit ? { ok: true } : { ok: false, reason: `email does not name our ${method} account` };
+}
+
+// Anything that is not settled money. An eCheck or a pending payment reads
+// almost identically to a cleared one ("sent you $19.99", "Note from ...") but
+// can bounce days after the key has been handed over; a refund or reversal is
+// the opposite of a payment and must never confirm anything.
+const NON_FINAL_PATTERNS = [
+  /\bpending\b/i, /\beCheck\b/i, /\be-check\b/i, /\bunclaimed\b/i,
+  /\bon hold\b/i, /\bbeing reviewed\b/i, /\bunder review\b/i,
+  /\brefund(ed|ing)?\b/i, /\breversal\b/i, /\breversed\b/i, /\bchargeback\b/i,
+  /\bdispute[ds]?\b/i, /\bcancell?ed\b/i, /\bfailed\b/i, /\bdeclined\b/i,
+  /\brequest(ed|s)? (?:money|payment)\b/i, /\bis requesting\b/i,
+  /\bwill be available\b/i, /\bmay take\b.*\bdays\b/i,
+];
+
+// Every provider receipt ends in boilerplate — a Resolution Center link, a
+// refund policy, an unsubscribe line. Those legitimately contain "dispute",
+// "refund", "cancelled" and "will be available", so scanning the whole body
+// rejected successful payments: this list matched a real settled PayPal receipt
+// on /\bdispute[ds]?\b/ every single time. Since a false positive here silently
+// strands a paying customer, the scan is confined to the part of the message
+// that actually states the transaction's status.
+const FOOTER_MARKERS = [
+  /^\s*(?:questions|need help|help center|resolution center)\b/i,
+  /^\s*(?:please )?do not reply\b/i, /^\s*don'?t reply\b/i,
+  /^\s*(?:to )?unsubscribe\b/i, /^\s*this email was sent\b/i,
+  /^\s*copyright\b/i, /^\s*©/, /^\s*paypal(?:,| is) /i,
+  /^\s*(?:privacy|legal) (?:policy|agreement)\b/i,
+  /^\s*learn more about\b/i, /^\s*-{4,}\s*$/, /^\s*_{4,}\s*$/,
+];
+
+// The transaction statement: above the footer, and above the payer's memo.
+function statusPortion(text) {
+  const provider = providerPortion(text);
+  const lines = provider.split('\n');
+  const cut = lines.findIndex(l => FOOTER_MARKERS.some(m => m.test(l)));
+  return cut === -1 ? provider : lines.slice(0, cut).join('\n');
+}
+
+function nonFinalReason(email, text) {
+  const haystack = `${email.subject || ''}\n${statusPortion(text)}`;
+  const hit = NON_FINAL_PATTERNS.find(p => p.test(haystack));
+  return hit ? `matched non-final pattern ${hit}` : null;
+}
+
+// USD only. `(?:USD)?` made the currency optional while PayPal renders CAD, AUD,
+// MXN and SGD with the same "$", so "sent you $19.99 MXN" (about one US dollar)
+// used to settle a $19.99 invoice at face value.
+//
+// Scoped to the status text for the same reason as the non-final patterns: a
+// currency-conversion footnote or a localized-site footer mentioning EUR must
+// not reject a payment that was actually made in dollars.
+const FOREIGN_CURRENCY = /\b(?:CAD|AUD|NZD|MXN|SGD|HKD|EUR|GBP|JPY|CHF|SEK|NOK|DKK|PLN|BRL|ILS|PHP|TWD|THB|CZK|HUF|RUB|INR|CNY|ZAR)\b/;
+
+function foreignCurrencyReason(text) {
+  const m = statusPortion(text).match(FOREIGN_CURRENCY);
+  return m ? `amount appears to be in ${m[0]}, not USD` : null;
+}
+
+// A message must be considered at most once. Claimed by INSERT before any
+// parsing, so a message redelivered by IMAP (reconnect, wider re-scan, or a
+// human toggling read state) is skipped rather than reprocessed.
+async function claimMessage(email) {
+  const messageId = (email.messageId || '').trim();
+  if (!messageId) {
+    // No Message-ID means no way to recognise it again. Refusing is the safe
+    // direction: every genuine provider notification has one.
+    return { claimed: false, reason: 'email has no Message-ID' };
+  }
+  try {
+    const { rowCount } = await query(
+      `INSERT INTO processed_emails (message_id, subject) VALUES ($1,$2)
+       ON CONFLICT (message_id) DO NOTHING`,
+      [messageId.slice(0, 500), (email.subject || '').slice(0, 500)]
+    );
+    if (!rowCount) return { claimed: false, reason: 'already processed' };
+    return { claimed: true, messageId: messageId.slice(0, 500) };
+  } catch (err) {
+    // If the dedupe store is unreachable we cannot promise exactly-once, so we
+    // decline rather than risk a double delivery. The scan retries later.
+    console.error('[EmailWatcher] Dedupe store unavailable:', err.message);
+    return { claimed: false, reason: 'dedupe unavailable' };
+  }
+}
+
+async function recordOutcome(messageId, outcome, orderId) {
+  if (!messageId) return;
+  await query(
+    `UPDATE processed_emails SET outcome = $1, order_id = $2 WHERE message_id = $3`,
+    [outcome, orderId != null ? String(orderId) : null, messageId]
+  ).catch(() => {});
+}
+
+// Gives the claim back so a later scan may consider the message again.
+//
+// The claim is taken before parsing, which is right for anything that reached a
+// verdict about money — but a message rejected by a *classifier* has not. If one
+// of those patterns is wrong (a footer word matching a non-final phrase, say),
+// keeping the claim would make the mistake permanent: the payment could never be
+// reprocessed even after the pattern was fixed, and would need a hand-written
+// DELETE against processed_emails to recover. These paths confirm nothing, so
+// re-reading the message is harmless.
+async function releaseClaim(messageId) {
+  if (!messageId) return;
+  await query('DELETE FROM processed_emails WHERE message_id = $1', [messageId]).catch(() => {});
 }
 
 async function processEmail(email) {
@@ -166,33 +397,81 @@ async function processEmail(email) {
 
   const verified = verifiedSenderDomain(email);
   if (!verified) {
-    console.warn(`[EmailWatcher] Ignored "${subject}" — no Gmail DMARC/DKIM pass on the sender`);
+    console.warn(`[EmailWatcher] Ignored "${subject}" — no Gmail DMARC pass on the sender`);
     return;
   }
 
-  if (domainMatches(verified, envDomains('CASHAPP_EMAIL_DOMAINS', DEFAULT_CASHAPP_DOMAINS))) {
-    await handleCashApp(email, text);
-    return;
-  }
-  if (domainMatches(verified, envDomains('PAYPAL_EMAIL_DOMAINS', DEFAULT_PAYPAL_DOMAINS))) {
-    await handlePayPal(email, text);
+  let method = null;
+  if (domainMatches(verified, envDomains('CASHAPP_EMAIL_DOMAINS', DEFAULT_CASHAPP_DOMAINS))) method = 'cashapp';
+  else if (domainMatches(verified, envDomains('PAYPAL_EMAIL_DOMAINS', DEFAULT_PAYPAL_DOMAINS))) method = 'paypal';
+
+  if (!method) {
+    console.log(`[EmailWatcher] Ignored "${subject}" — ${verified} is not a payment provider domain`);
     return;
   }
 
-  console.log(`[EmailWatcher] Ignored "${subject}" — ${verified} is not a payment provider domain`);
+  const claim = await claimMessage(email);
+  if (!claim.claimed) {
+    console.log(`[EmailWatcher] Skipping "${subject}" — ${claim.reason}`);
+    return;
+  }
+
+  const recipient = addressedToUs(email, text, method);
+  if (!recipient.ok) {
+    // Genuine provider mail that is not about a payment to us. Most often a
+    // receipt for something we bought — but it is also the shape of a forwarded
+    // notification for someone else's account, so it is worth surfacing.
+    console.warn(`[EmailWatcher] Ignored "${subject}" — ${recipient.reason}`);
+    await recordOutcome(claim.messageId, `rejected: ${recipient.reason}`, null);
+    return;
+  }
+
+  const nonFinal = nonFinalReason(email, text);
+  if (nonFinal) {
+    console.warn(`[EmailWatcher] Ignored "${subject}" — not a settled payment (${nonFinal})`);
+    await releaseClaim(claim.messageId);
+    await raiseAlert('email_payment_not_final',
+      `A ${method} email was rejected as not-final and needs a human: "${subject}"`,
+      { severity: 'warn', context: { method, reason: nonFinal } }).catch(() => {});
+    return;
+  }
+
+  const foreign = foreignCurrencyReason(text);
+  if (foreign) {
+    console.warn(`[EmailWatcher] Ignored "${subject}" — ${foreign}`);
+    await releaseClaim(claim.messageId);
+    await raiseAlert('email_payment_foreign_currency',
+      `A ${method} payment arrived in a non-USD currency and needs manual handling: "${subject}"`,
+      { severity: 'warn', context: { method, reason: foreign } }).catch(() => {});
+    return;
+  }
+
+  if (method === 'cashapp') await handleCashApp(email, text, claim.messageId);
+  else await handlePayPal(email, text, claim.messageId);
 }
 
-async function handleCashApp(email, text) {
-  try {
-    const amountPatterns = [
-      /you received \$?([\d,]+\.?\d*)/i,
-      /received \$?([\d,]+\.?\d*)/i,
-    ];
-    let amount = null;
-    for (const p of amountPatterns) {
-      const m = text.match(p);
-      if (m) { amount = parseFloat(m[1].replace(',', '')); break; }
+// Amount parsing. Anchored on the provider's own receipt wording rather than
+// scanning for any dollar figure: a payer controls their display name and the
+// memo, so a free-floating "$99.99" earlier in the body would otherwise win over
+// the real figure. `.replace(/,/g)` — without the global flag only the first
+// separator was stripped, so "$1,234,567.89" parsed as 1234.
+function parseAmount(text, patterns) {
+  for (const p of patterns) {
+    const m = text.match(p);
+    if (m) {
+      const value = parseFloat(m[1].replace(/,/g, ''));
+      if (Number.isFinite(value)) return value;
     }
+  }
+  return null;
+}
+
+async function handleCashApp(email, text, messageId) {
+  try {
+    const amount = parseAmount(text, [
+      /you received \$([\d,]+\.?\d*)/i,
+      /\bpaid you \$([\d,]+\.?\d*)/i,
+    ]);
 
     // Note is a single word: letters then the 4-digit suffix generateNote adds.
     const notePatterns = [
@@ -208,29 +487,30 @@ async function handleCashApp(email, text) {
 
     if (!note) {
       console.warn('[EmailWatcher] Cash App email had no parseable note — ignoring');
+      // Released, not recorded: if this is a format change, the fix should be
+      // able to pick the payment up on the next scan.
+      await releaseClaim(messageId);
+      // A verified provider email we could not read is how format drift shows
+      // up. Silence here means a paying customer waits forever.
+      await raiseAlert('email_unparseable',
+        `A verified Cash App email could not be parsed — check for a format change: "${email.subject || ''}"`,
+        { severity: 'warn', context: { method: 'cashapp' } }).catch(() => {});
       return;
     }
     console.log(`[EmailWatcher] Cash App — amount: $${amount}, note: ${note}`);
-    await matchAndConfirmOrder(note, amount, 'cashapp');
+    await matchAndConfirmOrder(note, amount, 'cashapp', messageId);
   } catch (err) {
     console.error('[EmailWatcher] Cash App parse error:', err.message);
   }
 }
 
-async function handlePayPal(email, text) {
+async function handlePayPal(email, text, messageId) {
   try {
-    // Amount
-    const amountPatterns = [
-      /sent you \$?([\d,]+\.?\d*)\s*(?:USD)?/i,
-      /you received \$?([\d,]+\.?\d*)\s*(?:USD)?/i,
-      /\$\s*([\d,]+\.?\d*)\s*USD/i,
-      /amount[:\s]+\$?([\d,]+\.?\d*)/i,
-    ];
-    let amount = null;
-    for (const p of amountPatterns) {
-      const m = text.match(p);
-      if (m) { amount = parseFloat(m[1].replace(',', '')); break; }
-    }
+    const amount = parseAmount(text, [
+      /you received \$([\d,]+\.?\d*)/i,
+      /sent you \$([\d,]+\.?\d*)/i,
+      /\bamount received[:\s]+\$([\d,]+\.?\d*)/i,
+    ]);
 
     // Note — PayPal format has note on the LINE AFTER "Note from Name"
     let note = null;
@@ -251,23 +531,31 @@ async function handlePayPal(email, text) {
 
     if (!note) {
       console.warn('[EmailWatcher] PayPal email had no parseable note — ignoring');
+      await releaseClaim(messageId);
+      await raiseAlert('email_unparseable',
+        `A verified PayPal email could not be parsed — check for a format change: "${email.subject || ''}"`,
+        { severity: 'warn', context: { method: 'paypal' } }).catch(() => {});
       return;
     }
 
     console.log(`[EmailWatcher] PayPal — amount: $${amount}, note: ${note}`);
-    await matchAndConfirmOrder(note, amount, 'paypal');
+    await matchAndConfirmOrder(note, amount, 'paypal', messageId);
   } catch (err) {
     console.error('[EmailWatcher] PayPal parse error:', err.message);
   }
 }
 
-async function matchAndConfirmOrder(note, amount, method) {
+async function matchAndConfirmOrder(note, amount, method, messageId) {
   try {
     console.log(`[EmailWatcher] Looking for pending ${method} order with note: ${note}`);
 
+    // expires_at is enforced here as it already is in the crypto poller.
+    // Without it, a months-old 'waiting' order could still settle at the price
+    // it was quoted at, and stale notes stayed matchable forever.
     const { rows } = await query(
       `SELECT * FROM orders
-       WHERE guild_id = $1 AND payment_note = $2 AND payment_method = $3 AND status = 'waiting'
+       WHERE guild_id = $1 AND payment_note = $2 AND payment_method = $3
+         AND status = 'waiting' AND expires_at > now()
        LIMIT 1`,
       [GUILD_ID, note, method]
     );
@@ -275,6 +563,12 @@ async function matchAndConfirmOrder(note, amount, method) {
 
     if (!order) {
       console.warn(`[EmailWatcher] No pending ${method} order for note: ${note}`);
+      await recordOutcome(messageId, 'rejected: no matching open order', null);
+      // Money may have arrived for an expired or already-settled order. That is
+      // a customer who paid and is waiting.
+      await raiseAlert('email_payment_unmatched',
+        `A verified ${method} payment of $${amount} quoted note "${note}" but no open order matches — possibly expired or already paid`,
+        { severity: 'error', context: { method, note, amount } }).catch(() => {});
       return;
     }
 
@@ -286,6 +580,10 @@ async function matchAndConfirmOrder(note, amount, method) {
     // confirmation — the order waits for a human instead.
     if (!Number.isFinite(amount) || amount <= 0) {
       console.warn(`[EmailWatcher] Order ${order.id} NOT confirmed — no amount parsed from the ${method} email`);
+      await recordOutcome(messageId, 'rejected: no amount parsed', order.id);
+      await raiseAlert('email_payment_no_amount',
+        `Order ${order.id} matched a ${method} email but no amount could be parsed — needs manual review`,
+        { severity: 'error', order_id: order.id, context: { method, note } }).catch(() => {});
       return;
     }
 
@@ -295,13 +593,24 @@ async function matchAndConfirmOrder(note, amount, method) {
     if (amount + tolerance < total) {
       console.warn(`[EmailWatcher] Order ${order.id} underpaid — expected $${total}, got $${amount}`);
       await query(
-        `UPDATE orders SET status = 'underpaid', amount_received_cents = $1 WHERE id = $2 AND status = 'waiting'`,
-        [Math.round(amount * 100), order.id]
+        `UPDATE orders SET status = 'underpaid', amount_received_cents = $1,
+                amount_received_native = $2, amount_received_unit = 'usd'
+          WHERE id = $3 AND status = 'waiting'`,
+        [Math.round(amount * 100), amount, order.id]
       ).catch(() => {});
+      await recordOutcome(messageId, 'underpaid', order.id);
+      // An underpaid order is a customer who needs help or someone probing —
+      // either way it sat in the database with nobody informed.
+      await raiseAlert('order_underpaid',
+        `Order ${order.id} underpaid via ${method}: expected $${total.toFixed(2)}, received $${amount.toFixed(2)}`,
+        { severity: 'error', order_id: order.id, context: { method, expected: total, received: amount, email: order.email } }).catch(() => {});
       return;
     }
     if (amount > total) {
       console.warn(`[EmailWatcher] Order ${order.id} overpaid — expected $${total}, got $${amount}`);
+      await raiseAlert('order_overpaid',
+        `Order ${order.id} overpaid via ${method}: expected $${total.toFixed(2)}, received $${amount.toFixed(2)} — refund the difference`,
+        { severity: 'warn', order_id: order.id, context: { method, expected: total, received: amount } }).catch(() => {});
     }
 
     await axios.post(`http://localhost:${process.env.PORT || 3000}/api/orders/confirm`, {
@@ -309,13 +618,23 @@ async function matchAndConfirmOrder(note, amount, method) {
       order_id: order.id,
       amount_received: amount,
       method,
+      // Ties this settlement to the specific email that caused it, so the same
+      // provider notification cannot settle anything a second time.
+      provider_txn_id: messageId || null,
     });
 
+    await recordOutcome(messageId, 'confirmed', order.id);
     console.log(`[EmailWatcher] Order ${order.id} confirmed via ${method} — $${amount}`);
   } catch (err) {
     console.error('[EmailWatcher] Match/confirm error:', err.message);
+    await raiseAlert('email_confirm_failed',
+      `A verified ${method} payment for note "${note}" could not be confirmed: ${err.message}`,
+      { severity: 'error', context: { method, note, amount } }).catch(() => {});
   }
 }
 
 module.exports = { start };
-module.exports.__test__ = { processEmail, verifiedSenderDomain, domainMatches };
+module.exports.__test__ = {
+  processEmail, verifiedSenderDomain, domainMatches,
+  addressedToUs, nonFinalReason, foreignCurrencyReason, parseAmount,
+};

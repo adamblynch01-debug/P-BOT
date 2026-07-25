@@ -5,6 +5,42 @@ const { requireAuth, requireAdmin, publicUser } = require('../utils/auth');
 
 const GUILD_ID = process.env.GUILD_ID;
 
+// Applies a signed delta to a wallet and logs it, or refuses.
+//
+// Both adjust routes used to write the ledger row unconditionally alongside a
+// `GREATEST(0, balance_cents + $1)` update. When a debit exceeded the balance
+// the wallet stopped at zero while the ledger recorded the full amount, so
+// SUM(credits) - SUM(debits) permanently disagreed with balance_cents — the
+// exact drift that makes a reconciliation report untrustworthy. Now the guard
+// is in the UPDATE's own WHERE clause: either the whole delta applies and gets
+// logged, or nothing happens and the caller gets an error.
+async function applyBalanceDelta(webUserId, amountCents, description, kindLabel) {
+  const { rows: balRows } = await query('SELECT web_user_id FROM balances WHERE web_user_id = $1', [webUserId]);
+  if (!balRows.length) {
+    await query('INSERT INTO balances (web_user_id, guild_id, balance_cents) VALUES ($1,$2,0)', [webUserId, GUILD_ID]);
+  }
+
+  const { rows } = await query(
+    `UPDATE balances SET balance_cents = balance_cents + $1, updated_at = now()
+      WHERE web_user_id = $2 AND balance_cents + $1 >= 0
+      RETURNING balance_cents`,
+    [amountCents, webUserId]
+  );
+  if (!rows.length) {
+    const err = new Error('Insufficient balance for that debit');
+    err.statusCode = 400;
+    throw err;
+  }
+
+  await query(
+    `INSERT INTO transactions (guild_id, web_user_id, kind, amount_cents, description)
+     VALUES ($1,$2,$3,$4,$5)`,
+    [GUILD_ID, webUserId, amountCents >= 0 ? 'credit' : 'debit', Math.abs(amountCents), description || kindLabel]
+  );
+
+  return rows[0].balance_cents;
+}
+
 // ─── GET /api/balance/mine ───────────────────────────────
 router.get('/mine', requireAuth, async (req, res) => {
   try {
@@ -106,19 +142,11 @@ router.post('/adjust', async (req, res) => {
     if (!userRows.length) return res.status(404).json({ error: 'User not found' });
     const webUserId = userRows[0].id;
 
-    const { rows } = await query(
-      `UPDATE balances SET balance_cents = balance_cents + $1, updated_at = now()
-       WHERE web_user_id = $2 RETURNING balance_cents`,
-      [amount_cents, webUserId]
-    );
-    await query(
-      `INSERT INTO transactions (guild_id, web_user_id, kind, amount_cents, description)
-       VALUES ($1,$2,$3,$4,$5)`,
-      [GUILD_ID, webUserId, amount_cents >= 0 ? 'credit' : 'debit', Math.abs(amount_cents), description || 'Manual adjustment']
-    );
+    const balanceCents = await applyBalanceDelta(webUserId, amount_cents, description, 'Manual adjustment');
 
-    res.json({ success: true, balance_cents: rows[0].balance_cents, balance: rows[0].balance_cents / 100 });
+    res.json({ success: true, balance_cents: balanceCents, balance: balanceCents / 100 });
   } catch (err) {
+    if (err && err.statusCode === 400) return res.status(400).json({ error: err.message });
     console.error('[Balance] Adjust error:', err);
     res.status(500).json({ error: 'Failed to adjust balance' });
   }
@@ -154,26 +182,13 @@ router.post('/admin/adjust', requireAdmin, async (req, res) => {
     }
 
     // Ensure a balances row exists (some accounts may predate the signup seed),
-    // then apply the delta. Debits are floored at 0 so an admin can't push a
-    // wallet negative. Avoids ON CONFLICT since balances has no guaranteed
-    // unique constraint on web_user_id in this schema.
-    const { rows: balRows } = await query('SELECT web_user_id FROM balances WHERE web_user_id = $1', [webUserId]);
-    if (!balRows.length) {
-      await query('INSERT INTO balances (web_user_id, guild_id, balance_cents) VALUES ($1,$2,0)', [webUserId, GUILD_ID]);
-    }
-    const { rows } = await query(
-      `UPDATE balances SET balance_cents = GREATEST(0, balance_cents + $1), updated_at = now()
-       WHERE web_user_id = $2 RETURNING balance_cents`,
-      [amount_cents, webUserId]
-    );
-    await query(
-      `INSERT INTO transactions (guild_id, web_user_id, kind, amount_cents, description)
-       VALUES ($1,$2,$3,$4,$5)`,
-      [GUILD_ID, webUserId, amount_cents >= 0 ? 'credit' : 'debit', Math.abs(amount_cents), description || 'Admin adjustment']
-    );
+    // then apply the delta. A debit larger than the balance is refused outright
+    // rather than clamped at zero — see applyBalanceDelta.
+    const balanceCents = await applyBalanceDelta(webUserId, amount_cents, description, 'Admin adjustment');
 
-    res.json({ success: true, balance_cents: rows[0].balance_cents, balance: rows[0].balance_cents / 100 });
+    res.json({ success: true, balance_cents: balanceCents, balance: balanceCents / 100 });
   } catch (err) {
+    if (err && err.statusCode === 400) return res.status(400).json({ error: err.message });
     console.error('[Balance] Admin adjust error:', err);
     res.status(500).json({ error: 'Failed to adjust balance' });
   }

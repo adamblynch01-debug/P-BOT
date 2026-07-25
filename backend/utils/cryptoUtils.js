@@ -8,18 +8,50 @@ const GUILD_ID = process.env.GUILD_ID;
 // Safe — xPub is read-only, cannot spend funds
 
 async function getNextAddressIndex(coin) {
+  const { rows } = await query(
+    `SELECT address_index FROM crypto_addresses
+     WHERE guild_id = $1 AND coin = $2
+     ORDER BY address_index DESC LIMIT 1`,
+    [GUILD_ID, coin.toUpperCase()]
+  );
+  if (!rows.length) return 0;
+  return (rows[0].address_index || 0) + 1;
+}
+
+// Derives an address and claims it in one attempt; returns null if the index was
+// taken in the meantime so the caller can retry with a fresh one.
+//
+// `SELECT MAX(index)+1` is a read-then-write, so two concurrent crypto
+// checkouts derive the SAME address and the second INSERT trips the UNIQUE on
+// crypto_addresses. That used to throw into a fallback that generated an
+// address whose private key we never keep — silently making any coins sent
+// there unspendable forever. Retrying the derivation is the fix; the fallback
+// is gone.
+async function claimDerivedAddress(coin, order_id, deriveAt) {
+  const index = await getNextAddressIndex(coin);
+  const address = deriveAt(index);
+  if (!address) return null;
   try {
-    const { rows } = await query(
-      `SELECT address_index FROM crypto_addresses
-       WHERE guild_id = $1 AND coin = $2
-       ORDER BY address_index DESC LIMIT 1`,
-      [GUILD_ID, coin.toUpperCase()]
+    await query(
+      `INSERT INTO crypto_addresses (guild_id, address, order_id, coin, address_index)
+       VALUES ($1,$2,$3,$4,$5)`,
+      [GUILD_ID, address, order_id, coin.toUpperCase(), index]
     );
-    if (!rows.length) return 0;
-    return (rows[0].address_index || 0) + 1;
-  } catch {
-    return 0;
+  } catch (err) {
+    if (err && err.code === '23505') return null; // index or address raced — retry
+    throw err;
   }
+  console.log(`[Crypto] Derived ${coin.toUpperCase()} address #${index}: ${address}`);
+  return address;
+}
+
+async function deriveWithRetry(coin, order_id, deriveAt) {
+  for (let attempt = 0; attempt < 5; attempt++) {
+    const address = await claimDerivedAddress(coin, order_id, deriveAt);
+    if (address) return address;
+  }
+  console.error(`[Crypto] Could not claim a unique ${coin.toUpperCase()} address after 5 attempts`);
+  return null;
 }
 
 async function generateCryptoAddress(coin, order_id) {
@@ -31,6 +63,8 @@ async function generateCryptoAddress(coin, order_id) {
     }
     return null;
   } catch (err) {
+    // Returning null is the safe failure: createOrder leaves the order without
+    // an address so nobody can pay into one we cannot spend from.
     console.error('[Crypto] Address generation error:', err.message);
     return null;
   }
@@ -43,35 +77,20 @@ async function deriveBTCAddress(order_id) {
     return null;
   }
 
-  try {
-    const HDKey = require('hdkey');
-    const bitcoin = require('bitcoinjs-lib');
+  const HDKey = require('hdkey');
+  const bitcoin = require('bitcoinjs-lib');
+  const hdkey = HDKey.fromExtendedKey(xpub);
 
-    const index = await getNextAddressIndex('btc');
-
+  return deriveWithRetry('btc', order_id, (index) => {
     // Derive child key at m/0/index (external chain)
-    const hdkey = HDKey.fromExtendedKey(xpub);
     const child = hdkey.derive(`m/0/${index}`);
-    const pubkey = child.publicKey;
-
     // Generate P2PKH address (legacy) — compatible with most wallets
     const { address } = bitcoin.payments.p2pkh({
-      pubkey,
+      pubkey: child.publicKey,
       network: bitcoin.networks.bitcoin,
     });
-
-    await query(
-      `INSERT INTO crypto_addresses (guild_id, address, order_id, coin, address_index) VALUES ($1,$2,$3,'BTC',$4)`,
-      [GUILD_ID, address, order_id, index]
-    );
-
-    console.log(`[Crypto] Derived BTC address #${index}: ${address}`);
     return address;
-  } catch (err) {
-    console.error('[Crypto] BTC derivation error:', err.message);
-    // Fallback to BlockCypher if xpub derivation fails
-    return await generateViaBlockCypher('btc', order_id);
-  }
+  });
 }
 
 async function deriveLTCAddress(order_id) {
@@ -81,78 +100,39 @@ async function deriveLTCAddress(order_id) {
     return null;
   }
 
+  const HDKey = require('hdkey');
+  const bitcoin = require('bitcoinjs-lib');
+
+  // LTC network params
+  const litecoin = {
+    messagePrefix: '\x19Litecoin Signed Message:\n',
+    bech32: 'ltc',
+    bip32: {
+      public: 0x019da462,  // Ltub
+      private: 0x019d9cfe, // Ltpv
+    },
+    pubKeyHash: 0x30,  // L addresses
+    scriptHash: 0x32,
+    wif: 0xb0,
+  };
+
+  // Handle both Ltub and xpub format
+  let hdkey;
   try {
-    const HDKey = require('hdkey');
-    const bitcoin = require('bitcoinjs-lib');
+    hdkey = HDKey.fromExtendedKey(xpub, litecoin.bip32);
+  } catch {
+    // Try with default BIP32 if Ltub parsing fails
+    hdkey = HDKey.fromExtendedKey(xpub);
+  }
 
-    const index = await getNextAddressIndex('ltc');
-
-    // LTC network params
-    const litecoin = {
-      messagePrefix: '\x19Litecoin Signed Message:\n',
-      bech32: 'ltc',
-      bip32: {
-        public: 0x019da462,  // Ltub
-        private: 0x019d9cfe, // Ltpv
-      },
-      pubKeyHash: 0x30,  // L addresses
-      scriptHash: 0x32,
-      wif: 0xb0,
-    };
-
-    // Handle both Ltub and xpub format
-    let hdkey;
-    try {
-      hdkey = HDKey.fromExtendedKey(xpub, litecoin.bip32);
-    } catch {
-      // Try with default BIP32 if Ltub parsing fails
-      hdkey = HDKey.fromExtendedKey(xpub);
-    }
-
+  return deriveWithRetry('ltc', order_id, (index) => {
     const child = hdkey.derive(`m/0/${index}`);
-    const pubkey = child.publicKey;
-
     const { address } = bitcoin.payments.p2pkh({
-      pubkey,
+      pubkey: child.publicKey,
       network: litecoin,
     });
-
-    await query(
-      `INSERT INTO crypto_addresses (guild_id, address, order_id, coin, address_index) VALUES ($1,$2,$3,'LTC',$4)`,
-      [GUILD_ID, address, order_id, index]
-    );
-
-    console.log(`[Crypto] Derived LTC address #${index}: ${address}`);
     return address;
-  } catch (err) {
-    console.error('[Crypto] LTC derivation error:', err.message);
-    return await generateViaBlockCypher('ltc', order_id);
-  }
-}
-
-// ─── Fallback: BlockCypher address generation ────────────
-async function generateViaBlockCypher(coin, order_id) {
-  try {
-    const token = process.env.BLOCKCYPHER_TOKEN;
-    if (!token) return null;
-
-    const chain = coin === 'btc' ? 'btc/main' : 'ltc/main';
-    const response = await axios.post(
-      `https://api.blockcypher.com/v1/${chain}/addrs?token=${token}`
-    );
-    const address = response.data.address;
-
-    await query(
-      `INSERT INTO crypto_addresses (guild_id, address, order_id, coin, address_index) VALUES ($1,$2,$3,$4,0)`,
-      [GUILD_ID, address, order_id, coin.toUpperCase()]
-    );
-
-    console.log(`[Crypto] BlockCypher fallback address: ${address}`);
-    return address;
-  } catch (err) {
-    console.error('[Crypto] BlockCypher fallback error:', err.message);
-    return null;
-  }
+  });
 }
 
 // ─── Register BlockCypher webhook to watch address ───────

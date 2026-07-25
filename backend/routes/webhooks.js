@@ -3,6 +3,7 @@ const router = express.Router();
 const axios = require('axios');
 const { query } = require('../db');
 const { verifyCryptoPayment } = require('../utils/cryptoUtils');
+const { raiseAlert } = require('../utils/alerts');
 
 const GUILD_ID = process.env.GUILD_ID;
 
@@ -79,7 +80,32 @@ router.post('/crypto', async (req, res) => {
     );
     const order = orderRows[0];
     if (!order) return res.sendStatus(200);
-    if (order.status === 'paid' || order.status === 'delivered') return res.sendStatus(200);
+    if (order.status === 'paid' || order.status === 'delivered') {
+      // Coins arrived at an address whose order is already settled. That money
+      // is real and nobody was being told about it.
+      await raiseAlert('crypto_payment_after_settlement',
+        `Received ${receivedSats} sats at ${ourAddress} for order ${order_id}, which is already ${order.status}`,
+        { severity: 'error', order_id, context: { address: ourAddress, received_sats: receivedSats } }).catch(() => {});
+      return res.sendStatus(200);
+    }
+
+    // 4b. Enforce the order's own deadline. The poller already did
+    //     (`expires_at > now()`), but BlockCypher hooks outlive the order, so a
+    //     payment days later still settled at a quote locked long ago — a free
+    //     option on the coin price. Late money is kept and flagged, not
+    //     auto-delivered.
+    if (order.expires_at && new Date(order.expires_at) < new Date()) {
+      console.warn(`[Webhook] Order ${order_id} paid after expiry — manual review`);
+      await query(
+        `UPDATE orders SET status = 'expired_paid', amount_received_native = $1, amount_received_unit = 'sats'
+          WHERE id = $2 AND status IN ('waiting','underpaid')`,
+        [receivedSats, order_id]
+      ).catch(() => {});
+      await raiseAlert('crypto_payment_after_expiry',
+        `Order ${order_id} received ${receivedSats} sats after it expired (${order.expires_at}) — quote is stale, review before delivering`,
+        { severity: 'error', order_id, context: { address: ourAddress, received_sats: receivedSats } }).catch(() => {});
+      return res.sendStatus(200);
+    }
 
     // 5. Verify the amount covers the locked quote. Fails closed when the order
     //    has no quote, leaving it for manual review rather than free delivery.
@@ -87,9 +113,13 @@ router.post('/crypto', async (req, res) => {
     if (!check.ok) {
       console.warn(`[Webhook] Order ${order_id} NOT confirmed: ${check.reason}`);
       await query(
-        `UPDATE orders SET status = 'underpaid', amount_received_cents = $1 WHERE id = $2 AND status = 'waiting'`,
+        `UPDATE orders SET status = 'underpaid', amount_received_native = $1, amount_received_unit = 'sats'
+          WHERE id = $2 AND status = 'waiting'`,
         [receivedSats, order_id]
       ).catch(() => {});
+      await raiseAlert('order_underpaid',
+        `Order ${order_id} underpaid via ${order.payment_method}: ${check.reason}`,
+        { severity: 'error', order_id, context: { received_sats: receivedSats, reason: check.reason } }).catch(() => {});
       return res.sendStatus(200);
     }
 
@@ -98,6 +128,9 @@ router.post('/crypto', async (req, res) => {
       order_id,
       amount_received: receivedSats,
       method: order.payment_method,
+      // The chain's own transaction hash. Ties the settlement to a specific tx
+      // so a redelivered callback cannot settle anything twice.
+      provider_txn_id: payload.hash || null,
     });
     console.log(`[Webhook] Order ${order_id} confirmed — ${receivedSats} sats`);
 
