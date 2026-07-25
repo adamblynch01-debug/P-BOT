@@ -3,6 +3,29 @@ const { query } = require('../db');
 
 const GUILD_ID = process.env.GUILD_ID;
 
+// ─── Public base URL ─────────────────────────────────────
+// BACKEND_URL is set on Railway as a bare host — "captivating-happiness-…
+// up.railway.app" with no scheme — because that is what the Railway dashboard
+// shows you. Interpolated straight into a callback URL that produced
+// "captivating-happiness-….up.railway.app/api/webhooks/crypto", which is not an
+// absolute URL, so BlockCypher could never call back. The env var is fixed, but
+// normalising here means the next person who pastes a bare host from a
+// dashboard doesn't silently break the webhook again.
+//
+// Returns null when there is nothing usable, so callers can decline to register
+// rather than register a hook that will never fire.
+function publicBaseUrl() {
+  const raw = (process.env.BACKEND_URL || '').trim();
+  if (!raw) {
+    return process.env.PORT ? `http://localhost:${process.env.PORT}` : 'http://localhost:3000';
+  }
+  const withScheme = /^https?:\/\//i.test(raw) ? raw : `https://${raw}`;
+  let parsed;
+  try { parsed = new URL(withScheme); } catch { return null; }
+  if (!parsed.hostname) return null;
+  return withScheme.replace(/\/+$/, ''); // no trailing slash — callers append one
+}
+
 // ─── HD Address Derivation ───────────────────────────────
 // Derives unique addresses from xPub for each order
 // Safe — xPub is read-only, cannot spend funds
@@ -240,6 +263,14 @@ async function registerWebhook(coin, address, order_id) {
       console.warn('[Crypto] No BLOCKCYPHER_TOKEN — webhook not registered, using polling only');
       return;
     }
+    if (!publicBaseUrl()) {
+      // A callback URL BlockCypher cannot parse means the hook is never
+      // delivered, and the failure is invisible: registration itself may still
+      // return 2xx. Polling covers us, so decline to register rather than
+      // pretend a webhook exists.
+      console.warn('[Crypto] BACKEND_URL is not a usable absolute URL — webhook not registered, using polling only');
+      return;
+    }
     // BlockCypher does not sign its callbacks, so the only thing separating a
     // real callback from a forged one is an unguessable URL. Without the secret
     // there is no way to tell them apart — so don't register at all rather than
@@ -251,7 +282,7 @@ async function registerWebhook(coin, address, order_id) {
     }
 
     const chain = coin === 'btc' ? 'btc/main' : 'ltc/main';
-    const backendUrl = process.env.BACKEND_URL || `http://localhost:${process.env.PORT || 3000}`;
+    const backendUrl = publicBaseUrl();
 
     await axios.post(
       `https://api.blockcypher.com/v1/${chain}/hooks?token=${token}`,
