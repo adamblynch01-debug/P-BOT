@@ -114,33 +114,72 @@ function fetchRecent() {
   });
 }
 
+// ─── Sender verification ─────────────────────────────────
+// This is the ONLY thing that decides whether an email is treated as a payment
+// notification. A From line is trivially forged and `subject.includes(...)`
+// let any stranger's email reach the confirm path, so neither is trusted here.
+//
+// Gmail has already run SPF/DKIM/DMARC by the time we fetch the message over
+// IMAP and stamps its verdict into an Authentication-Results header. That
+// verdict is the trustworthy signal. Only the FIRST such header is read:
+// Gmail prepends its own on receipt, so anything below it was supplied by the
+// sender and is attacker-controlled.
+
+const DEFAULT_CASHAPP_DOMAINS = ['cash.app', 'square.com', 'squareup.com'];
+const DEFAULT_PAYPAL_DOMAINS = ['paypal.com'];
+
+function envDomains(name, fallback) {
+  const raw = (process.env[name] || '').trim();
+  if (!raw) return fallback;
+  const list = raw.split(',').map(s => s.trim().toLowerCase()).filter(Boolean);
+  return list.length ? list : fallback;
+}
+
+// Exact domain or a subdomain of it (e.g. "e.paypal.com" for "paypal.com").
+function domainMatches(domain, allowed) {
+  if (!domain) return false;
+  const d = String(domain).toLowerCase();
+  return allowed.some(a => d === a || d.endsWith('.' + a));
+}
+
+function verifiedSenderDomain(parsed) {
+  const header = (parsed.headerLines || []).find(h => h.key === 'authentication-results');
+  if (!header) return null;
+
+  const body = String(header.line).replace(/^authentication-results:\s*/i, '');
+  // The verdict must be Gmail's own, not one the sender wrote themselves.
+  if (!/^mx\.google\.com\b/i.test(body.split(';')[0].trim())) return null;
+
+  const dmarc = body.match(/dmarc=pass[^;]*?header\.from=([a-z0-9.-]+)/i);
+  if (dmarc) return dmarc[1].toLowerCase();
+
+  const dkim = body.match(/dkim=pass[^;]*?header\.(?:i=@|d=)([a-z0-9.-]+)/i);
+  if (dkim) return dkim[1].toLowerCase();
+
+  return null;
+}
+
 async function processEmail(email) {
-  const from = (email.from?.text || '').toLowerCase();
-  const subject = (email.subject || '').toLowerCase();
-  // Use plain text only — HTML has CSS noise like "0px" that breaks parsing
+  const subject = email.subject || '';
+  // Plain text only — HTML carries CSS noise like "0px" that breaks parsing.
   const text = (email.text || '');
 
-  console.log(`[EmailWatcher] Checking: from="${from}" | subject="${subject}"`);
+  const verified = verifiedSenderDomain(email);
+  if (!verified) {
+    console.warn(`[EmailWatcher] Ignored "${subject}" — no Gmail DMARC/DKIM pass on the sender`);
+    return;
+  }
 
-  if (
-    from.includes('cash.app') ||
-    from.includes('square.com') ||
-    from.includes('squareup.com') ||
-    subject.includes('sent you') ||
-    subject.includes('payment received')
-  ) {
+  if (domainMatches(verified, envDomains('CASHAPP_EMAIL_DOMAINS', DEFAULT_CASHAPP_DOMAINS))) {
     await handleCashApp(email, text);
+    return;
+  }
+  if (domainMatches(verified, envDomains('PAYPAL_EMAIL_DOMAINS', DEFAULT_PAYPAL_DOMAINS))) {
+    await handlePayPal(email, text);
+    return;
   }
 
-  if (
-    from.includes('paypal.com') ||
-    from.includes('@paypal') ||
-    subject.includes('sent you') ||
-    subject.includes('you received') ||
-    subject.includes('payment received')
-  ) {
-    await handlePayPal(email, text);
-  }
+  console.log(`[EmailWatcher] Ignored "${subject}" — ${verified} is not a payment provider domain`);
 }
 
 async function handleCashApp(email, text) {
@@ -155,11 +194,11 @@ async function handleCashApp(email, text) {
       if (m) { amount = parseFloat(m[1].replace(',', '')); break; }
     }
 
-    // Note is a single lowercase word 4-12 chars, no numbers only
+    // Note is a single word: letters then the 4-digit suffix generateNote adds.
     const notePatterns = [
-      /note[:\s]+([a-z]{4,12})/i,
-      /for[:\s]+"?([a-z]{4,12})"?/i,
-      /memo[:\s]+([a-z]{4,12})/i,
+      /note[:\s]+([a-z]{4,12}\d{4})/i,
+      /for[:\s]+"?([a-z]{4,12}\d{4})"?/i,
+      /memo[:\s]+([a-z]{4,12}\d{4})/i,
     ];
     let note = null;
     for (const p of notePatterns) {
@@ -167,8 +206,11 @@ async function handleCashApp(email, text) {
       if (m) { note = m[1].toLowerCase().trim(); break; }
     }
 
+    if (!note) {
+      console.warn('[EmailWatcher] Cash App email had no parseable note — ignoring');
+      return;
+    }
     console.log(`[EmailWatcher] Cash App — amount: $${amount}, note: ${note}`);
-    if (!note) return;
     await matchAndConfirmOrder(note, amount, 'cashapp');
   } catch (err) {
     console.error('[EmailWatcher] Cash App parse error:', err.message);
@@ -177,9 +219,6 @@ async function handleCashApp(email, text) {
 
 async function handlePayPal(email, text) {
   try {
-    console.log('[EmailWatcher] PayPal plain text:');
-    console.log(text.substring(0, 500));
-
     // Amount
     const amountPatterns = [
       /sent you \$?([\d,]+\.?\d*)\s*(?:USD)?/i,
@@ -202,18 +241,16 @@ async function handlePayPal(email, text) {
       if (lines[i].toLowerCase().startsWith('note from') || lines[i].toLowerCase() === 'note') {
         // Note text is on the next line
         const nextLine = lines[i + 1] || '';
-        const match = nextLine.match(/^([a-z][a-z0-9]{3,15})$/i);
+        const match = nextLine.match(/^([a-z]{4,12}\d{4})$/i);
         if (match) {
           note = match[1].toLowerCase();
-          console.log(`[EmailWatcher] Found note on next line: "${note}"`);
           break;
         }
       }
     }
 
-    // Fallback: scan all pending orders and match note in text
     if (!note) {
-      await findNoteInText(text, amount, 'paypal');
+      console.warn('[EmailWatcher] PayPal email had no parseable note — ignoring');
       return;
     }
 
@@ -221,29 +258,6 @@ async function handlePayPal(email, text) {
     await matchAndConfirmOrder(note, amount, 'paypal');
   } catch (err) {
     console.error('[EmailWatcher] PayPal parse error:', err.message);
-  }
-}
-
-async function findNoteInText(text, amount, method) {
-  try {
-    const { rows: orders } = await query(
-      `SELECT id, payment_note, total_cents FROM orders
-       WHERE guild_id = $1 AND payment_method = $2 AND status = 'waiting'`,
-      [GUILD_ID, method]
-    );
-
-    if (!orders.length) return;
-
-    for (const order of orders) {
-      if (order.payment_note && text.toLowerCase().includes(order.payment_note.toLowerCase())) {
-        console.log(`[EmailWatcher] Found note "${order.payment_note}" in email text!`);
-        await matchAndConfirmOrder(order.payment_note, amount, method);
-        return;
-      }
-    }
-    console.warn('[EmailWatcher] Could not find any pending order note in email');
-  } catch (err) {
-    console.error('[EmailWatcher] findNoteInText error:', err.message);
   }
 }
 
@@ -265,11 +279,29 @@ async function matchAndConfirmOrder(note, amount, method) {
     }
 
     const total = order.total_cents / 100;
-    console.log(`[EmailWatcher] Found order ${order.id} — total: $${total}, received: $${amount}`);
 
-    if (amount && Math.abs(amount - total) > 1.00) {
-      console.warn(`[EmailWatcher] Amount mismatch — expected $${total}, got $${amount}`);
+    // An unparseable amount used to fall straight through this check (`amount`
+    // was null, so the guard was skipped and the order confirmed), which made
+    // omitting the figure easier than forging it. No amount now means no
+    // confirmation — the order waits for a human instead.
+    if (!Number.isFinite(amount) || amount <= 0) {
+      console.warn(`[EmailWatcher] Order ${order.id} NOT confirmed — no amount parsed from the ${method} email`);
       return;
+    }
+
+    // Underpayment is rejected; overpayment is accepted and noted, since
+    // refusing money the customer already sent just creates a support ticket.
+    const tolerance = parseFloat(process.env.EMAIL_UNDERPAY_TOLERANCE_USD || '0.01');
+    if (amount + tolerance < total) {
+      console.warn(`[EmailWatcher] Order ${order.id} underpaid — expected $${total}, got $${amount}`);
+      await query(
+        `UPDATE orders SET status = 'underpaid', amount_received_cents = $1 WHERE id = $2 AND status = 'waiting'`,
+        [Math.round(amount * 100), order.id]
+      ).catch(() => {});
+      return;
+    }
+    if (amount > total) {
+      console.warn(`[EmailWatcher] Order ${order.id} overpaid — expected $${total}, got $${amount}`);
     }
 
     await axios.post(`http://localhost:${process.env.PORT || 3000}/api/orders/confirm`, {
@@ -279,10 +311,11 @@ async function matchAndConfirmOrder(note, amount, method) {
       method,
     });
 
-    console.log(`[EmailWatcher] ✅ Order ${order.id} confirmed via ${method}!`);
+    console.log(`[EmailWatcher] Order ${order.id} confirmed via ${method} — $${amount}`);
   } catch (err) {
     console.error('[EmailWatcher] Match/confirm error:', err.message);
   }
 }
 
 module.exports = { start };
+module.exports.__test__ = { processEmail, verifiedSenderDomain, domainMatches };
