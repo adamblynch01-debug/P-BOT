@@ -2,7 +2,7 @@ const express = require('express');
 const router = express.Router();
 const { query } = require('../db');
 const { generateNote } = require('../utils/noteGenerator');
-const { generateCryptoAddress, registerWebhook } = require('../utils/cryptoUtils');
+const { generateCryptoAddress, registerWebhook, quoteCrypto } = require('../utils/cryptoUtils');
 const { notifyBot } = require('../utils/botNotify');
 const { attachUser, requireAuth, requireAdmin } = require('../utils/auth');
 
@@ -133,10 +133,30 @@ async function createOrder({ items, email, discord_id, payment_method, web_user_
     payment_info = { cashtag: process.env.CASHAPP_CASHTAG || '$YOUR_CASHTAG', note, amount: total };
   } else if (payment_method === 'paypal') {
     payment_info = { email: process.env.PAYPAL_EMAIL || 'your@paypal.com', note, amount: total };
-  } else if (payment_method === 'btc') {
-    payment_info = { address: crypto_address, amount: total, coin: 'BTC' };
-  } else if (payment_method === 'ltc') {
-    payment_info = { address: crypto_address, amount: total, coin: 'LTC' };
+  } else if (payment_method === 'btc' || payment_method === 'ltc') {
+    // Lock the USD→coin rate at order time. The customer is quoted dollars but
+    // pays satoshis, so without a stored quote there is nothing to validate the
+    // incoming payment against — which is exactly how a 1-satoshi payment used
+    // to settle any invoice. expected_sats is what the confirm path checks.
+    const coin = payment_method;
+    const quote = await quoteCrypto(coin, total);
+    payment_info = {
+      address: crypto_address,
+      amount: total,
+      coin: coin.toUpperCase(),
+      ...(quote ? {
+        coin_amount: quote.coin_amount,
+        expected_sats: quote.expected_sats,
+        rate_usd: quote.rate_usd,
+        quoted_at: new Date().toISOString(),
+      } : {}),
+    };
+    if (!quote) {
+      // No rate means no verifiable quote. Say so loudly: verifyCryptoPayment
+      // fails closed on a missing quote, so these orders will need manual
+      // review rather than settling on their own.
+      console.error(`[Orders] No ${coin.toUpperCase()} rate for order ${order.id} — payment cannot be auto-verified`);
+    }
   } else if (payment_method === 'balance') {
     payment_info = { amount: total };
   }

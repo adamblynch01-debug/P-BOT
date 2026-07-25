@@ -163,6 +163,15 @@ async function registerWebhook(coin, address, order_id) {
       console.warn('[Crypto] No BLOCKCYPHER_TOKEN — webhook not registered, using polling only');
       return;
     }
+    // BlockCypher does not sign its callbacks, so the only thing separating a
+    // real callback from a forged one is an unguessable URL. Without the secret
+    // there is no way to tell them apart — so don't register at all rather than
+    // stand up an endpoint that trusts anyone who finds it.
+    const hookSecret = process.env.WEBHOOK_SECRET;
+    if (!hookSecret) {
+      console.warn('[Crypto] No WEBHOOK_SECRET — webhook not registered, using polling only');
+      return;
+    }
 
     const chain = coin === 'btc' ? 'btc/main' : 'ltc/main';
     const backendUrl = process.env.BACKEND_URL || `http://localhost:${process.env.PORT || 3000}`;
@@ -172,7 +181,7 @@ async function registerWebhook(coin, address, order_id) {
       {
         event: 'confirmed-tx',
         address,
-        url: `${backendUrl}/api/webhooks/crypto?order_id=${order_id}`,
+        url: `${backendUrl}/api/webhooks/crypto?token=${encodeURIComponent(hookSecret)}`,
         confirmations: 1,
       }
     );
@@ -182,4 +191,85 @@ async function registerWebhook(coin, address, order_id) {
   }
 }
 
-module.exports = { generateCryptoAddress, registerWebhook };
+// ─── USD → coin rate ─────────────────────────────────────
+// Checkout quotes crypto orders in DOLLARS (payment_info.amount is the USD
+// total), but the chain reports satoshis. Without a rate the two are
+// incomparable, which is why the payment amount went unvalidated for so long.
+// The rate is locked at order time and stored on the order: that is the number
+// the customer was actually quoted, so it — not today's price — is what the
+// payment gets checked against.
+const COIN_IDS = { btc: 'bitcoin', ltc: 'litecoin' };
+
+async function getUsdRate(coin) {
+  try {
+    const id = COIN_IDS[String(coin).toLowerCase()];
+    if (!id) return null;
+    const { data } = await axios.get(
+      `https://api.coingecko.com/api/v3/simple/price?ids=${id}&vs_currencies=usd`,
+      { timeout: 8000 }
+    );
+    const rate = data && data[id] && data[id].usd;
+    return Number.isFinite(rate) && rate > 0 ? rate : null;
+  } catch (err) {
+    console.error('[Crypto] Rate fetch error:', err.message);
+    return null;
+  }
+}
+
+// Returns { coin_amount, expected_sats, rate_usd } or null if the rate is
+// unavailable. Null means "we cannot price this order" — callers must then
+// refuse to auto-confirm rather than guessing.
+async function quoteCrypto(coin, usdTotal) {
+  const rate = await getUsdRate(coin);
+  if (!rate) return null;
+  const coinAmount = usdTotal / rate;
+  return {
+    coin_amount: Number(coinAmount.toFixed(8)),
+    expected_sats: Math.round(coinAmount * 1e8),
+    rate_usd: rate,
+  };
+}
+
+// ─── Payment validation ──────────────────────────────────
+// Underpayment tolerance covers rounding and wallet fee quirks only. It is NOT
+// meant to absorb price movement — the quote is locked for the order's 24h
+// window and that risk is the store's, not a reason to widen the gate.
+function underpayTolerance() {
+  const pct = parseFloat(process.env.CRYPTO_UNDERPAY_TOLERANCE_PERCENT);
+  return Number.isFinite(pct) && pct >= 0 && pct <= 20 ? pct : 2;
+}
+
+// Fails CLOSED: an order with no locked quote returns ok:false, so a missing
+// or malformed quote leaves the order waiting for manual review instead of
+// being handed out for free.
+function verifyCryptoPayment(order, receivedSats) {
+  let info = order.payment_info;
+  if (typeof info === 'string') {
+    try { info = JSON.parse(info); } catch { info = null; }
+  }
+  const expected = info && Number(info.expected_sats);
+  if (!Number.isFinite(expected) || expected <= 0) {
+    return { ok: false, reason: 'no locked crypto quote on this order — manual review required' };
+  }
+  if (!Number.isFinite(receivedSats) || receivedSats <= 0) {
+    return { ok: false, reason: 'no satoshis received' };
+  }
+  const minimum = Math.floor(expected * (1 - underpayTolerance() / 100));
+  if (receivedSats < minimum) {
+    return {
+      ok: false,
+      reason: `underpaid — expected ~${expected} sats, received ${receivedSats}`,
+      expected_sats: expected,
+      received_sats: receivedSats,
+    };
+  }
+  return { ok: true, expected_sats: expected, received_sats: receivedSats };
+}
+
+module.exports = {
+  generateCryptoAddress,
+  registerWebhook,
+  getUsdRate,
+  quoteCrypto,
+  verifyCryptoPayment,
+};

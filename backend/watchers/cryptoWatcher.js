@@ -1,6 +1,7 @@
 const cron = require('node-cron');
 const axios = require('axios');
 const { query } = require('../db');
+const { verifyCryptoPayment } = require('../utils/cryptoUtils');
 
 const GUILD_ID = process.env.GUILD_ID;
 
@@ -40,14 +41,29 @@ async function checkAddress(order) {
     );
 
     const confirmed = res.data.balance || 0;
-    if (confirmed > 0) {
-      await axios.post(`http://localhost:${process.env.PORT || 3000}/api/orders/confirm`, {
-        secret: process.env.API_SECRET,
-        order_id: order.id,
-        amount_received: confirmed,
-        method: coin,
-      });
+    if (confirmed <= 0) return;
+
+    // Previously any balance > 0 confirmed the order, so a single satoshi paid
+    // off a $500 invoice. Check the received amount against the quote locked at
+    // order time; underpaid orders are flagged for manual review, never
+    // delivered.
+    const check = verifyCryptoPayment(order, confirmed);
+    if (!check.ok) {
+      console.warn(`[CryptoWatcher] Order ${order.id} NOT confirmed: ${check.reason}`);
+      await query(
+        `UPDATE orders SET status = 'underpaid', amount_received_cents = $1 WHERE id = $2 AND status = 'waiting'`,
+        [confirmed, order.id]
+      ).catch(() => {});
+      return;
     }
+
+    await axios.post(`http://localhost:${process.env.PORT || 3000}/api/orders/confirm`, {
+      secret: process.env.API_SECRET,
+      order_id: order.id,
+      amount_received: confirmed,
+      method: coin,
+    });
+    console.log(`[CryptoWatcher] Order ${order.id} confirmed — ${confirmed} sats`);
   } catch (err) {
     console.error(`[CryptoWatcher] Address check error:`, err.message);
   }
