@@ -181,11 +181,13 @@ router.post('/adjust', async (req, res) => {
 
 // ─── POST /api/reseller/purchase ─────────────────────────
 // The reseller keygen-buy: debit the reseller wallet by the discounted total,
-// record a reseller_orders row with the generated keys, and log the debit.
-// Server-authoritative: role, discount, list price, and balance ALL come from
-// the DB. tier_id identifies what is being bought; any client-sent price is
-// ignored, because the browser's tier <option> value is the price itself and a
-// reseller could edit it in devtools to mint keys for a cent.
+// claim that many real keys from the reseller_stock pool, record a
+// reseller_orders row, and log the debit.
+// Server-authoritative: role, discount, list price, KEYS, and balance ALL come
+// from the DB. tier_id identifies what is being bought; any client-sent price
+// or key list is ignored, because the browser's tier <option> value is the
+// price itself and a reseller could edit it in devtools to mint keys for a
+// cent — and browser-minted keys were never real inventory to begin with.
 router.post('/purchase', requireAuth, async (req, res) => {
   try {
     // A wallet debit must never be available to a non-reseller. requireAuth
@@ -194,16 +196,10 @@ router.post('/purchase', requireAuth, async (req, res) => {
     if (!isReseller) return res.status(403).json({ error: 'Not a reseller account' });
     if (req.user.reseller_suspended) return res.status(403).json({ error: 'Reseller account suspended' });
 
-    const { product, tier, tier_id, qty, keys } = req.body;
+    const { product, tier, tier_id, qty } = req.body;
     const q = parseInt(qty, 10);
     if (!Number.isInteger(q) || q < 1 || q > MAX_KEYGEN_QTY) {
       return res.status(400).json({ error: `qty must be between 1 and ${MAX_KEYGEN_QTY}` });
-    }
-    if (!Array.isArray(keys) || keys.length !== q) {
-      return res.status(400).json({ error: 'keys[] must be provided and match qty' });
-    }
-    if (!keys.every(k => typeof k === 'string' && k.trim() && k.length <= 128)) {
-      return res.status(400).json({ error: 'keys[] must be non-empty strings' });
     }
 
     // Price comes from product_tiers, never from the request.
@@ -222,6 +218,18 @@ router.post('/purchase', requireAuth, async (req, res) => {
     const unitCents = Math.round(listCents * (1 - discount / 100));
     const totalCents = unitCents * q;
 
+    // Refuse early if the reseller pool can't cover the order, so we don't
+    // debit for keys we can't hand over. The claim below is still atomic —
+    // this check only produces a better error than a partial fill.
+    const { rows: avail } = await query(
+      `SELECT COUNT(*)::int AS n FROM reseller_stock
+       WHERE guild_id = $1 AND tier_id = $2 AND used = false`,
+      [GUILD_ID, tierRow.id]
+    );
+    if (avail[0].n < q) {
+      return res.status(400).json({ error: `Only ${avail[0].n} key(s) in stock for this tier` });
+    }
+
     const bal = await ensureResellerWallet(req.user.id);
     if (bal < totalCents) return res.status(400).json({ error: 'Insufficient reseller balance' });
 
@@ -235,6 +243,38 @@ router.post('/purchase', requireAuth, async (req, res) => {
     );
     if (!rows.length) return res.status(400).json({ error: 'Insufficient reseller balance' });
 
+    // Claim the keys. FOR UPDATE SKIP LOCKED so two concurrent keygens can
+    // never be handed the same key. If the pool was drained between the check
+    // and here, refund what we just debited rather than short-changing them.
+    const { rows: claimed } = await query(
+      `UPDATE reseller_stock SET used = true, used_at = now()
+       WHERE id IN (
+         SELECT id FROM reseller_stock
+         WHERE guild_id = $1 AND tier_id = $2 AND used = false
+         ORDER BY id ASC LIMIT $3 FOR UPDATE SKIP LOCKED
+       )
+       RETURNING value`,
+      [GUILD_ID, tierRow.id, q]
+    );
+
+    if (claimed.length < q) {
+      // Put back both the money and any keys we managed to take.
+      await query(
+        `UPDATE reseller_balances SET balance_cents = balance_cents + $1, updated_at = now()
+         WHERE web_user_id = $2`,
+        [totalCents, req.user.id]
+      );
+      if (claimed.length) {
+        await query(
+          `UPDATE reseller_stock SET used = false, used_at = NULL
+           WHERE guild_id = $1 AND tier_id = $2 AND value = ANY($3::text[]) AND used = true`,
+          [GUILD_ID, tierRow.id, claimed.map(r => r.value)]
+        );
+      }
+      return res.status(400).json({ error: 'Stock was claimed by another order, please retry' });
+    }
+
+    const keys = claimed.map(r => r.value);
     const productName = tierRow.product_name || product || 'Item';
     const tierLabel = tierRow.label || tier || null;
     const { rows: ord } = await query(
@@ -243,18 +283,89 @@ router.post('/purchase', requireAuth, async (req, res) => {
       [GUILD_ID, req.user.id, productName, tierLabel, q, unitCents, totalCents, JSON.stringify(keys)]
     );
     await query(
+      `UPDATE reseller_stock SET order_id = $1 WHERE guild_id = $2 AND tier_id = $3 AND value = ANY($4::text[]) AND used = true AND order_id IS NULL`,
+      [ord[0].id, GUILD_ID, tierRow.id, keys]
+    );
+    await query(
       `INSERT INTO reseller_transactions (guild_id, web_user_id, kind, amount_cents, description)
        VALUES ($1,$2,'debit',$3,$4)`,
       [GUILD_ID, req.user.id, totalCents, `Key Gen: ${productName}${tierLabel ? ' (' + tierLabel + ')' : ''} × ${q}`]
     );
     res.json({
-      success: true, order_id: String(ord[0].id),
+      success: true, order_id: String(ord[0].id), keys,
       unit: unitCents / 100, total: totalCents / 100, discount,
       balance_cents: Number(rows[0].balance_cents), balance: Number(rows[0].balance_cents) / 100,
     });
   } catch (err) {
     console.error('[Reseller] purchase error:', err);
     res.status(500).json({ error: 'Failed to complete reseller purchase' });
+  }
+});
+
+// ─── GET /api/reseller/stock/bulk?ids=1,2,3 ──────────────
+// Available reseller-pool keys per tier, so the keygen panel can badge tiers
+// and refuse to offer what it can't deliver. Reseller-gated: retail customers
+// have no business reading the reseller pool.
+router.get('/stock/bulk', requireAuth, async (req, res) => {
+  try {
+    const isReseller = req.user.role === 'reseller' || !!req.user.reseller_role
+      || ['admin', 'staff'].includes(req.user.role);
+    if (!isReseller) return res.status(403).json({ error: 'Not a reseller account' });
+    const ids = String(req.query.ids || '')
+      .split(',')
+      .map(s => parseInt(s.trim(), 10))
+      .filter(n => Number.isInteger(n));
+    if (!ids.length) return res.json({ stock: {} });
+    const { rows } = await query(
+      `SELECT tier_id, COUNT(*)::int AS n FROM reseller_stock
+       WHERE guild_id = $1 AND used = false AND tier_id = ANY($2::bigint[])
+       GROUP BY tier_id`,
+      [GUILD_ID, ids]
+    );
+    const stock = {};
+    for (const r of rows) stock[r.tier_id] = r.n;
+    res.json({ stock });
+  } catch (err) {
+    console.error('[Reseller] stock bulk error:', err);
+    res.status(500).json({ error: 'Failed to fetch reseller stock' });
+  }
+});
+
+// ─── GET /api/reseller/stock/list/:tier_id ───────────────
+// Admin readback of the UNUSED reseller keys for a tier, so the panel's
+// restock textarea can prefill with what is actually deliverable.
+router.get('/stock/list/:tier_id', requireAdmin, async (req, res) => {
+  try {
+    const { rows } = await query(
+      `SELECT value FROM reseller_stock
+       WHERE guild_id = $1 AND tier_id = $2 AND used = false ORDER BY id ASC`,
+      [GUILD_ID, req.params.tier_id]
+    );
+    res.json({ tier_id: String(req.params.tier_id), items: rows.map(r => r.value) });
+  } catch (err) {
+    console.error('[Reseller] stock list error:', err);
+    res.status(500).json({ error: 'Failed to list reseller stock' });
+  }
+});
+
+// ─── POST /api/reseller/stock/set ────────────────────────
+// Admin replaces the UNUSED reseller keys for a tier. Claimed keys are left
+// alone so past reseller orders keep their history.
+router.post('/stock/set', requireAdmin, async (req, res) => {
+  try {
+    const { tier_id, items } = req.body;
+    if (!tier_id || !Array.isArray(items)) {
+      return res.status(400).json({ error: 'tier_id and items[] are required' });
+    }
+    const clean = items.map(v => String(v).trim()).filter(v => v !== '' && v.length <= 512);
+    await query('DELETE FROM reseller_stock WHERE guild_id = $1 AND tier_id = $2 AND used = false', [GUILD_ID, tier_id]);
+    for (const value of clean) {
+      await query('INSERT INTO reseller_stock (guild_id, tier_id, value) VALUES ($1,$2,$3)', [GUILD_ID, tier_id, value]);
+    }
+    res.json({ success: true, count: clean.length });
+  } catch (err) {
+    console.error('[Reseller] stock set error:', err);
+    res.status(500).json({ error: 'Failed to set reseller stock' });
   }
 });
 
