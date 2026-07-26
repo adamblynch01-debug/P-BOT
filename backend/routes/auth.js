@@ -5,8 +5,33 @@ const { query } = require('../db');
 const {
   hashPassword, verifyPassword, createSession, requireAuth, requireAdmin, publicUser,
 } = require('../utils/auth');
+const { rateLimit, safeCompare } = require('../utils/rateLimit');
 
 const GUILD_ID = process.env.GUILD_ID;
+
+// ─── Rate limiters ───────────────────────────────────────
+// Every endpoint below that takes a guessable secret gets one. Before this the
+// backend had no limiting anywhere, so /panel-unlock and /vault-unlock were
+// unauthenticated, unlimited-attempt oracles returning a clean boolean.
+//
+// The unlock gates carry a globalMax as well as a per-IP max: they are pure
+// guess-oracles, and a per-IP limit alone does nothing against an attacker
+// rotating addresses. A shared ceiling is acceptable there because only staff
+// ever hit those routes — 60 attempts/15min across the whole internet is far
+// more than legitimate use and far less than a useful brute force.
+//
+// login/signup deliberately have NO globalMax: a shared ceiling on those would
+// let one abuser lock every real customer out of the store.
+const unlockLimiter = rateLimit({ windowMs: 15 * 60 * 1000, max: 10, globalMax: 60, name: 'unlock' });
+const loginLimiter = rateLimit({ windowMs: 15 * 60 * 1000, max: 20, name: 'login' });
+const signupLimiter = rateLimit({ windowMs: 60 * 60 * 1000, max: 10, name: 'signup' });
+// API_SECRET-gated admin routes. The secret is 32 random bytes so this is not
+// the thing standing between an attacker and the account, but an unlimited
+// 401-oracle is still free reconnaissance.
+const secretLimiter = rateLimit({ windowMs: 15 * 60 * 1000, max: 30, globalMax: 200, name: 'secret-gated' });
+// Discord passwordless login: initiate makes SUPERBOT send a real DM, so an
+// unlimited rate here is a DM-spam amplifier pointed at a customer's inbox.
+const discordLoginLimiter = rateLimit({ windowMs: 15 * 60 * 1000, max: 15, name: 'discord-login' });
 
 // SUPERBOT (Discord 2FA server) base URL — same service the storefront's 2FA
 // modal talks to, but here we call it server-to-server so the browser never
@@ -151,7 +176,7 @@ router.get('/discord-oauth/callback', async (req, res) => {
 });
 
 // ─── POST /api/auth/signup ──────────────────────────────
-router.post('/signup', async (req, res) => {
+router.post('/signup', signupLimiter, async (req, res) => {
   try {
     const { username, email, password } = req.body;
     if (!username || !email || !password) {
@@ -190,7 +215,7 @@ router.post('/signup', async (req, res) => {
 });
 
 // ─── POST /api/auth/login ───────────────────────────────
-router.post('/login', async (req, res) => {
+router.post('/login', loginLimiter, async (req, res) => {
   try {
     const { username, password } = req.body;
     if (!username || !password) {
@@ -257,30 +282,95 @@ router.post('/confirm-discord', requireAuth, async (req, res) => {
 // ─── POST /api/auth/set-role ─────────────────────────────
 // Admin bootstrap / role management — gated by the same API_SECRET used
 // everywhere else in this backend rather than requireAdmin, so the very
-// first admin can be promoted with no existing admin account yet.
-router.post('/set-role', async (req, res) => {
+// first admin can be promoted with no existing admin account yet. This is what
+// the bot's /web-promote calls.
+//
+// Accepts THREE ways of naming the target, because the bot offers all three:
+//   username    — website username (also matches email, see below)
+//   email       — website email
+//   discord_id  — the linked Discord account, so staff can just pick a member
+//                 out of the Discord picker instead of knowing their site login
+//
+// `username` matches username OR email. The bot's option has always been
+// described as "Website username or email" but the SQL only ever compared
+// username, so an email silently 404'd. Fixed here rather than in the bot so
+// the panel and any other caller get it too.
+//
+// discord_id is compared as TEXT and never parsed as a number: 19-digit
+// snowflakes exceed Number.MAX_SAFE_INTEGER and parseInt() would round them to
+// a different, non-existent id.
+router.post('/set-role', secretLimiter, async (req, res) => {
   try {
-    const { secret, username, role } = req.body;
-    if (secret !== process.env.API_SECRET) return res.status(401).json({ error: 'Unauthorized' });
+    const { secret, username, email, discord_id, role } = req.body;
+    if (!process.env.API_SECRET) return res.status(503).json({ error: 'Server not configured' });
+    if (!safeCompare(secret, process.env.API_SECRET)) return res.status(401).json({ error: 'Unauthorized' });
     if (!['member', 'staff', 'admin', 'reseller'].includes(role)) {
       return res.status(400).json({ error: 'Invalid role' });
     }
-    const { rows } = await query(
-      `UPDATE web_users SET role = $1 WHERE guild_id = $2 AND lower(username) = lower($3) RETURNING id, username, role`,
-      [role, GUILD_ID, username]
+
+    const ident = username != null ? String(username).trim() : '';
+    const mail = email != null ? String(email).trim() : '';
+    const did = discord_id != null ? String(discord_id).trim() : '';
+    if (!ident && !mail && !did) {
+      return res.status(400).json({ error: 'username, email, or discord_id is required' });
+    }
+
+    // Look the row up first so a miss can say WHICH identifier missed. A blind
+    // UPDATE ... RETURNING can only report the generic "User not found", which
+    // is what made the email case so confusing to diagnose.
+    const { rows: found } = await query(
+      `SELECT id, username, email, discord_id, discord_verified, role FROM web_users
+       WHERE guild_id = $1
+         AND ( ($2 <> '' AND (lower(username) = lower($2) OR lower(email) = lower($2)))
+            OR ($3 <> '' AND lower(email) = lower($3))
+            OR ($4 <> '' AND discord_id = $4) )`,
+      [GUILD_ID, ident, mail, did]
     );
-    if (!rows.length) return res.status(404).json({ error: 'User not found' });
-    res.json({ success: true, user: rows[0] });
+
+    if (!found.length) {
+      return res.status(404).json({
+        error: did && !ident && !mail
+          ? 'No website account is linked to that Discord user. They need to sign up and link Discord first.'
+          : 'User not found',
+      });
+    }
+    if (found.length > 1) {
+      // Different identifiers resolving to different people — refuse rather
+      // than promote an arbitrary one of them.
+      return res.status(409).json({
+        error: 'That matched more than one account. Use a single, more specific identifier.',
+        matched: found.map(r => r.username),
+      });
+    }
+
+    const target = found[0];
+    const { rows } = await query(
+      `UPDATE web_users SET role = $1 WHERE id = $2 AND guild_id = $3 RETURNING id, username, email, role`,
+      [role, target.id, GUILD_ID]
+    );
+
+    // No session invalidation needed on demotion: requireAdmin re-reads the
+    // role from web_users on every request (see utils/auth.js), so a demoted
+    // admin loses panel access on their very next call without logging out.
+
+    res.json({
+      success: true,
+      user: { ...rows[0], id: String(rows[0].id) },
+      previous_role: target.role,
+      discord_linked: !!target.discord_id && target.discord_verified === true,
+    });
   } catch (err) {
+    console.error('[Auth] set-role error:', err);
     res.status(500).json({ error: 'Failed to set role' });
   }
 });
 
 // ─── POST /api/auth/ban ──────────────────────────────────
-router.post('/ban', async (req, res) => {
+router.post('/ban', secretLimiter, async (req, res) => {
   try {
     const { secret, username, banned } = req.body;
-    if (secret !== process.env.API_SECRET) return res.status(401).json({ error: 'Unauthorized' });
+    if (!process.env.API_SECRET) return res.status(503).json({ error: 'Server not configured' });
+    if (!safeCompare(secret, process.env.API_SECRET)) return res.status(401).json({ error: 'Unauthorized' });
     const { rows } = await query(
       `UPDATE web_users SET banned = $1 WHERE guild_id = $2 AND lower(username) = lower($3) RETURNING id, username, banned`,
       [!!banned, GUILD_ID, username]
@@ -388,38 +478,42 @@ router.post('/admin/ban', requireAdmin, async (req, res) => {
 });
 
 // ─── POST /api/auth/vault-unlock ─────────────────────────
-// Gate for the hidden vault's master password. Reads VAULT_PASSWORD from the
-// env — but note that VAULT_PASSWORD is in config.js's allowed_keys, so if a
-// `config` row exists, loadConfigFromDB() overwrites the env var at boot and
-// the DB row is what actually applies. Rotating in Railway alone is NOT enough;
-// update the row too. No hardcoded fallback — if VAULT_PASSWORD is unset the
-// vault cannot be opened. Returns only a boolean; never echoes the value.
-router.post('/vault-unlock', async (req, res) => {
+// Gate for the hidden vault's master password.
+//
+// The Railway env var is the ONLY source of truth. VAULT_PASSWORD used to sit
+// in config.js's allowed_keys, which meant a `config` table row overwrote the
+// env var at boot — so rotating in Railway looked like it worked and silently
+// did nothing. Both password keys were removed from allowed_keys and their rows
+// deleted; change the value in Railway, redeploy, done.
+//
+// No hardcoded fallback — if VAULT_PASSWORD is unset the vault cannot be
+// opened. Returns only a boolean and never echoes the value; the compare is
+// constant-time so response timing doesn't leak how much of a guess matched.
+router.post('/vault-unlock', unlockLimiter, async (req, res) => {
   try {
     const { password } = req.body;
     if (!password) return res.status(400).json({ error: 'password is required' });
     const configured = process.env.VAULT_PASSWORD;
     if (!configured) return res.json({ ok: false });
-    res.json({ ok: String(password) === String(configured) });
+    res.json({ ok: safeCompare(password, configured) });
   } catch (err) {
     res.status(500).json({ error: 'Failed to verify vault password' });
   }
 });
 
 // ─── POST /api/auth/panel-unlock ─────────────────────────
-// Gate for the admin panel's static unlock code. Reads PANEL_PASSWORD from the
-// env — but PANEL_PASSWORD is in config.js's allowed_keys, so a `config` row
-// overwrites the env var at boot and is what actually applies. Rotating in
-// Railway alone is NOT enough; update the row too. No hardcoded fallback — if
-// PANEL_PASSWORD is unset the panel cannot be unlocked. Returns only a boolean;
-// never echoes the value. Public (no session yet — this IS the gate).
-router.post('/panel-unlock', async (req, res) => {
+// Gate for the admin panel's static unlock code. Same contract as
+// /vault-unlock above: PANEL_PASSWORD comes from the Railway env var and
+// nowhere else, no fallback, boolean-only response, constant-time compare.
+// Public by necessity — there is no session yet, this IS the gate — so the
+// rate limiter is the only thing bounding guesses.
+router.post('/panel-unlock', unlockLimiter, async (req, res) => {
   try {
     const { password } = req.body;
     if (!password) return res.status(400).json({ error: 'password is required' });
     const configured = process.env.PANEL_PASSWORD;
     if (!configured) return res.json({ ok: false });
-    res.json({ ok: String(password) === String(configured) });
+    res.json({ ok: safeCompare(password, configured) });
   } catch (err) {
     res.status(500).json({ error: 'Failed to verify panel password' });
   }
@@ -448,7 +542,7 @@ router.delete('/admin/user/:id', requireAdmin, async (req, res) => {
 // ask SUPERBOT to DM that account an Authenticate button. We hand the browser
 // back only an opaque pending_id — never the account's email or user id — so
 // the page can poll for completion without learning anything about the target.
-router.post('/discord-login/initiate', async (req, res) => {
+router.post('/discord-login/initiate', discordLoginLimiter, async (req, res) => {
   try {
     reapDiscordPending();
     const { discord_id } = req.body;

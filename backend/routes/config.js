@@ -1,8 +1,15 @@
 const express = require('express');
 const router = express.Router();
 const { query } = require('../db');
+const { safeCompare } = require('../utils/rateLimit');
 
 const GUILD_ID = process.env.GUILD_ID;
+
+// Keys that must come from the Railway env var and never from the `config`
+// table. Enforced in BOTH directions — rejected on write below, and ignored on
+// read in loadConfigFromDB — so a leftover or hand-inserted row can't quietly
+// resurrect the old override behaviour.
+const ENV_ONLY_KEYS = ['PANEL_PASSWORD', 'VAULT_PASSWORD'];
 
 router.get('/', (req, res) => {
   res.json({
@@ -24,14 +31,38 @@ router.get('/', (req, res) => {
 router.post('/update', async (req, res) => {
   try {
     const { secret, key, value } = req.body;
-    if (secret !== process.env.API_SECRET) return res.status(401).json({ error: 'Unauthorized' });
+    // Was `secret !== process.env.API_SECRET`, which is `undefined !== undefined`
+    // → false when the env var is unset: the route failed OPEN. Refuse to serve
+    // at all rather than authorize everyone, and compare in constant time.
+    if (!process.env.API_SECRET) return res.status(503).json({ error: 'Server not configured' });
+    if (!safeCompare(secret, process.env.API_SECRET)) return res.status(401).json({ error: 'Unauthorized' });
+    if (!key || typeof key !== 'string') return res.status(400).json({ error: 'key is required' });
 
+    // Keys the admin panel may store in the `config` table. A row here beats
+    // the Railway env var at boot (see loadConfigFromDB below), which is what
+    // makes this list security-relevant rather than cosmetic.
+    //
+    // PANEL_PASSWORD and VAULT_PASSWORD were REMOVED from this list. They were
+    // the two keys where DB-wins was actively harmful: rotating them in Railway
+    // appeared to succeed and silently did nothing, because boot restored the
+    // old row. It also meant anyone holding API_SECRET could set the admin
+    // panel password through this endpoint. Both now come from the Railway env
+    // var and nowhere else — change them there, redeploy, done.
     const allowed_keys = [
       'CASHAPP_CASHTAG', 'PAYPAL_EMAIL', 'GMAIL_USER', 'GMAIL_PASSWORD',
       'DISCORD_GUILD_ID', 'CASHAPP_FEE_PERCENT', 'PAYPAL_FEE_PERCENT',
       'CRYPTO_DISCOUNT_PERCENT', 'STORE_NAME', 'BTC_XPUB', 'LTC_XPUB',
-      'ORDER_LOG_CHANNEL_ID', 'PANEL_PASSWORD', 'VAULT_PASSWORD',
+      'ORDER_LOG_CHANNEL_ID',
     ];
+
+    // Rejected by name so the error explains itself instead of looking like a
+    // typo, and so nobody re-adds them to allowed_keys without reading why.
+    if (ENV_ONLY_KEYS.includes(String(key).toUpperCase())) {
+      return res.status(400).json({
+        error: `${String(key).toUpperCase()} is set in Railway only. Change it there and redeploy — ` +
+               `storing it here would override the Railway value at boot.`,
+      });
+    }
 
     if (!allowed_keys.includes(key.toUpperCase())) {
       return res.status(400).json({ error: `Key "${key}" is not configurable` });
@@ -57,20 +88,33 @@ router.post('/update', async (req, res) => {
 async function loadConfigFromDB() {
   try {
     const { rows } = await query('SELECT key, value FROM config WHERE guild_id = $1', [GUILD_ID]);
-    // A DB row wins over the Railway env var. That is the intent, but it makes
-    // rotating a leaked credential in Railway silently ineffective for any key
-    // that also has a row here — the new value is set, the service restarts,
-    // and boot quietly puts the old one back. PANEL_PASSWORD and VAULT_PASSWORD
-    // both sit in allowed_keys, so both are exposed to this. Name the keys that
-    // got overridden (never the values) so the next rotation fails loudly.
+    // A DB row wins over the Railway env var. That is the intent for settings
+    // the admin panel edits (store name, fees, cashtag), but it made rotating a
+    // leaked credential in Railway silently ineffective — the new value gets
+    // set, the service restarts, and boot quietly puts the old one back.
+    //
+    // ENV_ONLY_KEYS are skipped outright so that can't happen to the panel and
+    // vault passwords again even if a row is left behind or re-inserted by
+    // hand. For everything else, name the keys that got overridden (never the
+    // values) so the next surprise rotation fails loudly instead of silently.
     const overridden = [];
+    const ignored = [];
+    let applied = 0;
     for (const row of rows) {
       if (row.value == null) continue;
+      if (ENV_ONLY_KEYS.includes(row.key)) { ignored.push(row.key); continue; }
       const prev = process.env[row.key];
       if (prev !== undefined && prev !== row.value) overridden.push(row.key);
       process.env[row.key] = row.value;
+      applied += 1;
     }
-    if (rows.length) console.log(`[Config] Restored ${rows.length} config value(s) from DB`);
+    if (applied) console.log(`[Config] Restored ${applied} config value(s) from DB`);
+    if (ignored.length) {
+      console.warn(
+        `[Config] IGNORED stale config row(s) for env-only key(s): ${ignored.join(', ')} — ` +
+        `the Railway value applies. Delete these rows.`
+      );
+    }
     if (overridden.length) {
       console.warn(
         `[Config] DB value overrode a DIFFERENT env var for: ${overridden.join(', ')} — ` +

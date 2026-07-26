@@ -4,6 +4,15 @@ const cors = require('cors');
 
 const app = express();
 
+// Railway terminates TLS at its edge and forwards to us over plain HTTP, so
+// req.ip is the proxy's address unless we trust the X-Forwarded-For header.
+// The rate limiters in utils/rateLimit.js key on req.ip — without this every
+// visitor collapses into one bucket and the per-IP limits would lock out real
+// customers the moment anyone hit them. '1' = trust exactly one proxy hop
+// (Railway's), so a client-supplied X-Forwarded-For can't spoof its way past
+// the limiter by prepending fake entries.
+app.set('trust proxy', 1);
+
 app.use(cors({
   origin: '*',
   methods: ['GET', 'POST', 'PATCH', 'DELETE', 'OPTIONS'],
