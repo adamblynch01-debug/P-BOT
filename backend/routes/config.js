@@ -57,10 +57,26 @@ router.post('/update', async (req, res) => {
 async function loadConfigFromDB() {
   try {
     const { rows } = await query('SELECT key, value FROM config WHERE guild_id = $1', [GUILD_ID]);
+    // A DB row wins over the Railway env var. That is the intent, but it makes
+    // rotating a leaked credential in Railway silently ineffective for any key
+    // that also has a row here — the new value is set, the service restarts,
+    // and boot quietly puts the old one back. PANEL_PASSWORD and VAULT_PASSWORD
+    // both sit in allowed_keys, so both are exposed to this. Name the keys that
+    // got overridden (never the values) so the next rotation fails loudly.
+    const overridden = [];
     for (const row of rows) {
-      if (row.value != null) process.env[row.key] = row.value;
+      if (row.value == null) continue;
+      const prev = process.env[row.key];
+      if (prev !== undefined && prev !== row.value) overridden.push(row.key);
+      process.env[row.key] = row.value;
     }
     if (rows.length) console.log(`[Config] Restored ${rows.length} config value(s) from DB`);
+    if (overridden.length) {
+      console.warn(
+        `[Config] DB value overrode a DIFFERENT env var for: ${overridden.join(', ')} — ` +
+        `if you just rotated one of these in Railway, the DB row still holds the old value`
+      );
+    }
   } catch (err) {
     console.warn('[Config] Could not preload config from DB:', err.message);
   }

@@ -388,10 +388,12 @@ router.post('/admin/ban', requireAdmin, async (req, res) => {
 });
 
 // ─── POST /api/auth/vault-unlock ─────────────────────────
-// Gate for the hidden vault's master password. Single source of truth is the
-// VAULT_PASSWORD env var (rotatable via Railway or POST /api/config/update,
-// which persists it to Supabase). No hardcoded fallback — if VAULT_PASSWORD is
-// unset the vault cannot be opened. Returns only a boolean; never echoes the value.
+// Gate for the hidden vault's master password. Reads VAULT_PASSWORD from the
+// env — but note that VAULT_PASSWORD is in config.js's allowed_keys, so if a
+// `config` row exists, loadConfigFromDB() overwrites the env var at boot and
+// the DB row is what actually applies. Rotating in Railway alone is NOT enough;
+// update the row too. No hardcoded fallback — if VAULT_PASSWORD is unset the
+// vault cannot be opened. Returns only a boolean; never echoes the value.
 router.post('/vault-unlock', async (req, res) => {
   try {
     const { password } = req.body;
@@ -405,11 +407,12 @@ router.post('/vault-unlock', async (req, res) => {
 });
 
 // ─── POST /api/auth/panel-unlock ─────────────────────────
-// Gate for the admin panel's static unlock code. Single source of truth is the
-// PANEL_PASSWORD env var (rotatable via Railway or POST /api/config/update,
-// which persists it to Supabase). No hardcoded fallback — if PANEL_PASSWORD is
-// unset the panel cannot be unlocked. Returns only a boolean; never echoes the
-// value. Public (no session yet — this IS the gate), constant-shape response.
+// Gate for the admin panel's static unlock code. Reads PANEL_PASSWORD from the
+// env — but PANEL_PASSWORD is in config.js's allowed_keys, so a `config` row
+// overwrites the env var at boot and is what actually applies. Rotating in
+// Railway alone is NOT enough; update the row too. No hardcoded fallback — if
+// PANEL_PASSWORD is unset the panel cannot be unlocked. Returns only a boolean;
+// never echoes the value. Public (no session yet — this IS the gate).
 router.post('/panel-unlock', async (req, res) => {
   try {
     const { password } = req.body;
