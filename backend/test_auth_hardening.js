@@ -36,7 +36,7 @@ process.env.PANEL_PASSWORD = 'panel-correct-horse-battery';
 process.env.VAULT_PASSWORD = 'vault-correct-horse-battery';
 
 const express = require('express');
-const { rateLimit, safeCompare } = require('./utils/rateLimit');
+const { rateLimit, failureLimiter, safeCompare } = require('./utils/rateLimit');
 
 let passed = 0;
 function check(name, fn) {
@@ -136,6 +136,37 @@ sc.push(check('missing req.ip falls back without throwing', () => {
   assert.strictEqual(ok, true);
 }));
 
+console.log('\nfailureLimiter');
+sc.push(check('successes are never counted — unlimited correct attempts', () => {
+  const g = failureLimiter({ windowMs: 60000, max: 2, name: 'f1' });
+  for (let i = 0; i < 100; i++) {
+    const [req, res] = fakeReqRes('6.6.6.6');
+    assert.strictEqual(g.blocked(req, res), false, `success ${i} must pass`);
+    // no .fail() — this models a correct password
+  }
+}));
+sc.push(check('failures accumulate and then block', () => {
+  const g = failureLimiter({ windowMs: 60000, max: 2, name: 'f2' });
+  for (let i = 0; i < 2; i++) {
+    const [req, res] = fakeReqRes('7.7.7.7');
+    assert.strictEqual(g.blocked(req, res), false);
+    g.fail(req);
+  }
+  const [req, res] = fakeReqRes('7.7.7.7');
+  assert.strictEqual(g.blocked(req, res), true);
+  assert.strictEqual(res.statusCode, 429);
+}));
+sc.push(check('a global ceiling still stops distributed guessing', () => {
+  const g = failureLimiter({ windowMs: 60000, max: 100, globalMax: 3, name: 'f3' });
+  for (let i = 0; i < 3; i++) {
+    const [req, res] = fakeReqRes(`12.0.0.${i}`);
+    assert.strictEqual(g.blocked(req, res), false);
+    g.fail(req);
+  }
+  const [req, res] = fakeReqRes('12.0.0.99');
+  assert.strictEqual(g.blocked(req, res), true, 'fresh IP blocked by the global ceiling');
+}));
+
 // ─── Route-level tests over a real HTTP server ───────────
 const app = express();
 app.set('trust proxy', 1);
@@ -208,6 +239,27 @@ function post(pathname, body, ip) {
       if (r.status === 429) blocked++;
     }
     assert.ok(blocked > 0, 'expected some attempts to be rate limited');
+  });
+  await check('a wrong-guess burst does NOT lock out the correct password', async () => {
+    // The whole reason unlock counts failures only. With every-request counting
+    // and a global ceiling, anyone could keep staff out of the panel for 15
+    // minutes by spamming this endpoint from anywhere.
+    for (let i = 0; i < 25; i++) await post('/api/auth/panel-unlock', { password: `flood${i}` }, '20.8.8.8');
+    const r = await post('/api/auth/panel-unlock', { password: process.env.PANEL_PASSWORD }, '20.8.8.7');
+    assert.strictEqual(r.status, 200, 'staff on a clean IP must still get in');
+    assert.strictEqual(r.body.ok, true);
+  });
+  await check('correct password works even from the flooding IP itself', async () => {
+    // The password is verified BEFORE the limiter is consulted, so no volume of
+    // wrong guesses — from this IP or any other — can lock out someone holding
+    // the real password. Without that ordering the global ceiling would be a
+    // free admin-lockout DoS for any stranger.
+    for (let i = 0; i < 15; i++) await post('/api/auth/panel-unlock', { password: `flood${i}` }, '20.7.7.7');
+    const blockedNow = await post('/api/auth/panel-unlock', { password: 'still-wrong' }, '20.7.7.7');
+    assert.strictEqual(blockedNow.status, 429, 'wrong guesses from that IP are throttled');
+    const r = await post('/api/auth/panel-unlock', { password: process.env.PANEL_PASSWORD }, '20.7.7.7');
+    assert.strictEqual(r.status, 200);
+    assert.strictEqual(r.body.ok, true, 'the correct password still gets through');
   });
 
   console.log('\nconfig /update — env-only keys');
@@ -358,6 +410,11 @@ function post(pathname, body, ip) {
     }
     assert.ok(blocked > 0, 'the 401 oracle should not be unlimited');
   });
+  await check('the real API_SECRET still works from a throttled IP (bot must not be locked out)', async () => {
+    dbHandler = roleDb('username');
+    const r = await post('/api/auth/set-role', { secret: process.env.API_SECRET, username: 'ghost', role: 'admin' }, '23.9.9.9');
+    assert.strictEqual(r.status, 200, 'a valid secret bypasses the failure counter');
+  });
 
   console.log('\nlogin / signup limiters');
   await check('login is rate limited but has no global ceiling', async () => {
@@ -370,6 +427,36 @@ function post(pathname, body, ip) {
     assert.ok(blocked > 0, 'same IP should eventually be blocked');
     const other = await post('/api/auth/login', { username: 'x', password: 'y' }, '24.0.0.2');
     assert.notStrictEqual(other.status, 429, 'a different customer must NOT be locked out');
+  });
+  await check('a valid login still succeeds from a throttled IP', async () => {
+    // Several people behind one NAT/office IP is normal; one of them fat-
+    // fingering their password 20 times must not lock the others out.
+    const { hashPassword } = require('./utils/auth');
+    const hash = hashPassword('right-password');
+    dbHandler = async (text) => {
+      if (/FROM web_users u/i.test(text)) {
+        return { rows: [{ id: 7n, username: 'real', email: 'r@e.com', role: 'member', banned: false, password_hash: hash, balance_cents: 0 }] };
+      }
+      return { rows: [] };
+    };
+    const r = await post('/api/auth/login', { username: 'real', password: 'right-password' }, '24.0.0.1');
+    assert.strictEqual(r.status, 200, 'correct credentials are checked before the limiter');
+    assert.ok(r.body.token, 'should have minted a session');
+  });
+  await check('signup counts every request, not just failures', async () => {
+    // Each signup that succeeds still costs a row, so unlike login there is no
+    // "success is free" case to exempt.
+    dbHandler = async (text) => {
+      if (/SELECT id FROM web_users/i.test(text)) return { rows: [] };
+      if (/INSERT INTO web_users/i.test(text)) return { rows: [{ id: 1n, username: 'u', email: 'e' }] };
+      return { rows: [] };
+    };
+    let blocked = 0;
+    for (let i = 0; i < 12; i++) {
+      const r = await post('/api/auth/signup', { username: 'u' + i, email: `u${i}@e.com`, password: 'password1' }, '25.0.0.1');
+      if (r.status === 429) blocked++;
+    }
+    assert.ok(blocked > 0, 'signup should cap even when every request succeeds');
   });
 
   server.close();

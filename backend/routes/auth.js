@@ -5,32 +5,40 @@ const { query } = require('../db');
 const {
   hashPassword, verifyPassword, createSession, requireAuth, requireAdmin, publicUser,
 } = require('../utils/auth');
-const { rateLimit, safeCompare } = require('../utils/rateLimit');
+const { rateLimit, failureLimiter, safeCompare } = require('../utils/rateLimit');
 
 const GUILD_ID = process.env.GUILD_ID;
 
 // ─── Rate limiters ───────────────────────────────────────
-// Every endpoint below that takes a guessable secret gets one. Before this the
-// backend had no limiting anywhere, so /panel-unlock and /vault-unlock were
-// unauthenticated, unlimited-attempt oracles returning a clean boolean.
+// Before this the backend had no limiting anywhere, so /panel-unlock and
+// /vault-unlock were unauthenticated, unlimited-attempt oracles returning a
+// clean boolean.
 //
-// The unlock gates carry a globalMax as well as a per-IP max: they are pure
-// guess-oracles, and a per-IP limit alone does nothing against an attacker
-// rotating addresses. A shared ceiling is acceptable there because only staff
-// ever hit those routes — 60 attempts/15min across the whole internet is far
-// more than legitimate use and far less than a useful brute force.
-//
-// login/signup deliberately have NO globalMax: a shared ceiling on those would
-// let one abuser lock every real customer out of the store.
-const unlockLimiter = rateLimit({ windowMs: 15 * 60 * 1000, max: 10, globalMax: 60, name: 'unlock' });
-const loginLimiter = rateLimit({ windowMs: 15 * 60 * 1000, max: 20, name: 'login' });
-const signupLimiter = rateLimit({ windowMs: 60 * 60 * 1000, max: 10, name: 'signup' });
+// Anything guarding a secret counts FAILED attempts only (failureLimiter), so
+// a burst of wrong guesses can never lock out the person who knows the right
+// answer. That distinction matters most on the unlock gates: they carry a
+// global ceiling — necessary because a per-IP limit does nothing against an
+// attacker rotating addresses — and if that ceiling counted every request,
+// anyone on the internet could keep staff out of the admin panel for 15
+// minutes at a time by spamming it. Letting a correct password through even
+// while the limiter is hot leaks nothing, because the response already tells
+// the caller whether the guess was right.
+const unlockLimiter = failureLimiter({ windowMs: 15 * 60 * 1000, max: 10, globalMax: 100, name: 'unlock' });
+// No globalMax on login: a shared ceiling would let one abuser lock every real
+// customer out of the store.
+const loginLimiter = failureLimiter({ windowMs: 15 * 60 * 1000, max: 20, name: 'login' });
 // API_SECRET-gated admin routes. The secret is 32 random bytes so this is not
 // the thing standing between an attacker and the account, but an unlimited
-// 401-oracle is still free reconnaissance.
-const secretLimiter = rateLimit({ windowMs: 15 * 60 * 1000, max: 30, globalMax: 200, name: 'secret-gated' });
-// Discord passwordless login: initiate makes SUPERBOT send a real DM, so an
-// unlimited rate here is a DM-spam amplifier pointed at a customer's inbox.
+// 401-oracle is still free reconnaissance. Only 401s count, so the bot can call
+// these as often as it legitimately needs to.
+const secretLimiter = failureLimiter({ windowMs: 15 * 60 * 1000, max: 30, globalMax: 300, name: 'secret-gated' });
+
+// These two count EVERY request, because the request itself is the cost rather
+// than the guess: signup writes a row, and discord-login/initiate makes
+// SUPERBOT send a real DM — unlimited, that is a spam amplifier pointed at a
+// customer's inbox. Neither takes a globalMax, for the same reason login
+// doesn't.
+const signupLimiter = rateLimit({ windowMs: 60 * 60 * 1000, max: 10, name: 'signup' });
 const discordLoginLimiter = rateLimit({ windowMs: 15 * 60 * 1000, max: 15, name: 'discord-login' });
 
 // SUPERBOT (Discord 2FA server) base URL — same service the storefront's 2FA
@@ -215,7 +223,7 @@ router.post('/signup', signupLimiter, async (req, res) => {
 });
 
 // ─── POST /api/auth/login ───────────────────────────────
-router.post('/login', loginLimiter, async (req, res) => {
+router.post('/login', async (req, res) => {
   try {
     const { username, password } = req.body;
     if (!username || !password) {
@@ -228,8 +236,13 @@ router.post('/login', loginLimiter, async (req, res) => {
        WHERE u.guild_id = $1 AND (lower(u.username) = lower($2) OR lower(u.email) = lower($2))`,
       [GUILD_ID, username]
     );
+    // Credentials are checked before the limiter, so a customer with the right
+    // password gets in even if someone has been guessing against their account
+    // from the same address. Only wrong guesses are counted.
     const user = rows[0];
     if (!user || !verifyPassword(password, user.password_hash)) {
+      if (loginLimiter.blocked(req, res)) return;
+      loginLimiter.fail(req);
       return res.status(401).json({ error: 'Invalid username or password' });
     }
     if (user.banned) return res.status(403).json({ error: 'This account has been banned' });
@@ -299,11 +312,16 @@ router.post('/confirm-discord', requireAuth, async (req, res) => {
 // discord_id is compared as TEXT and never parsed as a number: 19-digit
 // snowflakes exceed Number.MAX_SAFE_INTEGER and parseInt() would round them to
 // a different, non-existent id.
-router.post('/set-role', secretLimiter, async (req, res) => {
+router.post('/set-role', async (req, res) => {
   try {
     const { secret, username, email, discord_id, role } = req.body;
     if (!process.env.API_SECRET) return res.status(503).json({ error: 'Server not configured' });
-    if (!safeCompare(secret, process.env.API_SECRET)) return res.status(401).json({ error: 'Unauthorized' });
+    // Only wrong secrets are counted, so the bot is never throttled.
+    if (!safeCompare(secret, process.env.API_SECRET)) {
+      if (secretLimiter.blocked(req, res)) return;
+      secretLimiter.fail(req);
+      return res.status(401).json({ error: 'Unauthorized' });
+    }
     if (!['member', 'staff', 'admin', 'reseller'].includes(role)) {
       return res.status(400).json({ error: 'Invalid role' });
     }
@@ -366,11 +384,15 @@ router.post('/set-role', secretLimiter, async (req, res) => {
 });
 
 // ─── POST /api/auth/ban ──────────────────────────────────
-router.post('/ban', secretLimiter, async (req, res) => {
+router.post('/ban', async (req, res) => {
   try {
     const { secret, username, banned } = req.body;
     if (!process.env.API_SECRET) return res.status(503).json({ error: 'Server not configured' });
-    if (!safeCompare(secret, process.env.API_SECRET)) return res.status(401).json({ error: 'Unauthorized' });
+    if (!safeCompare(secret, process.env.API_SECRET)) {
+      if (secretLimiter.blocked(req, res)) return;
+      secretLimiter.fail(req);
+      return res.status(401).json({ error: 'Unauthorized' });
+    }
     const { rows } = await query(
       `UPDATE web_users SET banned = $1 WHERE guild_id = $2 AND lower(username) = lower($3) RETURNING id, username, banned`,
       [!!banned, GUILD_ID, username]
@@ -489,13 +511,17 @@ router.post('/admin/ban', requireAdmin, async (req, res) => {
 // No hardcoded fallback — if VAULT_PASSWORD is unset the vault cannot be
 // opened. Returns only a boolean and never echoes the value; the compare is
 // constant-time so response timing doesn't leak how much of a guess matched.
-router.post('/vault-unlock', unlockLimiter, async (req, res) => {
+router.post('/vault-unlock', async (req, res) => {
   try {
     const { password } = req.body;
     if (!password) return res.status(400).json({ error: 'password is required' });
     const configured = process.env.VAULT_PASSWORD;
     if (!configured) return res.json({ ok: false });
-    res.json({ ok: safeCompare(password, configured) });
+    // Verify before consulting the limiter — see /panel-unlock below.
+    if (safeCompare(password, configured)) return res.json({ ok: true });
+    if (unlockLimiter.blocked(req, res)) return;
+    unlockLimiter.fail(req);
+    res.json({ ok: false });
   } catch (err) {
     res.status(500).json({ error: 'Failed to verify vault password' });
   }
@@ -507,13 +533,19 @@ router.post('/vault-unlock', unlockLimiter, async (req, res) => {
 // nowhere else, no fallback, boolean-only response, constant-time compare.
 // Public by necessity — there is no session yet, this IS the gate — so the
 // rate limiter is the only thing bounding guesses.
-router.post('/panel-unlock', unlockLimiter, async (req, res) => {
+router.post('/panel-unlock', async (req, res) => {
   try {
     const { password } = req.body;
     if (!password) return res.status(400).json({ error: 'password is required' });
     const configured = process.env.PANEL_PASSWORD;
     if (!configured) return res.json({ ok: false });
-    res.json({ ok: safeCompare(password, configured) });
+    // Verify BEFORE the limiter so a correct password is never rate limited.
+    // The limiter has a global ceiling, and checking it first would mean any
+    // stranger could lock staff out of the panel with a burst of wrong guesses.
+    if (safeCompare(password, configured)) return res.json({ ok: true });
+    if (unlockLimiter.blocked(req, res)) return;
+    unlockLimiter.fail(req);
+    res.json({ ok: false });
   } catch (err) {
     res.status(500).json({ error: 'Failed to verify panel password' });
   }

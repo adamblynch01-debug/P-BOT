@@ -1,9 +1,13 @@
 const express = require('express');
 const router = express.Router();
 const { query } = require('../db');
-const { safeCompare } = require('../utils/rateLimit');
+const { failureLimiter, safeCompare } = require('../utils/rateLimit');
 
 const GUILD_ID = process.env.GUILD_ID;
+
+// Counts only rejected secrets, so the admin panel can save settings as often
+// as it likes while a guesser gets 30 tries per 15 minutes.
+const secretLimiter = failureLimiter({ windowMs: 15 * 60 * 1000, max: 30, globalMax: 300, name: 'config-update' });
 
 // Keys that must come from the Railway env var and never from the `config`
 // table. Enforced in BOTH directions — rejected on write below, and ignored on
@@ -35,7 +39,11 @@ router.post('/update', async (req, res) => {
     // → false when the env var is unset: the route failed OPEN. Refuse to serve
     // at all rather than authorize everyone, and compare in constant time.
     if (!process.env.API_SECRET) return res.status(503).json({ error: 'Server not configured' });
-    if (!safeCompare(secret, process.env.API_SECRET)) return res.status(401).json({ error: 'Unauthorized' });
+    if (!safeCompare(secret, process.env.API_SECRET)) {
+      if (secretLimiter.blocked(req, res)) return;
+      secretLimiter.fail(req);
+      return res.status(401).json({ error: 'Unauthorized' });
+    }
     if (!key || typeof key !== 'string') return res.status(400).json({ error: 'key is required' });
 
     // Keys the admin panel may store in the `config` table. A row here beats
