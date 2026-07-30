@@ -1,7 +1,8 @@
 const express = require('express');
 const router = express.Router();
 const { query, withTransaction } = require('../db');
-const { requireAuth, requireAdmin, publicUser } = require('../utils/auth');
+const { requireAuth, requireAdmin, requireOwnerAdmin, publicUser, botAuthorized, botAuthUnavailable } = require('../utils/auth');
+const { logAdminAction } = require('../utils/adminLog');
 
 const GUILD_ID = process.env.GUILD_ID;
 
@@ -116,8 +117,8 @@ router.post('/topup/create', requireAuth, async (req, res) => {
 // Used by SUPERBOT's /web-balance command.
 router.get('/by-discord/:discordId', async (req, res) => {
   try {
-    const { secret } = req.query;
-    if (secret !== process.env.API_SECRET) return res.status(401).json({ error: 'Unauthorized' });
+    if (botAuthUnavailable()) return res.status(503).json({ error: 'Server not configured' });
+    if (!botAuthorized(req)) return res.status(401).json({ error: 'Unauthorized' });
     const { rows } = await query(
       `SELECT u.username, u.email, b.balance_cents FROM web_users u
        LEFT JOIN balances b ON b.web_user_id = u.id
@@ -137,8 +138,9 @@ router.get('/by-discord/:discordId', async (req, res) => {
 // refund. Gated by API_SECRET like the rest of this backend's internal ops.
 router.post('/adjust', async (req, res) => {
   try {
-    const { secret, username, discord_id, amount_cents, description } = req.body;
-    if (secret !== process.env.API_SECRET) return res.status(401).json({ error: 'Unauthorized' });
+    const { username, discord_id, amount_cents, description } = req.body;
+    if (botAuthUnavailable()) return res.status(503).json({ error: 'Server not configured' });
+    if (!botAuthorized(req)) return res.status(401).json({ error: 'Unauthorized' });
     if (!amount_cents || !Number.isInteger(amount_cents)) {
       return res.status(400).json({ error: 'amount_cents must be a non-zero integer (negative to debit)' });
     }
@@ -149,9 +151,17 @@ router.post('/adjust', async (req, res) => {
       [GUILD_ID, username || discord_id]
     );
     if (!userRows.length) return res.status(404).json({ error: 'User not found' });
+    // Refuse rather than pick one: nothing enforced uniqueness on discord_id,
+    // so a second row could shadow the real account and quietly receive the
+    // credit meant for it.
+    if (userRows.length > 1) return res.status(409).json({ error: 'That identifier matches more than one account. Use user_id.' });
     const webUserId = userRows[0].id;
 
     const balanceCents = await applyBalanceDelta(webUserId, amount_cents, description, 'Manual adjustment');
+
+    await logAdminAction(req, 'balance_adjust', webUserId, {
+      amount_cents, description: description || null, balance_after_cents: balanceCents, via: 'api_secret',
+    });
 
     res.json({ success: true, balance_cents: balanceCents, balance: balanceCents / 100 });
   } catch (err) {
@@ -167,7 +177,7 @@ router.post('/adjust', async (req, res) => {
 // site balance (the static site can never hold the secret). Looks the user up
 // by web_users id, username, or discord_id; upserts the balances row so it
 // works even for accounts that predate the signup balance seed.
-router.post('/admin/adjust', requireAdmin, async (req, res) => {
+router.post('/admin/adjust', requireOwnerAdmin, async (req, res) => {
   try {
     const { user_id, username, discord_id, amount_cents, description } = req.body;
     if (!amount_cents || !Number.isInteger(amount_cents)) {
@@ -184,6 +194,7 @@ router.post('/admin/adjust', requireAdmin, async (req, res) => {
         [GUILD_ID, username || discord_id]
       );
       if (!userRows.length) return res.status(404).json({ error: 'User not found' });
+      if (userRows.length > 1) return res.status(409).json({ error: 'That identifier matches more than one account. Use user_id.' });
       webUserId = userRows[0].id;
     } else {
       const { rows: exists } = await query('SELECT id FROM web_users WHERE guild_id = $1 AND id = $2', [GUILD_ID, webUserId]);
@@ -194,6 +205,10 @@ router.post('/admin/adjust', requireAdmin, async (req, res) => {
     // then apply the delta. A debit larger than the balance is refused outright
     // rather than clamped at zero — see applyBalanceDelta.
     const balanceCents = await applyBalanceDelta(webUserId, amount_cents, description, 'Admin adjustment');
+
+    await logAdminAction(req, 'balance_adjust', webUserId, {
+      amount_cents, description: description || null, balance_after_cents: balanceCents,
+    });
 
     res.json({ success: true, balance_cents: balanceCents, balance: balanceCents / 100 });
   } catch (err) {

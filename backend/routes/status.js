@@ -1,7 +1,7 @@
 const express = require('express');
 const router = express.Router();
 const { query } = require('../db');
-const { requireAdmin } = require('../utils/auth');
+const { requireAdmin, getSessionUser, bearerToken, botAuthorized } = require('../utils/auth');
 
 const GUILD_ID = process.env.GUILD_ID;
 
@@ -70,10 +70,9 @@ router.get('/vault', async (req, res) => {
 // covers the bot, requireAdmin covers a logged-in website admin.
 router.post('/update', async (req, res) => {
   try {
-    const { secret, product_id, game_name, product_name, status, note } = req.body;
-    const isBot = secret === process.env.API_SECRET;
+    const { product_id, game_name, product_name, status, note } = req.body;
+    const isBot = botAuthorized(req);
     if (!isBot) {
-      const { getSessionUser, bearerToken } = require('../utils/auth');
       const user = await getSessionUser(bearerToken(req));
       if (!user || !['admin', 'staff'].includes(user.role)) return res.status(401).json({ error: 'Unauthorized' });
     }

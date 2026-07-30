@@ -4,6 +4,41 @@ const cors = require('cors');
 
 const app = express();
 
+// ─── Startup environment check ───────────────────────────────────────────────
+// There was none. The process started happily with API_SECRET absent, which is
+// exactly the condition that made every `secret === process.env.API_SECRET`
+// gate authorize anonymous callers (see utils/auth.js botAuthorized). Those
+// compares are fixed, but a backend running without its shared secret still
+// cannot talk to the bot at all — better to refuse to start than to serve a
+// storefront whose delivery and notification paths are quietly broken.
+(function checkEnvironment() {
+  const required = {
+    DATABASE_URL: 'no database connection is possible',
+    API_SECRET: 'the bot and watchers cannot authenticate to this backend',
+    GUILD_ID: 'every query is scoped by guild and would match nothing',
+  };
+  const recommended = {
+    BOT_INTERNAL_URL: 'defaults to localhost — Discord notifications will not reach the bot',
+    WEBHOOK_SECRET: 'the crypto webhook endpoint will reject all callbacks',
+    PAYPAL_EMAIL: 'PayPal checkout shows a placeholder address',
+    CASHAPP_CASHTAG: 'Cash App checkout shows a placeholder cashtag',
+    GMAIL_USER: 'the email payment watcher cannot start',
+    BLOCKCYPHER_TOKEN: 'crypto address monitoring is rate-limited or unavailable',
+  };
+
+  const missingRequired = Object.keys(required).filter(k => !process.env[k]);
+  const missingRecommended = Object.keys(recommended).filter(k => !process.env[k]);
+
+  for (const k of missingRequired) console.error(`[Startup] MISSING ${k} — ${required[k]}`);
+  for (const k of missingRecommended) console.warn(`[Startup] missing ${k} — ${recommended[k]}`);
+
+  if (missingRequired.length) {
+    console.error('[Startup] Refusing to start. Set the above on the Railway service.');
+    process.exit(1);
+  }
+  if (!missingRecommended.length) console.log('[Startup] Environment check passed.');
+})();
+
 // Railway terminates TLS at its edge and forwards to us over plain HTTP, so
 // req.ip is the proxy's address unless we trust the X-Forwarded-For header.
 // The rate limiters in utils/rateLimit.js key on req.ip — without this every
@@ -34,16 +69,71 @@ app.use('/api/reviews',  require('./routes/reviews'));
 app.use('/api/status',   require('./routes/status'));
 app.use('/api/state',    require('./routes/state'));
 app.use('/api/reseller', require('./routes/reseller'));
+app.use('/api/tickets',  require('./routes/tickets'));
+app.use('/api/alerts',   require('./routes/alerts'));
+app.use('/api/downloads', require('./routes/downloads'));
 
 // ─── Health ─────────────────────────────────────────────
 app.get('/health', (req, res) => res.json({ status: 'ok', store: process.env.STORE_NAME || 'H8ED Shop' }));
 
+// ─── 404 ────────────────────────────────────────────────
+// Without this Express answers an unknown /api path with its HTML default
+// page, which a fetch() then fails to parse — the caller sees a confusing
+// syntax error instead of "no such endpoint".
+app.use('/api', (req, res) => {
+  res.status(404).json({ error: 'No such endpoint' });
+});
+
+// ─── Error handler ──────────────────────────────────────
+// Express needs the 4-arg signature to recognise this as an error handler.
+// Anything a route throws outside its own try/catch used to fall through to
+// Express's default, which replies with a stack trace in the body.
+app.use((err, req, res, next) => {
+  console.error(`[Error] ${req.method} ${req.originalUrl}:`, err && err.stack ? err.stack : err);
+  if (res.headersSent) return next(err);
+  res.status(err && err.statusCode ? err.statusCode : 500).json({ error: 'Internal server error' });
+});
+
+// ─── Last-resort process guards ─────────────────────────
+// An unhandled rejection anywhere (a watcher, a fire-and-forget notify) kills
+// the process on modern Node, taking the whole storefront down. Log it and
+// stay up: the alternative is a payment backend that dies from a Discord
+// timeout.
+process.on('unhandledRejection', (reason) => {
+  console.error('[UnhandledRejection]', reason && reason.stack ? reason.stack : reason);
+});
+process.on('uncaughtException', (err) => {
+  console.error('[UncaughtException]', err && err.stack ? err.stack : err);
+});
+
 // ─── Start ──────────────────────────────────────────────
 const PORT = process.env.PORT || 3000;
 require('./routes/config').loadConfigFromDB().finally(() => {
-  app.listen(PORT, () => {
+  const server = app.listen(PORT, () => {
     console.log(`[H8ED] Backend running on port ${PORT}`);
     require('./watchers/emailWatcher').start();
     require('./watchers/cryptoWatcher').start();
   });
+
+  // Railway sends SIGTERM on every deploy. Without this the process is killed
+  // mid-request, which can cut an in-flight checkout between the wallet debit
+  // and the delivery. Stop accepting new connections, let the open ones
+  // finish, then exit.
+  let shuttingDown = false;
+  const shutdown = (signal) => {
+    if (shuttingDown) return;
+    shuttingDown = true;
+    console.log(`[H8ED] ${signal} received — finishing in-flight requests…`);
+    server.close(() => {
+      console.log('[H8ED] Closed cleanly.');
+      process.exit(0);
+    });
+    // Don't hang forever on a stuck connection.
+    setTimeout(() => {
+      console.warn('[H8ED] Forcing exit after shutdown timeout.');
+      process.exit(0);
+    }, 15000).unref();
+  };
+  process.on('SIGTERM', () => shutdown('SIGTERM'));
+  process.on('SIGINT', () => shutdown('SIGINT'));
 });

@@ -153,6 +153,23 @@ async function claimRecycledAddress(coin, order_id) {
       [order_id, activity.total_received, cand.id, cand.order_id]
     );
     if (rowCount) {
+      // Record the handover. Without this the address's history is erased on
+      // rebind, so a late payment from the PREVIOUS customer silently resolves
+      // to the new order — and if it covers the new quote, the new customer is
+      // delivered for free while the one who actually paid gets nothing.
+      // webhooks.js checks this history and refuses to auto-confirm a
+      // settlement on a freshly-recycled address.
+      await query(
+        `UPDATE crypto_address_assignments SET released_at = now()
+          WHERE guild_id = $1 AND address = $2 AND released_at IS NULL`,
+        [GUILD_ID, cand.address]
+      ).catch(err => console.error('[Crypto] Could not close address assignment:', err.message));
+      await query(
+        `INSERT INTO crypto_address_assignments (guild_id, address, coin, order_id, baseline_received)
+         VALUES ($1,$2,$3,$4,$5)`,
+        [GUILD_ID, cand.address, coin.toUpperCase(), String(order_id), activity.total_received]
+      ).catch(err => console.error('[Crypto] Could not record address assignment:', err.message));
+
       console.log(`[Crypto] Recycled ${coin.toUpperCase()} address #${cand.address_index} from order ${cand.order_id} → ${order_id}`);
       return cand.address;
     }

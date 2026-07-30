@@ -656,7 +656,20 @@ const CASH_ORDER = { ...ORDER, payment_method: 'cashapp' };
   check('mail is no longer marked \\Seen', !/addFlags/.test(watcherSrc));
   check('the search window is no longer UNSEEN-filtered', !/'UNSEEN'/.test(watcherSrc));
   check('TLS validation is not disabled', !/rejectUnauthorized:\s*false/.test(watcherSrc));
-  check('overlapping scans are serialised', /if \(scanning\) return/.test(watcherSrc));
+  // Overlapping scans must still be serialised — but the latch is no longer an
+  // unconditional `if (scanning) return`. That version could wedge forever: the
+  // flag is module-global and survives a reconnect, so one fetch that never
+  // fired 'end' silently stopped the watcher reading mail at all. It now
+  // force-releases a scan that has held the latch past SCAN_STUCK_MS.
+  check('overlapping scans are still serialised', /if \(scanning\)/.test(watcherSrc));
+  check('a wedged scan is force-released rather than blocking forever',
+    /SCAN_STUCK_MS/.test(watcherSrc) && /scanStartedAt/.test(watcherSrc));
+  check('every latch release also clears the scan start time',
+    /const endScan = \(\) => \{ scanning = false; scanStartedAt = null; \}/.test(watcherSrc));
+  // A failed openBox must force a reconnect. Returning bare left the client
+  // connected with no 'mail' listener attached — permanently deaf.
+  check('a failed inbox open schedules a reconnect',
+    /Failed to open inbox[\s\S]{0,320}scheduleReconnect\(\)/.test(watcherSrc));
 
   console.log('\n=== noteGenerator entropy ===');
   const { generateNote } = require(path.join(BACKEND, 'utils', 'noteGenerator.js'));

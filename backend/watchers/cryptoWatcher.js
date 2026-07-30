@@ -20,13 +20,21 @@ async function checkPendingCryptoOrders() {
     // baseline_received comes along for the ride: what the address had already
     // received when it was issued, which is what makes "paid for this order"
     // distinguishable from "this address has a past".
+    // 'underpaid' is included deliberately. The poller used to scan
+    // `status = 'waiting'` only, while the underpay branch below flipped the
+    // order to 'underpaid' — so an order that was underpaid once was never
+    // looked at again. A customer who paid in two transactions (wallets batch;
+    // people top up after seeing "underpaid") had the full amount sitting at
+    // our address with the order stuck forever and no keys delivered.
+    // /confirm already accepts 'underpaid' as confirmable; only the poller's
+    // own filter was blocking it.
     const { rows: orders } = await query(
       `SELECT o.*, ca.baseline_received
          FROM orders o
          LEFT JOIN crypto_addresses ca
            ON ca.guild_id = o.guild_id AND ca.address = o.crypto_address
         WHERE o.guild_id = $1 AND o.payment_method IN ('btc','ltc')
-          AND o.status = 'waiting' AND o.expires_at > now()`,
+          AND o.status IN ('waiting','underpaid') AND o.expires_at > now()`,
       [GUILD_ID]
     );
     for (const order of orders) {
@@ -66,18 +74,28 @@ async function checkAddress(order) {
     // delivered.
     const check = verifyCryptoPayment(order, confirmed);
     if (!check.ok) {
+      // Only alert the FIRST time an order goes underpaid. Now that the poller
+      // re-examines underpaid orders every two minutes, alerting on each pass
+      // would bury the queue in duplicates of the same problem.
+      const wasAlreadyUnderpaid = order.status === 'underpaid';
       console.warn(`[CryptoWatcher] Order ${order.id} NOT confirmed: ${check.reason}`);
       // `confirmed` is satoshis. Writing it into amount_received_cents claimed
       // 4,000,000 sats was $40,000.00 — the native figure goes in the native
       // column, and the USD conversion is left to whoever has the rate.
+      //
+      // The WHERE accepts 'underpaid' too, so a partial top-up keeps
+      // amount_received_native current instead of freezing at the first
+      // transaction's value.
       await query(
         `UPDATE orders SET status = 'underpaid', amount_received_native = $1, amount_received_unit = 'sats'
-          WHERE id = $2 AND status = 'waiting'`,
+          WHERE id = $2 AND status IN ('waiting','underpaid')`,
         [confirmed, order.id]
       ).catch(() => {});
-      await raiseAlert('order_underpaid',
-        `Order ${order.id} underpaid via ${coin.toUpperCase()}: ${check.reason}`,
-        { severity: 'error', order_id: order.id, context: { received_sats: confirmed, reason: check.reason } }).catch(() => {});
+      if (!wasAlreadyUnderpaid) {
+        await raiseAlert('order_underpaid',
+          `Order ${order.id} underpaid via ${coin.toUpperCase()}: ${check.reason}`,
+          { severity: 'error', order_id: order.id, context: { received_sats: confirmed, reason: check.reason } }).catch(() => {});
+      }
       return;
     }
 

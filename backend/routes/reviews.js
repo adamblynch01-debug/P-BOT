@@ -1,7 +1,7 @@
 const express = require('express');
 const router = express.Router();
 const { query } = require('../db');
-const { requireAuth, requireAdmin, getSessionUser, bearerToken } = require('../utils/auth');
+const { requireAuth, requireAdmin, getSessionUser, bearerToken, botAuthorized, botAuthUnavailable } = require('../utils/auth');
 const { notifyBot } = require('../utils/botNotify');
 
 const GUILD_ID = process.env.GUILD_ID;
@@ -9,8 +9,7 @@ const GUILD_ID = process.env.GUILD_ID;
 // Bot (secret) and admin panel (logged-in admin/staff session) both moderate
 // reviews — same dual-gate pattern as routes/status.js and routes/products.js.
 async function requireAdminOrBot(req, res, next) {
-  const secret = req.body.secret || req.query.secret;
-  if (secret === process.env.API_SECRET) return next();
+  if (botAuthorized(req)) return next();
   const user = await getSessionUser(bearerToken(req));
   if (user && ['admin', 'staff'].includes(user.role)) { req.user = user; return next(); }
   return res.status(401).json({ error: 'Unauthorized' });
@@ -119,8 +118,9 @@ router.delete('/:id', requireAdminOrBot, async (req, res) => {
 // (guild_id, source, external_id) when the bot supplies a message id.
 router.post('/bot', async (req, res) => {
   try {
-    const { secret, display_name, rating, body, product_id, external_id, discord_id } = req.body;
-    if (secret !== process.env.API_SECRET) return res.status(401).json({ error: 'Unauthorized' });
+    const { display_name, rating, body, product_id, external_id, discord_id } = req.body;
+    if (botAuthUnavailable()) return res.status(503).json({ error: 'Server not configured' });
+    if (!botAuthorized(req)) return res.status(401).json({ error: 'Unauthorized' });
     const r = parseInt(rating, 10) || 5;
     if (r < 1 || r > 5) return res.status(400).json({ error: 'rating must be 1-5' });
     if (!display_name) return res.status(400).json({ error: 'display_name is required' });

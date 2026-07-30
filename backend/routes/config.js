@@ -13,7 +13,14 @@ const secretLimiter = failureLimiter({ windowMs: 15 * 60 * 1000, max: 30, global
 // table. Enforced in BOTH directions — rejected on write below, and ignored on
 // read in loadConfigFromDB — so a leftover or hand-inserted row can't quietly
 // resurrect the old override behaviour.
-const ENV_ONLY_KEYS = ['PANEL_PASSWORD', 'VAULT_PASSWORD'];
+//
+// ORDER_LOG_CHANNEL_ID is on this list by the owner's explicit decision
+// (2026-07-26): it is set directly in Railway and `/config set logchan` is not
+// used. That closes the trap for the one key where it would be hardest to
+// notice — a stale config row would silently redirect the entire order feed to
+// a dead or wrong channel at boot, and the symptom (orders "not logging") looks
+// identical to the bug that started this whole audit.
+const ENV_ONLY_KEYS = ['PANEL_PASSWORD', 'VAULT_PASSWORD', 'ORDER_LOG_CHANNEL_ID'];
 
 router.get('/', (req, res) => {
   res.json({

@@ -13,6 +13,8 @@ let heartbeatTimer = null;
 let lastActivityAt = Date.now();
 let deadAlertSent = false;
 let scanning = false;
+// When the current scan started, so a wedged one can be force-released.
+let scanStartedAt = null;
 
 // Backoff caps at 5 minutes and never gives up. The watcher used to stop
 // permanently after 5 failures with only a console.error — after which every
@@ -22,6 +24,9 @@ let scanning = false;
 const BACKOFF_MS = [10000, 30000, 60000, 120000, 300000];
 const HEARTBEAT_CHECK_MS = 5 * 60 * 1000;
 const SILENCE_ALERT_MS = 20 * 60 * 1000;
+// A scan that has held the latch this long is presumed dead, not slow. Well
+// above a normal two-day fetch, well below the 20-minute silence alarm.
+const SCAN_STUCK_MS = 5 * 60 * 1000;
 
 function start() {
   if (!process.env.GMAIL_USER || !process.env.GMAIL_PASSWORD) {
@@ -35,20 +40,64 @@ function start() {
   console.log('[EmailWatcher] Started');
 }
 
-// Being connected is not the same as being alive: a wedged IDLE keeps the socket
-// open while delivering nothing. Alert on silence, not just on errors.
+// Being connected is not the same as being alive: a wedged IDLE keeps the
+// socket open while delivering nothing. But "no mail arrived" is NOT the same
+// as "broken" either — and that was the bug.
+//
+// markAlive() only ran on connect, on an inbound 'mail' event, and on a search
+// that returned rows. A quiet mailbox therefore looked identical to a dead
+// watcher, so a store with no orders alarmed every ~20 minutes forever. Worse,
+// each reconnect called markAlive() and cleared deadAlertSent, so the alarm
+// re-armed and fired again and again ("failCount: 0" in every one of those
+// alerts is the tell — there were no failures at all).
+//
+// The heartbeat now ACTIVELY probes the connection instead of waiting to be
+// spoken to. A probe that succeeds proves the watcher can still see the
+// mailbox, whether or not anyone has emailed. Only a failed probe — or a
+// client that is not in the authenticated state — is an actual outage.
 function startHeartbeat() {
   if (heartbeatTimer) clearInterval(heartbeatTimer);
   heartbeatTimer = setInterval(async () => {
+    const healthy = await probeConnection();
+    if (healthy) {
+      lastActivityAt = Date.now();
+      deadAlertSent = false;
+      return;
+    }
     const silentFor = Date.now() - lastActivityAt;
     if (silentFor > SILENCE_ALERT_MS && !deadAlertSent) {
       deadAlertSent = true;
       await raiseAlert('email_watcher_silent',
-        `Payment email watcher has had no IMAP activity for ${Math.round(silentFor / 60000)} minutes — Cash App/PayPal payments may not be confirming`,
-        { severity: 'error', context: { failCount } }).catch(() => {});
+        `Payment email watcher cannot reach the mailbox (no successful IMAP probe for ${Math.round(silentFor / 60000)} minutes) — Cash App/PayPal payments may not be confirming`,
+        { severity: 'error', context: { failCount, imapState: imapClient ? imapClient.state : 'none' } }).catch(() => {});
     }
   }, HEARTBEAT_CHECK_MS);
   if (heartbeatTimer.unref) heartbeatTimer.unref();
+}
+
+// Cheap liveness check: ask the server for the mailbox status. Resolves true
+// only if the round trip actually completes, so a half-open socket that no
+// longer answers is correctly reported as dead.
+function probeConnection() {
+  return new Promise((resolve) => {
+    if (!imapClient || imapClient.state !== 'authenticated') return resolve(false);
+    let settled = false;
+    const done = (ok) => { if (!settled) { settled = true; resolve(ok); } };
+    // Don't hang the heartbeat on a wedged connection.
+    const t = setTimeout(() => done(false), 15000);
+    if (t.unref) t.unref();
+    try {
+      imapClient.status('INBOX', (err) => {
+        clearTimeout(t);
+        if (err) console.warn('[EmailWatcher] health probe failed:', err.message);
+        done(!err);
+      });
+    } catch (e) {
+      clearTimeout(t);
+      console.warn('[EmailWatcher] health probe threw:', e.message);
+      done(false);
+    }
+  });
 }
 
 function markAlive() {
@@ -111,7 +160,15 @@ function scheduleReconnect() {
 function openInbox() {
   imapClient.openBox('INBOX', false, (err) => {
     if (err) {
-      console.error('[EmailWatcher] Failed to open inbox:', err.message);
+      // This used to just `return`. The IMAP connection stayed up, so the
+      // 'end'/'error' handlers that schedule a reconnect never fired, and no
+      // 'mail' listener was ever attached — the watcher sat there connected
+      // and permanently deaf. Payments stopped confirming with no error after
+      // this one line. Force the reconnect instead.
+      console.error('[EmailWatcher] Failed to open inbox:', err.message, '— forcing reconnect');
+      scanning = false;
+      try { imapClient.end(); } catch { /* already gone */ }
+      scheduleReconnect();
       return;
     }
     console.log('[EmailWatcher] Inbox open — watching for payments');
@@ -128,8 +185,25 @@ function fetchRecent() {
   // Serialised deliberately. Overlapping scans used to hand the same UID to two
   // parallel processEmail calls, and PayPal sends more than one notification per
   // payment, so concurrent confirmations of a single order were routine.
-  if (scanning) return;
+  //
+  // The latch needs a way out, though: it is module-global and survives a
+  // reconnect, so a fetch that never fires 'end' (a dropped socket mid-stream,
+  // a parser that never calls back) left `scanning` true forever and EVERY
+  // later scan returned on the first line. The mailbox kept receiving payments
+  // and the watcher silently stopped reading them. A stuck scan is now
+  // force-released so the next 'mail' event can proceed.
+  if (scanning) {
+    if (scanStartedAt && Date.now() - scanStartedAt > SCAN_STUCK_MS) {
+      console.error(`[EmailWatcher] previous scan stuck for ${Math.round((Date.now() - scanStartedAt) / 1000)}s — releasing the latch`);
+      scanning = false;
+    } else {
+      return;
+    }
+  }
   scanning = true;
+  scanStartedAt = Date.now();
+
+  const endScan = () => { scanning = false; scanStartedAt = null; };
 
   // Two days back, and NOT filtered on UNSEEN. The old `UNSEEN SINCE today`
   // window dropped mail permanently in two ways: a restart just after local
@@ -142,7 +216,7 @@ function fetchRecent() {
   const sinceDate = `${dd}-${months[since.getMonth()]}-${since.getFullYear()}`;
 
   imapClient.search([['SINCE', sinceDate]], (err, results) => {
-    if (err || !results || results.length === 0) { scanning = false; return; }
+    if (err || !results || results.length === 0) { endScan(); return; }
     markAlive();
 
     const fetch = imapClient.fetch(results, { bodies: '' });
@@ -169,14 +243,14 @@ function fetchRecent() {
 
     fetch.once('error', (fetchErr) => {
       console.error('[EmailWatcher] Fetch error:', fetchErr.message);
-      scanning = false;
+      endScan();
     });
 
     fetch.once('end', async () => {
       // Sequential, so two messages quoting the same note can never race each
       // other into /confirm.
       for (const p of pending) await p;
-      scanning = false;
+      endScan();
     });
   });
 }

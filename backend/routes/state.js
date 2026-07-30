@@ -28,8 +28,12 @@ const KEY_ACL = {
   ghostCustomVaultProducts:'public',
   ghostCustomVaultCategories:'public',
   ghostCustomVaultTiles:   'public',
-  ghostDownloads:          'public',
-  ghostVaultDownloads:     'public',
+  // ghostDownloads / ghostVaultDownloads were 'public'. That served the direct
+  // file URL for every product — vault exclusives included — to any anonymous
+  // caller with one curl. They are admin-only now, and customers reach a link
+  // through GET /api/downloads/:name, which checks they actually bought it.
+  ghostDownloads:          'admin',
+  ghostVaultDownloads:     'admin',
   ghostStatuses:           'public',
   ghostStatusHidden:       'public',
   ghostNFALoaderURL:       'public',
@@ -46,11 +50,16 @@ const KEY_ACL = {
   ghostAdminSettings:      'admin',
   ghostResellerRoles:      'admin',
   ghostResellerLog:        'admin',
-  ghostHwidRequests:       'admin',
-  ghostTickets:            'admin',
-  ghostVaultTickets:       'admin',
   ghostResellerUsers:      'admin',
   ghostVaultUsers:         'admin',
+  // ghostTickets, ghostVaultTickets and ghostHwidRequests were here. They are
+  // per-user records, so the global scope was the wrong home twice over: the
+  // 'admin' ACL rejected the customer's own write (401, silently swallowed by
+  // the frontend, ticket lost), and storing the whole list as one JSON blob
+  // meant two staff replying at once overwrote each other. They now live in
+  // the tickets / ticket_messages / hwid_requests tables — see routes/tickets.js.
+  // Anything not listed here is 'admin' by default, so a stale client writing
+  // these keys is still refused rather than silently accepted.
 
   // ── per-user records (owner reads/writes its own) ──
   ghostVaultCart:          'user',
@@ -92,16 +101,40 @@ router.post('/global/:key', async (req, res) => {
   try {
     if (!isAdmin(await sessionUser(req))) return res.status(401).json({ error: 'Unauthorized' });
     const key = req.params.key;
+
+    // Only keys this backend actually knows about. The route used to accept ANY
+    // key name, so every request with a fresh name appended a new row — a typo
+    // from the panel silently created a permanent orphan, and a loop could grow
+    // the table until Supabase's storage cap started rejecting writes for the
+    // whole system, order creation included.
+    //
+    // Rejecting an unknown key also surfaces frontend/backend drift instead of
+    // writing data nothing will ever read back.
+    if (!Object.prototype.hasOwnProperty.call(KEY_ACL, key)) {
+      return res.status(400).json({
+        error: `Unknown state key "${key}". Add it to KEY_ACL in routes/state.js if it is real.`,
+      });
+    }
+
     const value = req.body && 'value' in req.body ? req.body.value : null;
+    const serialised = JSON.stringify(value);
+    // app_state holds display config and admin records, not blobs. A cap here
+    // keeps one oversized paste from bloating a row every other request reads.
+    const MAX_STATE_BYTES = 512 * 1024;
+    if (serialised && Buffer.byteLength(serialised, 'utf8') > MAX_STATE_BYTES) {
+      return res.status(413).json({ error: 'That value is too large to store (512KB limit).' });
+    }
+
     await query(
       `INSERT INTO app_state (guild_id, scope, owner_id, key, value, updated_at)
        VALUES ($1,'global','',$2,$3, now())
        ON CONFLICT (guild_id, scope, owner_id, key)
        DO UPDATE SET value = $3, updated_at = now()`,
-      [GUILD_ID, key, JSON.stringify(value)]
+      [GUILD_ID, key, serialised]
     );
     res.json({ success: true });
   } catch (err) {
+    console.error('[State] global write error:', err);
     res.status(500).json({ error: 'Failed to write state' });
   }
 });

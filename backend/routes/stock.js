@@ -1,8 +1,7 @@
 const express = require('express');
 const router = express.Router();
-const { query } = require('../db');
-const { getSessionUser, bearerToken } = require('../utils/auth');
-
+const { query, withTransaction } = require('../db');
+const { getSessionUser, bearerToken, botAuthorized, botAuthUnavailable } = require('../utils/auth');
 const GUILD_ID = process.env.GUILD_ID;
 
 // Bot (secret) and admin panel (logged-in admin/staff session) both manage
@@ -10,7 +9,7 @@ const GUILD_ID = process.env.GUILD_ID;
 // never hold API_SECRET, so its stock writes authenticate with the admin's
 // session token instead.
 async function isAuthorizedOrAdmin(req) {
-  if (req.body && req.body.secret === process.env.API_SECRET) return true;
+  if (botAuthorized(req)) return true;
   const user = await getSessionUser(bearerToken(req));
   return !!(user && ['admin', 'staff'].includes(user.role));
 }
@@ -18,7 +17,7 @@ async function isAuthorizedOrAdmin(req) {
 // Who made this stock change — a named admin, or the bot when it authed with
 // the shared secret.
 async function stockActor(req) {
-  if (req.body && req.body.secret === process.env.API_SECRET) return 'bot';
+  if (botAuthorized(req)) return 'bot';
   const user = await getSessionUser(bearerToken(req));
   return (user && user.username) || 'unknown';
 }
@@ -110,34 +109,86 @@ router.get('/log', async (req, res) => {
   }
 });
 
+// Public: the storefront shows a stock badge on every card, so the count is not
+// secret. It IS numeric though — `tier_id` is a BIGINT, and passing 'abc' made
+// Postgres raise 22P02, which the catch turned into a 500. Anyone could drive
+// unlimited 500s and error-log noise with a trivial loop. Validate the shape and
+// answer 400 instead.
 router.get('/:product_id', async (req, res) => {
   try {
+    const id = String(req.params.product_id);
+    if (!/^\d{1,19}$/.test(id)) {
+      return res.status(400).json({ error: 'product_id must be a numeric tier id' });
+    }
     const { rows } = await query(
       'SELECT COUNT(*)::int AS n FROM product_stock WHERE guild_id = $1 AND tier_id = $2 AND used = false',
-      [GUILD_ID, req.params.product_id]
+      [GUILD_ID, id]
     );
-    res.json({ product_id: req.params.product_id, available: rows[0].n });
+    res.json({ product_id: id, available: rows[0].n });
   } catch (err) {
+    console.error('[Stock] count error:', err);
     res.status(500).json({ error: 'Failed to fetch stock' });
   }
 });
+
+// Caps so one request cannot insert an unbounded number of rows. `items` was
+// used untyped and unbounded: a non-array crashed the loop, and 500k lines
+// would have been inserted one statement at a time.
+const MAX_STOCK_ITEMS = 10000;
+const MAX_STOCK_VALUE_LEN = 512;
+
+// Shared cleaner. Dedupes, because two identical rows for one tier means the
+// same credential can be claimed and sold twice.
+function cleanStockItems(items) {
+  if (!Array.isArray(items)) return { error: 'items[] must be an array' };
+  if (items.length > MAX_STOCK_ITEMS) return { error: `Too many items (max ${MAX_STOCK_ITEMS})` };
+  const clean = Array.from(new Set(
+    items.map(v => String(v == null ? '' : v).trim())
+         .filter(v => v !== '' && v.length <= MAX_STOCK_VALUE_LEN)
+  ));
+  return { clean };
+}
+
+// Values already SOLD for this tier. Re-inserting one of these as unused is how
+// a credential that has been delivered to a paying customer gets sold a second
+// time — the vault path did exactly that, because the browser's mirror still
+// held every key it had ever pasted, including the ones since claimed.
+async function soldValues(tierId) {
+  const { rows } = await query(
+    'SELECT value FROM product_stock WHERE guild_id = $1 AND tier_id = $2 AND used = true',
+    [GUILD_ID, tierId]
+  );
+  return new Set(rows.map(r => r.value));
+}
 
 router.post('/add', async (req, res) => {
   try {
     if (!(await isAuthorizedOrAdmin(req))) return res.status(401).json({ error: 'Unauthorized' });
     const { product_id, items, source } = req.body;
+    if (!product_id) return res.status(400).json({ error: 'product_id is required' });
+
+    const { clean, error } = cleanStockItems(items);
+    if (error) return res.status(400).json({ error });
+
+    const sold = await soldValues(product_id);
+    const toInsert = clean.filter(v => !sold.has(v));
+    const skipped = clean.length - toInsert.length;
+
     const before = await unusedCount(product_id);
-    let added = 0;
-    for (const value of items) {
-      await query('INSERT INTO product_stock (guild_id, tier_id, value) VALUES ($1,$2,$3)', [GUILD_ID, product_id, value]);
-      added++;
+    if (toInsert.length) {
+      await query(
+        `INSERT INTO product_stock (guild_id, tier_id, value)
+         SELECT $1, $2, v FROM unnest($3::text[]) AS v`,
+        [GUILD_ID, product_id, toInsert]
+      );
     }
     await logStockChange({
-      tierId: product_id, action: 'add', before, after: before + added,
+      tierId: product_id, action: 'add', before, after: before + toInsert.length,
       source, actor: await stockActor(req),
     });
-    res.json({ success: true, added });
+    res.json({ success: true, added: toInsert.length, skipped_already_sold: skipped });
   } catch (err) {
+    console.error('[Stock] add error:', err);
     res.status(500).json({ error: 'Failed to add stock' });
   }
 });
@@ -150,24 +201,92 @@ router.post('/set', async (req, res) => {
   try {
     if (!(await isAuthorizedOrAdmin(req))) return res.status(401).json({ error: 'Unauthorized' });
     const { product_id, items, source } = req.body;
-    if (!product_id || !Array.isArray(items)) return res.status(400).json({ error: 'product_id and items[] are required' });
-    const clean = items.map(v => String(v).trim()).filter(v => v !== '');
-    const before = await unusedCount(product_id);
-    await query('DELETE FROM product_stock WHERE guild_id = $1 AND tier_id = $2 AND used = false', [GUILD_ID, product_id]);
-    for (const value of clean) {
-      await query('INSERT INTO product_stock (guild_id, tier_id, value) VALUES ($1,$2,$3)', [GUILD_ID, product_id, value]);
+    if (!product_id) return res.status(400).json({ error: 'product_id is required' });
+
+    const { clean, error } = cleanStockItems(items);
+    if (error) return res.status(400).json({ error });
+
+    // Anti-resurrection. The vault admin panel posts the browser's whole mirror
+    // of a tier, which still contains every key it ever held — including the
+    // ones sold since. Without this filter a routine SAVE re-listed delivered
+    // credentials as available, and the stock_log just read like a restock.
+    const sold = await soldValues(product_id);
+    const toInsert = clean.filter(v => !sold.has(v));
+    const skipped = clean.length - toInsert.length;
+    if (skipped) {
+      console.warn(`[Stock] set on tier ${product_id}: ignored ${skipped} already-sold key(s)`);
     }
+
+    const before = await unusedCount(product_id);
+
+    // One transaction. The DELETE used to commit on its own, so a failure
+    // partway through the insert loop wiped the tier and left it partly
+    // stocked, with the caller getting a 500 that said nothing about which.
+    await withTransaction(async (exec) => {
+      await exec('DELETE FROM product_stock WHERE guild_id = $1 AND tier_id = $2 AND used = false', [GUILD_ID, product_id]);
+      if (toInsert.length) {
+        await exec(
+          `INSERT INTO product_stock (guild_id, tier_id, value)
+           SELECT $1, $2, v FROM unnest($3::text[]) AS v`,
+          [GUILD_ID, product_id, toInsert]
+        );
+      }
+    });
+
     // A 'set' to zero is a deliberate wipe — log it as such so the history
     // distinguishes "cleared the tier" from "replaced the keys".
-    if (before !== clean.length || clean.length === 0) {
+    if (before !== toInsert.length || toInsert.length === 0) {
       await logStockChange({
-        tierId: product_id, action: clean.length === 0 ? 'clear' : 'set',
-        before, after: clean.length, source, actor: await stockActor(req),
+        tierId: product_id, action: toInsert.length === 0 ? 'clear' : 'set',
+        before, after: toInsert.length, source, actor: await stockActor(req),
       });
     }
-    res.json({ success: true, count: clean.length });
+    res.json({ success: true, count: toInsert.length, skipped_already_sold: skipped });
   } catch (err) {
+    console.error('[Stock] set error:', err);
     res.status(500).json({ error: 'Failed to set stock' });
+  }
+});
+
+// ─── POST /api/stock/issue ───────────────────────────────
+// Hand a key to a customer manually (the vault KEYGEN tab), marking it used in
+// the SAME atomic claim the automatic delivery path uses.
+//
+// The vault keygen used to pull keys out of the browser's localStorage mirror
+// and never tell the server. The row stayed used=false, so the next checkout
+// for that tier claimed the very same credential and sold it again — two
+// paying customers holding one account, with no trace in stock_log.
+router.post('/issue', async (req, res) => {
+  try {
+    if (!(await isAuthorizedOrAdmin(req))) return res.status(401).json({ error: 'Unauthorized' });
+    const { product_id, qty, note } = req.body;
+    if (!product_id) return res.status(400).json({ error: 'product_id is required' });
+    const n = parseInt(qty, 10) || 1;
+    if (n < 1 || n > 100) return res.status(400).json({ error: 'qty must be between 1 and 100' });
+
+    const before = await unusedCount(product_id);
+    const { rows } = await query(
+      `UPDATE product_stock SET used = true, used_at = now()
+       WHERE id IN (
+         SELECT id FROM product_stock
+         WHERE guild_id = $1 AND tier_id = $2 AND used = false
+         ORDER BY id ASC LIMIT $3 FOR UPDATE SKIP LOCKED
+       )
+       RETURNING value`,
+      [GUILD_ID, product_id, n]
+    );
+    if (!rows.length) return res.status(404).json({ error: 'Out of stock for that tier' });
+
+    const actor = await stockActor(req);
+    await logStockChange({
+      tierId: product_id, action: 'issue', before, after: before - rows.length,
+      source: note ? `manual: ${String(note).slice(0, 120)}` : 'manual issue', actor,
+    });
+
+    res.json({ success: true, issued: rows.length, items: rows.map(r => r.value) });
+  } catch (err) {
+    console.error('[Stock] issue error:', err);
+    res.status(500).json({ error: 'Failed to issue stock' });
   }
 });
 
@@ -191,8 +310,9 @@ router.get('/list/:product_id', async (req, res) => {
 
 router.post('/claim', async (req, res) => {
   try {
-    const { secret, product_id, order_id } = req.body;
-    if (secret !== process.env.API_SECRET) return res.status(401).json({ error: 'Unauthorized' });
+    const { product_id, order_id } = req.body;
+    if (botAuthUnavailable()) return res.status(503).json({ error: 'Server not configured' });
+    if (!botAuthorized(req)) return res.status(401).json({ error: 'Unauthorized' });
 
     // Atomic claim: lock+skip so concurrent deliveries can't hand out the
     // same key twice (mirrors the pattern SUPERBOT's own index.js already

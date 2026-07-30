@@ -1,4 +1,3 @@
-const axios = require('axios');
 const { query, withTransaction } = require('../db');
 const { notifyBot } = require('./botNotify');
 const { raiseAlert } = require('./alerts');
@@ -34,6 +33,9 @@ async function lookupTier(tierId) {
 // "OUT_OF_STOCK" and the order was marked 'delivered' like any success.
 const FAILURE_MARKERS = new Set([
   'OUT_OF_STOCK', 'PRODUCT_NOT_FOUND', 'MANUAL_DELIVERY_REQUIRED', 'NO_ACCOUNT_LINKED',
+  // Distinct from OUT_OF_STOCK on purpose: the claim itself errored, so the
+  // key may well exist. Restocking is the wrong response — this needs a look.
+  'CLAIM_ERROR',
 ]);
 
 function collectFailures(deliveredGoods) {
@@ -131,14 +133,38 @@ async function deliver(order) {
       if (tier.delivery_type === 'auto' && tier.stock_type !== 'manual') {
         const claimed = [];
         for (let i = 0; i < (item.qty || 1); i++) {
+          // Claim straight from the DB.
+          //
+          // This used to POST to its OWN /api/stock/claim over
+          // http://localhost — an HTTP round trip with no timeout, and a bare
+          // `catch` that turned ANY failure into the string 'OUT_OF_STOCK'.
+          // The customer had already paid at this point, so a SIGTERM during a
+          // deploy, a saturated connection pool, or the loopback stalling all
+          // produced the same outcome: a paid order marked needs_attention
+          // reporting an out-of-stock item that was actually in stock. It also
+          // depended on API_SECRET being set for the server to authenticate to
+          // itself, which is a fail-open surface for no benefit.
+          //
+          // Same statement, same atomicity (FOR UPDATE SKIP LOCKED), no
+          // network. A genuine DB error is now distinguishable from real
+          // exhaustion instead of being flattened into it.
           try {
-            const res = await axios.post(
-              `http://localhost:${process.env.PORT || 3000}/api/stock/claim`,
-              { secret: process.env.API_SECRET, product_id: tier.id, order_id: order.id }
+            const { rows } = await query(
+              `UPDATE product_stock SET used = true, used_at = now(), order_id = $1
+               WHERE id = (
+                 SELECT id FROM product_stock
+                 WHERE guild_id = $2 AND tier_id = $3 AND used = false
+                 ORDER BY id ASC LIMIT 1 FOR UPDATE SKIP LOCKED
+               )
+               RETURNING value`,
+              [order.id, GUILD_ID, tier.id]
             );
-            claimed.push(res.data.success ? res.data.value : 'OUT_OF_STOCK');
-          } catch {
-            claimed.push('OUT_OF_STOCK');
+            claimed.push(rows.length ? rows[0].value : 'OUT_OF_STOCK');
+          } catch (claimErr) {
+            // Distinct marker: this is an infrastructure failure, not empty
+            // stock, and it needs a human rather than a restock.
+            console.error(`[Delivery] Stock claim FAILED for tier ${tier.id} on order ${order.id}:`, claimErr.message);
+            claimed.push('CLAIM_ERROR');
           }
         }
         deliveredGoods.push({ product: tier.product_name, items: claimed });

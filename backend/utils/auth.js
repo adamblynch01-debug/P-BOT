@@ -4,8 +4,34 @@
 
 const crypto = require('crypto');
 const { query } = require('../db');
+const { safeCompare } = require('./rateLimit');
 
 const SESSION_TTL_MS = 30 * 24 * 60 * 60 * 1000; // 30 days
+
+// Shared-secret gate for the bot and the watchers.
+//
+// Every call site used to spell this as `req.body.secret === process.env.API_SECRET`,
+// which is `undefined === undefined` — TRUE — whenever the variable is missing
+// from the environment. A single bad deploy or a rotation that deletes before
+// it re-adds therefore opened stock claiming, order confirmation, wallet
+// credit and catalog writes to anonymous callers. routes/config.js and
+// routes/auth.js were fixed individually; this helper exists so no route can
+// get it wrong again. Returns false when the secret is unset, and compares in
+// constant time.
+function botAuthorized(req) {
+  const expected = process.env.API_SECRET;
+  if (!expected) return false;
+  const given = (req.body && req.body.secret) || (req.query && req.query.secret);
+  if (!given) return false;
+  return safeCompare(given, expected);
+}
+
+// True when API_SECRET is missing entirely, so a route can answer 503 (server
+// misconfigured) instead of 401 (your secret is wrong) — the two are very
+// different for whoever is debugging a deploy.
+function botAuthUnavailable() {
+  return !process.env.API_SECRET;
+}
 
 function hashPassword(password) {
   const salt = crypto.randomBytes(16).toString('hex');
@@ -47,10 +73,18 @@ async function getSessionUser(token) {
   return rows[0] || null;
 }
 
+// Session token from the Authorization header, or the request body.
+//
+// A `?token=` query fallback used to be accepted too. A 30-day session token
+// in a URL ends up in proxy access logs, browser history and the Referer
+// header sent to any third-party asset on the page — so an admin token could
+// leak without anyone doing anything wrong. Nothing in the frontend or the bot
+// ever sent it that way (both use the Bearer header), so the fallback was pure
+// exposure and is gone.
 function bearerToken(req) {
   const header = req.get('authorization') || '';
   const m = header.match(/^Bearer (.+)$/i);
-  return m ? m[1] : (req.body && req.body.token) || (req.query && req.query.token) || null;
+  return m ? m[1] : (req.body && req.body.token) || null;
 }
 
 // Attaches req.user if a valid session token is present; never blocks the
@@ -88,6 +122,27 @@ async function requireAdmin(req, res, next) {
   }
 }
 
+// Stricter gate for the routes that can hand out authority or move money:
+// role changes, password resets, account deletion, wallet adjustment.
+//
+// requireAdmin deliberately accepts 'staff' so moderators can manage the
+// catalog, stock and reviews. Applying that same gate to /admin/set-role made
+// 'staff' equivalent to owner — a staff account could POST its own id with
+// role 'admin', or demote the real owner, or reset the owner's password and
+// take the account. Splitting the two means 'staff' is finally a real
+// lower-privilege tier rather than one request away from full control.
+async function requireOwnerAdmin(req, res, next) {
+  try {
+    const user = await getSessionUser(bearerToken(req));
+    if (!user) return res.status(401).json({ error: 'Not logged in' });
+    if (user.role !== 'admin') return res.status(403).json({ error: 'Owner admin only' });
+    req.user = user;
+    next();
+  } catch (err) {
+    res.status(500).json({ error: 'Auth check failed' });
+  }
+}
+
 function publicUser(row) {
   if (!row) return null;
   return {
@@ -105,5 +160,6 @@ function publicUser(row) {
 
 module.exports = {
   hashPassword, verifyPassword, createSession, getSessionUser, bearerToken,
-  attachUser, requireAuth, requireAdmin, publicUser,
+  attachUser, requireAuth, requireAdmin, requireOwnerAdmin, publicUser,
+  botAuthorized, botAuthUnavailable,
 };

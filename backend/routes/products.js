@@ -1,12 +1,12 @@
 const express = require('express');
 const router = express.Router();
 const { query } = require('../db');
-const { requireAdmin, getSessionUser, bearerToken } = require('../utils/auth');
+const { requireAdmin, getSessionUser, bearerToken, botAuthorized } = require('../utils/auth');
 
 const GUILD_ID = process.env.GUILD_ID;
 
 function isAuthorized(req) {
-  return req.body.secret === process.env.API_SECRET;
+  return botAuthorized(req);
 }
 
 // Bot (secret) and admin panel (logged-in admin/staff session) both manage

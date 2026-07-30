@@ -2,7 +2,7 @@ const express = require('express');
 const router = express.Router();
 const axios = require('axios');
 const { query } = require('../db');
-const { verifyCryptoPayment } = require('../utils/cryptoUtils');
+const { verifyCryptoPayment, fetchTotalReceived, receivedSinceBaseline } = require('../utils/cryptoUtils');
 const { raiseAlert } = require('../utils/alerts');
 
 const GUILD_ID = process.env.GUILD_ID;
@@ -57,22 +57,47 @@ router.post('/crypto', async (req, res) => {
     }
 
     const { rows: addrRows } = await query(
-      `SELECT order_id, address FROM crypto_addresses
-       WHERE guild_id = $1 AND address = ANY($2::text[])`,
+      `SELECT ca.order_id, ca.address, ca.baseline_received
+         FROM crypto_addresses ca
+        WHERE ca.guild_id = $1 AND ca.address = ANY($2::text[])`,
       [GUILD_ID, paidAddresses]
     );
     if (!addrRows.length) {
       console.warn('[Webhook] Payment to an address we do not own — ignoring');
       return res.sendStatus(200);
     }
-    const { order_id, address: ourAddress } = addrRows[0];
+    // One transaction can pay more than one of our addresses (an exchange
+    // batching two withdrawals, or a buyer settling two invoices from one
+    // wallet). Only addrRows[0] was ever considered, so the second order's
+    // funds arrived with no confirmation and no alert.
+    if (addrRows.length > 1) {
+      await raiseAlert('crypto_multi_address_tx',
+        `One transaction paid ${addrRows.length} of our addresses — only the first is auto-processed, review the rest`,
+        { severity: 'error', context: { orders: addrRows.map(r => String(r.order_id)) } }).catch(() => {});
+    }
+    const { order_id, address: ourAddress, baseline_received: baseline } = addrRows[0];
 
-    // 4. Count only what was paid TO US. Summing every output credited the
-    //    sender's own change back to the order, so a large change output could
-    //    cover a tiny real payment.
-    const receivedSats = outputs
+    // 4. Count what has been paid TO US in TOTAL, not just in this payload.
+    //
+    //    Summing this transaction's outputs alone meant a payment split across
+    //    two transactions never settled: each one fell short of the quote on
+    //    its own, and a customer topping up after an "underpaid" message stayed
+    //    stuck forever with the full amount on-chain. Re-reading the address's
+    //    cumulative total (minus whatever was there before we issued it) is the
+    //    same figure the poller uses, so both paths now agree.
+    let receivedSats = outputs
       .filter(o => (o.addresses || []).includes(ourAddress))
       .reduce((sum, o) => sum + (o.value || 0), 0);
+    try {
+      const total = await fetchTotalReceived(payload.coin || (payload.chain === 'litecoin' ? 'ltc' : 'btc'), ourAddress);
+      const cumulative = receivedSinceBaseline(total, baseline);
+      // Fails closed: on a bad read, fall back to this payload's own figure
+      // rather than confirming on a number we do not trust.
+      if (cumulative.ok && cumulative.sats >= receivedSats) receivedSats = cumulative.sats;
+      else if (!cumulative.ok) console.warn(`[Webhook] cumulative read unusable (${cumulative.reason}) — using payload amount`);
+    } catch (e) {
+      console.warn('[Webhook] Could not re-read address total, using payload amount:', e.message);
+    }
 
     const { rows: orderRows } = await query(
       'SELECT * FROM orders WHERE id = $1 AND guild_id = $2',
@@ -107,6 +132,41 @@ router.post('/crypto', async (req, res) => {
       return res.sendStatus(200);
     }
 
+    // 4c. Was this address recently handed to a DIFFERENT order?
+    //     Recycling rebinds an expired order's address to a new customer. If
+    //     the ORIGINAL customer then finally pays, the funds resolve to the new
+    //     order — and if they cover its quote, the new customer is delivered
+    //     for free while the person who actually paid gets nothing. A
+    //     settlement that lands soon after a handover is therefore not
+    //     auto-confirmable; a human has to attribute it.
+    try {
+      const { rows: hist } = await query(
+        `SELECT order_id, assigned_at FROM crypto_address_assignments
+          WHERE guild_id = $1 AND address = $2
+          ORDER BY assigned_at DESC LIMIT 1`,
+        [GUILD_ID, ourAddress]
+      );
+      const h = hist[0];
+      if (h && String(h.order_id) === String(order_id)) {
+        const heldForMs = Date.now() - new Date(h.assigned_at).getTime();
+        const RECYCLE_SUSPICION_MS = 48 * 60 * 60 * 1000;
+        if (heldForMs < RECYCLE_SUSPICION_MS) {
+          console.warn(`[Webhook] Order ${order_id} paid on a recently recycled address — holding for review`);
+          await query(
+            `UPDATE orders SET amount_received_native = $1, amount_received_unit = 'sats'
+              WHERE id = $2 AND status IN ('waiting','underpaid')`,
+            [receivedSats, order_id]
+          ).catch(() => {});
+          await raiseAlert('crypto_recycled_address_payment',
+            `Order ${order_id} received ${receivedSats} sats at ${ourAddress}, which was recycled from another order ${Math.round(heldForMs / 3600000)}h ago. Confirm the payer before delivering.`,
+            { severity: 'error', order_id, context: { address: ourAddress, received_sats: receivedSats, assigned_at: h.assigned_at } }).catch(() => {});
+          return res.sendStatus(200);
+        }
+      }
+    } catch (e) {
+      console.warn('[Webhook] Could not check address assignment history:', e.message);
+    }
+
     // 5. Verify the amount covers the locked quote. Fails closed when the order
     //    has no quote, leaving it for manual review rather than free delivery.
     const check = verifyCryptoPayment(order, receivedSats);
@@ -114,7 +174,7 @@ router.post('/crypto', async (req, res) => {
       console.warn(`[Webhook] Order ${order_id} NOT confirmed: ${check.reason}`);
       await query(
         `UPDATE orders SET status = 'underpaid', amount_received_native = $1, amount_received_unit = 'sats'
-          WHERE id = $2 AND status = 'waiting'`,
+          WHERE id = $2 AND status IN ('waiting','underpaid')`,
         [receivedSats, order_id]
       ).catch(() => {});
       await raiseAlert('order_underpaid',

@@ -1,10 +1,12 @@
 const express = require('express');
 const router = express.Router();
+const crypto = require('crypto');
 const { query, withTransaction } = require('../db');
 const { generateNote } = require('../utils/noteGenerator');
 const { generateCryptoAddress, registerWebhook, quoteCrypto } = require('../utils/cryptoUtils');
 const { notifyBot } = require('../utils/botNotify');
-const { attachUser, requireAuth, requireAdmin } = require('../utils/auth');
+const { attachUser, requireAuth, requireAdmin, botAuthorized, botAuthUnavailable } = require('../utils/auth');
+const { safeCompare } = require('../utils/rateLimit');
 
 const GUILD_ID = process.env.GUILD_ID;
 
@@ -18,10 +20,22 @@ const MAX_ITEM_QTY = 25;
 // A negative price would turn that debit into a credit, so every catalog line
 // is re-read from the DB and anything unpriceable is rejected outright when
 // the wallet is paying.
-async function repriceItems(items, { paidFromBalance }) {
+//
+// The reseller discount is applied HERE, from web_users.reseller_discount, and
+// nowhere else. The storefront cart used to compute it in the browser and
+// paint the discounted figure as the amount due while this route charged full
+// list price — so every reseller was overcharged by exactly their discount,
+// and the cart, the balance check and the actual debit were three different
+// numbers. The client's arithmetic is now display-only; this is the authority.
+async function repriceItems(items, { paidFromBalance, discountPercent }) {
   const ids = items
     .filter(i => /^\d+$/.test(String(i.id)))
     .map(i => parseInt(String(i.id), 10));
+
+  // Clamped and converted to basis points so the arithmetic stays in integers
+  // — same shape as routes/reseller.js, which had this right already.
+  const pct = Math.max(0, Math.min(99, Number(discountPercent) || 0));
+  const discountBp = Math.round(pct * 100);
 
   const priced = {};
   if (ids.length) {
@@ -45,12 +59,16 @@ async function repriceItems(items, { paidFromBalance }) {
     const row = priced[id];
 
     if (row) {
-      const cents = Number(row.price_cents) || 0;
-      if (cents <= 0) return { error: `"${row.product_name}" is quote-only and cannot be bought online` };
+      const listCents = Number(row.price_cents) || 0;
+      if (listCents <= 0) return { error: `"${row.product_name}" is quote-only and cannot be bought online` };
+      const cents = discountBp
+        ? Math.round((listCents * (10000 - discountBp)) / 10000)
+        : listCents;
       out.push({
         id, qty,
         name: row.label ? `${row.product_name} (${row.label})` : row.product_name,
         price: cents / 100,
+        ...(discountBp ? { list_price: listCents / 100 } : {}),
       });
       continue;
     }
@@ -58,6 +76,7 @@ async function repriceItems(items, { paidFromBalance }) {
     // Not a catalog tier: a user-set amount, or a legacy synthetic slug from
     // the embedded catalog. Those still carry a client price, so they may only
     // be paid for externally where a human confirms the amount received.
+    // No discount is applied to these — the price is not ours to trust.
     if (paidFromBalance) {
       return { error: 'This item is not available for balance checkout. Please contact support.' };
     }
@@ -65,7 +84,7 @@ async function repriceItems(items, { paidFromBalance }) {
     if (!Number.isFinite(price) || price <= 0) return { error: 'Invalid item price' };
     out.push({ id, qty, name: item.name || 'Item', price });
   }
-  return { items: out };
+  return { items: out, discount_percent: pct };
 }
 
 const FEES = { cashapp: ['CASHAPP_FEE_PERCENT', 10, 'Cash App'],
@@ -105,21 +124,47 @@ async function createOrder({ items, email, discord_id, payment_method, web_user_
   const { totalCents, fee_note } = applyFee(subtotalCents, payment_method);
 
   const total = totalCents / 100;
-  const note = generateNote();
 
-  const { rows } = await query(
-    `INSERT INTO orders
-       (guild_id, web_user_id, email, discord_id, items_snapshot, subtotal_cents, total_cents,
-        payment_method, payment_note, status, created_at, expires_at)
-     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,'waiting', now(), now() + interval '24 hours')
-     RETURNING *`,
-    [
-      GUILD_ID, web_user_id || null, email, discord_id || null, JSON.stringify(items),
-      subtotalCents, totalCents,
-      payment_method, note,
-    ]
-  );
-  const order = rows[0];
+  // The payment note is drawn from a 5.76M-value space and constrained by the
+  // partial unique index uniq_orders_open_note (one open order per note). A
+  // collision is rare but not impossible, and the crypto-address path already
+  // retries its own 23505 — the note path never did, so an unlucky customer
+  // got a bare 500 with nothing to act on. Retry with a fresh note instead.
+  let order = null;
+  let lastErr = null;
+  for (let attempt = 0; attempt < 5; attempt++) {
+    const note = generateNote();
+    const publicRef = crypto.randomBytes(16).toString('hex');
+    try {
+      const { rows } = await query(
+        `INSERT INTO orders
+           (guild_id, web_user_id, email, discord_id, items_snapshot, subtotal_cents, total_cents,
+            payment_method, payment_note, public_ref, status, created_at, expires_at)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,'waiting', now(), now() + interval '24 hours')
+         RETURNING *`,
+        [
+          GUILD_ID, web_user_id || null, email, discord_id || null, JSON.stringify(items),
+          subtotalCents, totalCents,
+          payment_method, note, publicRef,
+        ]
+      );
+      order = rows[0];
+      break;
+    } catch (err) {
+      if (err && err.code === '23505') {
+        lastErr = err;
+        console.warn(`[Orders] note/ref collision on attempt ${attempt + 1}, retrying`);
+        continue;
+      }
+      throw err;
+    }
+  }
+  if (!order) {
+    console.error('[Orders] exhausted note retries:', lastErr && lastErr.message);
+    const e = new Error('Could not allocate a payment reference. Please try again.');
+    e.statusCode = 400;
+    throw e;
+  }
 
   // Snapshot line items into order_items when checkout sent real numeric
   // tier ids (the new /api/products-backed catalog); older synthetic slugs
@@ -144,9 +189,9 @@ async function createOrder({ items, email, discord_id, payment_method, web_user_
 
   let payment_info = {};
   if (payment_method === 'cashapp') {
-    payment_info = { cashtag: process.env.CASHAPP_CASHTAG || '$YOUR_CASHTAG', note, amount: total };
+    payment_info = { cashtag: process.env.CASHAPP_CASHTAG || '$YOUR_CASHTAG', note: order.payment_note, amount: total };
   } else if (payment_method === 'paypal') {
-    payment_info = { email: process.env.PAYPAL_EMAIL || 'your@paypal.com', note, amount: total };
+    payment_info = { email: process.env.PAYPAL_EMAIL || 'your@paypal.com', note: order.payment_note, amount: total };
   } else if (payment_method === 'btc' || payment_method === 'ltc') {
     // Lock the USD→coin rate at order time. The customer is quoted dollars but
     // pays satoshis, so without a stored quote there is nothing to validate the
@@ -224,6 +269,17 @@ async function createOrder({ items, email, discord_id, payment_method, web_user_
       throw err;
     }
 
+    // Every payment method converges here: staff get one order feed regardless
+    // of how the customer paid. This notify used to live only in the `else`
+    // branch, so a balance checkout — which settles instantly and is the most
+    // common path for a returning customer — produced no Discord entry at all.
+    // Fired BEFORE delivery so the order is visible even if delivery then
+    // fails and flips the order to needs_attention.
+    await notifyBot('new_order', {
+      order: { ...freshOrder, id: String(order.id), status: 'paid' },
+      payment_info,
+    });
+
     // Delivery only after COMMIT. Inside the transaction a later rollback would
     // un-charge the customer while the keys were already sent — the one failure
     // mode worse than the one being fixed.
@@ -234,6 +290,58 @@ async function createOrder({ items, email, discord_id, payment_method, web_user_
 
   return { order: freshOrder, payment_info, total, fee_note };
 }
+
+// ─── POST /api/orders/quote ─────────────────────────────
+// Prices a cart WITHOUT creating an order, using exactly the same repriceItems
+// + applyFee path /create uses.
+//
+// The payment overlay used to compute the method fee and grand total in the
+// browser from a config it had fetched separately. If /api/config was briefly
+// unreachable the fee row silently vanished and the summary showed the
+// undiscounted subtotal as TOTAL — while the payment instructions, which come
+// from the server, asked for the fee-inclusive amount. The customer sent what
+// the site displayed, the watcher's amount check rejected it as an
+// underpayment, and the order sat unpaid with the buyer certain they had paid.
+// The same divergence was permanent if a fee percent changed on Railway.
+//
+// One authority for money: this route.
+router.post('/quote', attachUser, async (req, res) => {
+  try {
+    const { items, payment_method } = req.body;
+    if (!items || !Array.isArray(items) || !items.length) {
+      return res.status(400).json({ error: 'items[] is required' });
+    }
+    if (items.length > 50) return res.status(400).json({ error: 'Too many items' });
+
+    const paidFromBalance = payment_method === 'balance';
+    if (paidFromBalance && !req.user) {
+      return res.status(401).json({ error: 'Log in to pay with balance' });
+    }
+
+    const repriced = await repriceItems(items, {
+      paidFromBalance,
+      discountPercent: (req.user && req.user.reseller_discount) || 0,
+    });
+    if (repriced.error) return res.status(400).json({ error: repriced.error });
+
+    const subtotalCents = repriced.items.reduce(
+      (sum, item) => sum + Math.round(item.price * 100) * (item.qty || 1), 0
+    );
+    const { totalCents, fee_note } = applyFee(subtotalCents, payment_method);
+
+    res.json({
+      items: repriced.items,
+      discount_percent: repriced.discount_percent || 0,
+      subtotal: subtotalCents / 100,
+      fee: (totalCents - subtotalCents) / 100,
+      fee_note,
+      total: totalCents / 100,
+    });
+  } catch (err) {
+    console.error('[Orders] quote error:', err);
+    res.status(500).json({ error: 'Failed to price this cart' });
+  }
+});
 
 // ─── POST /api/orders/create ────────────────────────────
 router.post('/create', attachUser, async (req, res) => {
@@ -250,8 +358,13 @@ router.post('/create', attachUser, async (req, res) => {
       return res.status(401).json({ error: 'Log in to pay with balance' });
     }
 
-    // Prices come from product_tiers, never from the request body.
-    const repriced = await repriceItems(items, { paidFromBalance });
+    // Prices come from product_tiers, never from the request body. The
+    // reseller discount likewise comes from the session's own web_users row —
+    // an anonymous checkout gets none, and the client cannot ask for one.
+    const repriced = await repriceItems(items, {
+      paidFromBalance,
+      discountPercent: (req.user && req.user.reseller_discount) || 0,
+    });
     if (repriced.error) return res.status(400).json({ error: repriced.error });
     const safeItems = repriced.items;
 
@@ -277,6 +390,14 @@ router.post('/create', attachUser, async (req, res) => {
     res.json({
       success: true,
       order_id: String(order.id),
+      // Returned exactly once, to whoever created the order. GET /api/orders/:id
+      // requires it (or an owning/admin session) — the numeric id alone is not
+      // a credential.
+      public_ref: order.public_ref || null,
+      // What the server actually applied, so the cart can render the server's
+      // number instead of its own guess.
+      discount_percent: repriced.discount_percent || 0,
+      items: safeItems,
       payment_method,
       payment_info,
       total,
@@ -356,11 +477,33 @@ function formatOrder(data) {
 }
 
 // ─── GET /api/orders/:id ────────────────────────────────
-router.get('/:id', async (req, res) => {
+// The payment overlay polls this every 5s, including for guest checkouts with
+// no session, so it cannot simply require auth. But orders.id is a BIGSERIAL:
+// leaving it as the only credential let anyone enumerate 1,2,3… and read the
+// status, method, total and timestamps of every order ever placed.
+//
+// Three ways to read an order now, in order of preference:
+//   ?ref=<public_ref>  — the unguessable handle returned only to the creator
+//   a session that owns the order
+//   an admin/staff session
+// Anything else gets 404 — deliberately not 403, so a probe cannot use the
+// status code to confirm that an id exists.
+router.get('/:id', attachUser, async (req, res) => {
   try {
-    const { rows } = await query('SELECT * FROM orders WHERE id = $1', [req.params.id]);
+    const { rows } = await query(
+      'SELECT * FROM orders WHERE id = $1 AND guild_id = $2',
+      [req.params.id, GUILD_ID]
+    );
     const data = rows[0];
     if (!data) return res.status(404).json({ error: 'Order not found' });
+
+    const ref = req.query.ref ? String(req.query.ref) : '';
+    const refMatches = !!data.public_ref && safeCompare(ref, data.public_ref);
+    const isOwner = !!(req.user && data.web_user_id && String(req.user.id) === String(data.web_user_id));
+    const isAdmin = !!(req.user && ['admin', 'staff'].includes(req.user.role));
+    if (!refMatches && !isOwner && !isAdmin) {
+      return res.status(404).json({ error: 'Order not found' });
+    }
 
     res.json({
       order_id: String(data.id),
@@ -383,8 +526,9 @@ router.get('/:id', async (req, res) => {
 // the email) so the address is only ever revealed to the trusted bot.
 router.post('/verify-claim', async (req, res) => {
   try {
-    const { secret, order_id, email } = req.body;
-    if (secret !== process.env.API_SECRET) return res.status(401).json({ error: 'Unauthorized' });
+    const { order_id, email } = req.body;
+    if (botAuthUnavailable()) return res.status(503).json({ error: 'Server not configured' });
+    if (!botAuthorized(req)) return res.status(401).json({ error: 'Unauthorized' });
     if (!order_id || !email) return res.status(400).json({ error: 'order_id and email are required' });
 
     const { rows } = await query(
@@ -440,9 +584,10 @@ function nativeToUsdCents(order, native, method) {
 // ─── POST /api/orders/confirm ───────────────────────────
 router.post('/confirm', async (req, res) => {
   try {
-    const { secret, order_id, amount_received, method, provider_txn_id } = req.body;
+    const { order_id, amount_received, method, provider_txn_id } = req.body;
 
-    if (secret !== process.env.API_SECRET) {
+    if (botAuthUnavailable()) return res.status(503).json({ error: 'Server not configured' });
+    if (!botAuthorized(req)) {
       return res.status(401).json({ error: 'Unauthorized' });
     }
 

@@ -1,11 +1,17 @@
 const express = require('express');
 const router = express.Router();
 const axios = require('axios');
-const { query } = require('../db');
+const crypto = require('crypto');
+const { query, withTransaction } = require('../db');
 const {
-  hashPassword, verifyPassword, createSession, requireAuth, requireAdmin, publicUser,
+  hashPassword, verifyPassword, createSession, requireAuth, requireAdmin,
+  requireOwnerAdmin, publicUser,
 } = require('../utils/auth');
 const { rateLimit, failureLimiter, safeCompare } = require('../utils/rateLimit');
+const { logAdminAction } = require('../utils/adminLog');
+const {
+  generateSecret, verifyTOTP, generateBackupCodes, hashBackupCode, otpauthUrl,
+} = require('../utils/totp');
 
 const GUILD_ID = process.env.GUILD_ID;
 
@@ -223,6 +229,14 @@ router.post('/signup', signupLimiter, async (req, res) => {
 });
 
 // ─── POST /api/auth/login ───────────────────────────────
+// Password check ONLY. If the account has a second factor, this returns a
+// challenge and NO token — the session is minted by /login/verify.
+//
+// It used to return the 30-day bearer here unconditionally, with the TOTP
+// prompt and the Discord DM running afterwards in page JavaScript. Anyone
+// holding just the password could therefore skip both with a single curl, and
+// in the browser, wiping the localStorage record that held the `twofa` object
+// skipped the prompt too.
 router.post('/login', async (req, res) => {
   try {
     const { username, password } = req.body;
@@ -247,13 +261,289 @@ router.post('/login', async (req, res) => {
     }
     if (user.banned) return res.status(403).json({ error: 'This account has been banned' });
 
+    const methods = [];
+    if (user.totp_enabled && user.totp_secret) methods.push('totp');
+    if (user.discord_id && user.discord_verified) methods.push('discord');
+
+    if (methods.length) {
+      const challengeId = crypto.randomBytes(24).toString('hex');
+      await query(
+        `INSERT INTO web_login_challenges (id, web_user_id, guild_id, kind, expires_at)
+         VALUES ($1,$2,$3,$4, now() + interval '10 minutes')`,
+        [challengeId, user.id, GUILD_ID, methods[0]]
+      );
+      // Deliberately no token, and no account detail beyond what the caller
+      // already proved they know.
+      return res.json({
+        success: true,
+        requires_2fa: true,
+        challenge_id: challengeId,
+        methods,
+        discord_id: methods.includes('discord') ? user.discord_id : null,
+        email: user.email,
+      });
+    }
+
     await query('UPDATE web_users SET last_login_at = now() WHERE id = $1', [user.id]);
 
     const token = await createSession(user.id, GUILD_ID);
-    res.json({ success: true, token, user: publicUser(user) });
+    res.json({ success: true, requires_2fa: false, token, user: publicUser(user) });
   } catch (err) {
     console.error('[Auth] Login error:', err);
     res.status(500).json({ error: 'Failed to log in' });
+  }
+});
+
+// ─── POST /api/auth/login/discord-challenge ─────────────
+// Starts the Discord leg of a 2FA login: the BACKEND asks SUPERBOT to DM the
+// account's linked Discord user, and records the bot's session id against the
+// challenge row. The browser never supplies the Discord id and never gets to
+// say whether the DM was clicked — it only polls.
+router.post('/login/discord-challenge', async (req, res) => {
+  try {
+    const { challenge_id } = req.body;
+    if (!challenge_id) return res.status(400).json({ error: 'challenge_id is required' });
+
+    const { rows } = await query(
+      `SELECT c.*, u.email, u.discord_id, u.discord_verified, u.banned
+         FROM web_login_challenges c JOIN web_users u ON u.id = c.web_user_id
+        WHERE c.id = $1 AND c.guild_id = $2 AND c.consumed_at IS NULL AND c.expires_at > now()`,
+      [challenge_id, GUILD_ID]
+    );
+    const row = rows[0];
+    if (!row) return res.status(401).json({ error: 'This login request has expired. Please log in again.' });
+    if (row.banned) return res.status(403).json({ error: 'This account has been banned' });
+    if (!row.discord_id || !row.discord_verified) {
+      return res.status(400).json({ error: 'No verified Discord account is linked to this login.' });
+    }
+
+    let sbSessionId = null;
+    try {
+      const sb = await axios.post(`${SUPERBOT_URL}/api/auth/initiate-2fa`, {
+        email: row.email,
+        discordId: row.discord_id,
+      });
+      sbSessionId = sb.data && sb.data.userId;
+    } catch (e) {
+      const msg = (e.response && e.response.data && e.response.data.message) || null;
+      console.error('[Auth] discord-challenge initiate failed:', msg || e.message);
+      return res.status(502).json({ error: msg || 'Could not reach the Discord verification service.' });
+    }
+    if (!sbSessionId) return res.status(502).json({ error: 'Verification service did not start a session.' });
+
+    await query('UPDATE web_login_challenges SET ref = $1, kind = $2 WHERE id = $3',
+      [sbSessionId, 'discord', challenge_id]);
+
+    res.json({ success: true, sent: true });
+  } catch (err) {
+    console.error('[Auth] discord-challenge error:', err);
+    res.status(500).json({ error: 'Failed to start Discord verification' });
+  }
+});
+
+// ─── POST /api/auth/login/verify ────────────────────────
+// Second factor. The ONLY place a session is minted for a 2FA account.
+//
+// Accepts either a TOTP code, a single-use backup code, or — for the Discord
+// path — the SUPERBOT verification id, which is confirmed by asking the bot
+// directly rather than trusting the browser's word that the DM was clicked.
+router.post('/login/verify', async (req, res) => {
+  try {
+    const { challenge_id, code } = req.body;
+    if (!challenge_id) return res.status(400).json({ error: 'challenge_id is required' });
+
+    const { rows: cRows } = await query(
+      `SELECT * FROM web_login_challenges
+        WHERE id = $1 AND guild_id = $2 AND consumed_at IS NULL AND expires_at > now()`,
+      [challenge_id, GUILD_ID]
+    );
+    const challenge = cRows[0];
+    if (!challenge) return res.status(401).json({ error: 'This login request has expired. Please log in again.' });
+
+    // Bound the guesses per challenge. A 6-digit code is a 1,000,000 space but
+    // the challenge lives ten minutes, which is plenty of requests.
+    if (challenge.attempts >= 8) {
+      await query('UPDATE web_login_challenges SET consumed_at = now() WHERE id = $1', [challenge_id]);
+      return res.status(429).json({ error: 'Too many incorrect codes. Please log in again.' });
+    }
+
+    const { rows: uRows } = await query(
+      `SELECT u.*, b.balance_cents FROM web_users u
+       LEFT JOIN balances b ON b.web_user_id = u.id
+       WHERE u.id = $1 AND u.guild_id = $2`,
+      [challenge.web_user_id, GUILD_ID]
+    );
+    const user = uRows[0];
+    if (!user) return res.status(401).json({ error: 'Account not found' });
+    if (user.banned) return res.status(403).json({ error: 'This account has been banned' });
+
+    let verified = false;
+    let usedBackupCode = false;
+
+    if (!code && challenge.ref) {
+      // Discord leg: ask SUPERBOT whether the DM button was actually clicked.
+      // The reference came from OUR record of the challenge, not the browser.
+      try {
+        const sb = await axios.post(`${SUPERBOT_URL}/api/auth/verify-token`, { userId: challenge.ref });
+        verified = !!(sb.data && sb.data.verified);
+      } catch (e) {
+        return res.json({ verified: false, pending: true });
+      }
+      // Still waiting on the user to click — not a failed attempt, so do not
+      // burn one of the eight tries on it.
+      if (!verified) return res.json({ verified: false, pending: true });
+    } else if (code && user.totp_enabled && user.totp_secret && verifyTOTP(user.totp_secret, code)) {
+      verified = true;
+    } else if (code) {
+      // Single-use backup code, matched against stored hashes.
+      const { rows: bc } = await query(
+        `UPDATE web_user_backup_codes SET used_at = now()
+          WHERE id = (SELECT id FROM web_user_backup_codes
+                       WHERE web_user_id = $1 AND used_at IS NULL AND code_hash = $2
+                       LIMIT 1)
+          RETURNING id`,
+        [user.id, hashBackupCode(code)]
+      );
+      if (bc.length) { verified = true; usedBackupCode = true; }
+    }
+
+    if (!verified) {
+      await query('UPDATE web_login_challenges SET attempts = attempts + 1 WHERE id = $1', [challenge_id]);
+      return res.status(401).json({ error: 'That code is not valid.' });
+    }
+
+    await query('UPDATE web_login_challenges SET consumed_at = now() WHERE id = $1', [challenge_id]);
+    await query('UPDATE web_users SET last_login_at = now() WHERE id = $1', [user.id]);
+
+    const token = await createSession(user.id, GUILD_ID);
+    res.json({ success: true, token, user: publicUser(user), used_backup_code: usedBackupCode });
+  } catch (err) {
+    console.error('[Auth] login/verify error:', err);
+    res.status(500).json({ error: 'Failed to verify' });
+  }
+});
+
+// ─── 2FA enrollment ─────────────────────────────────────
+// Enrollment used to happen entirely in the browser: it generated the secret,
+// verified the first code itself, and wrote secret + plaintext backup codes
+// into the localStorage `ghostUsers` record. Anyone with devtools could read
+// the secret, and clearing the record silently disabled the second factor.
+// The secret is now issued here, held pending until a real code proves the
+// authenticator app has it, and only then written to web_users.
+
+// Pending enrollments, in memory: web_user_id → { secret, codes, expiresAt }.
+// Never persisted until confirmed, so an abandoned setup leaves nothing behind.
+const pendingEnrollments = new Map();
+function reapEnrollments() {
+  const now = Date.now();
+  for (const [k, v] of pendingEnrollments) if (v.expiresAt < now) pendingEnrollments.delete(k);
+}
+
+// ─── GET /api/auth/2fa/status ───────────────────────────
+router.get('/2fa/status', requireAuth, async (req, res) => {
+  try {
+    const { rows } = await query(
+      `SELECT (SELECT COUNT(*)::int FROM web_user_backup_codes
+                WHERE web_user_id = $1 AND used_at IS NULL) AS codes_left`,
+      [req.user.id]
+    );
+    res.json({
+      enabled: !!req.user.totp_enabled,
+      discord_available: !!(req.user.discord_id && req.user.discord_verified),
+      backup_codes_remaining: rows[0] ? rows[0].codes_left : 0,
+    });
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to read 2FA status' });
+  }
+});
+
+// ─── POST /api/auth/2fa/setup ───────────────────────────
+// Issues a secret + backup codes. Nothing is active until /2fa/confirm.
+router.post('/2fa/setup', requireAuth, async (req, res) => {
+  try {
+    reapEnrollments();
+    if (req.user.totp_enabled) return res.status(400).json({ error: '2FA is already enabled. Disable it first.' });
+    const secret = generateSecret();
+    const codes = generateBackupCodes(8);
+    pendingEnrollments.set(String(req.user.id), { secret, codes, expiresAt: Date.now() + 15 * 60 * 1000 });
+    res.json({
+      secret,
+      otpauth_url: otpauthUrl(secret, req.user.email || req.user.username, process.env.STORE_NAME || 'GHOST.EXE'),
+      // Shown once, at enrollment. Only hashes are stored.
+      backup_codes: codes,
+    });
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to start 2FA setup' });
+  }
+});
+
+// ─── POST /api/auth/2fa/confirm ─────────────────────────
+router.post('/2fa/confirm', requireAuth, async (req, res) => {
+  try {
+    reapEnrollments();
+    const pending = pendingEnrollments.get(String(req.user.id));
+    if (!pending) return res.status(400).json({ error: 'Start setup again — this enrollment expired.' });
+    if (!verifyTOTP(pending.secret, req.body && req.body.code)) {
+      return res.status(400).json({ error: 'That code is not valid. Check your authenticator app and try again.' });
+    }
+
+    await withTransaction(async (exec) => {
+      await exec('UPDATE web_users SET totp_secret = $1, totp_enabled = true WHERE id = $2 AND guild_id = $3',
+        [pending.secret, req.user.id, GUILD_ID]);
+      await exec('DELETE FROM web_user_backup_codes WHERE web_user_id = $1', [req.user.id]);
+      for (const c of pending.codes) {
+        await exec('INSERT INTO web_user_backup_codes (web_user_id, guild_id, code_hash) VALUES ($1,$2,$3)',
+          [req.user.id, GUILD_ID, hashBackupCode(c)]);
+      }
+    });
+
+    pendingEnrollments.delete(String(req.user.id));
+    res.json({ success: true, enabled: true });
+  } catch (err) {
+    console.error('[Auth] 2fa/confirm error:', err);
+    res.status(500).json({ error: 'Failed to enable 2FA' });
+  }
+});
+
+// ─── POST /api/auth/2fa/disable ─────────────────────────
+// Requires the current password: a hijacked session must not be able to strip
+// the second factor off the account it just walked into.
+router.post('/2fa/disable', requireAuth, async (req, res) => {
+  try {
+    const { password } = req.body;
+    if (!password) return res.status(400).json({ error: 'Your password is required to disable 2FA' });
+    const { rows } = await query('SELECT password_hash FROM web_users WHERE id = $1', [req.user.id]);
+    if (!rows.length || !verifyPassword(password, rows[0].password_hash)) {
+      if (loginLimiter.blocked(req, res)) return;
+      loginLimiter.fail(req);
+      return res.status(401).json({ error: 'Incorrect password' });
+    }
+    await withTransaction(async (exec) => {
+      await exec('UPDATE web_users SET totp_secret = NULL, totp_enabled = false WHERE id = $1', [req.user.id]);
+      await exec('DELETE FROM web_user_backup_codes WHERE web_user_id = $1', [req.user.id]);
+    });
+    res.json({ success: true, enabled: false });
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to disable 2FA' });
+  }
+});
+
+// ─── POST /api/auth/2fa/backup-codes ────────────────────
+// Regenerate. Returns the new codes once; the old ones stop working.
+router.post('/2fa/backup-codes', requireAuth, async (req, res) => {
+  try {
+    if (!req.user.totp_enabled) return res.status(400).json({ error: '2FA is not enabled on this account' });
+    const codes = generateBackupCodes(8);
+    await withTransaction(async (exec) => {
+      await exec('DELETE FROM web_user_backup_codes WHERE web_user_id = $1', [req.user.id]);
+      for (const c of codes) {
+        await exec('INSERT INTO web_user_backup_codes (web_user_id, guild_id, code_hash) VALUES ($1,$2,$3)',
+          [req.user.id, GUILD_ID, hashBackupCode(c)]);
+      }
+    });
+    res.json({ success: true, backup_codes: codes });
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to regenerate backup codes' });
   }
 });
 
@@ -274,20 +564,122 @@ router.post('/logout', async (req, res) => {
   }
 });
 
+// ─── Discord account linking ────────────────────────────
+// This used to be ONE route, POST /api/auth/confirm-discord, which took a
+// discord_id straight from the request body and wrote
+// `discord_verified = true`. Its own comment claimed SUPERBOT's verify-token
+// flow had already confirmed the id — but the backend never called SUPERBOT.
+// The browser made the trust decision and the server just recorded it, so
+// `curl -H 'Authorization: Bearer <any new signup>' -d '{"discord_id":"<owner
+// snowflake>"}'` claimed the owner's Discord identity outright. That poisons
+// every admin lookup keyed by discord_id (balance adjust, reseller resolve)
+// and the passwordless-login path.
+//
+// Now it is two steps and the backend owns both. The browser never supplies
+// the id at confirm time — it only carries an opaque pending_id.
+
+// discord link pending: pending_id -> { webUserId, discordId, sbRef, expiresAt }
+const discordLinkPending = new Map();
+function reapDiscordLinks() {
+  const now = Date.now();
+  for (const [k, v] of discordLinkPending) if (v.expiresAt < now) discordLinkPending.delete(k);
+}
+
+// ─── POST /api/auth/link-discord/start ──────────────────
+// Asks SUPERBOT to DM the claimed Discord account an Authenticate button.
+// Only the real owner of that account can click it.
+router.post('/link-discord/start', requireAuth, discordLoginLimiter, async (req, res) => {
+  try {
+    reapDiscordLinks();
+    const discordId = String((req.body && req.body.discord_id) || '').trim();
+    if (!/^\d{15,25}$/.test(discordId)) {
+      return res.status(400).json({ error: 'That does not look like a Discord user ID.' });
+    }
+
+    // Refuse a snowflake already verified on another account, rather than
+    // creating the duplicate that makes admin lookups ambiguous.
+    const { rows: taken } = await query(
+      `SELECT id FROM web_users
+        WHERE guild_id = $1 AND discord_id = $2 AND discord_verified = true AND id <> $3`,
+      [GUILD_ID, discordId, req.user.id]
+    );
+    if (taken.length) {
+      return res.status(409).json({ error: 'That Discord account is already linked to another site account.' });
+    }
+
+    let sbRef = null;
+    try {
+      const sb = await axios.post(`${SUPERBOT_URL}/api/auth/initiate-2fa`, {
+        email: req.user.email,
+        discordId,
+      });
+      sbRef = sb.data && sb.data.userId;
+    } catch (e) {
+      const msg = (e.response && e.response.data && e.response.data.message) || null;
+      return res.status(502).json({ error: msg || 'Could not send the Discord verification DM.' });
+    }
+    if (!sbRef) return res.status(502).json({ error: 'Verification service did not start a session.' });
+
+    const pendingId = crypto.randomBytes(24).toString('hex');
+    discordLinkPending.set(pendingId, {
+      webUserId: req.user.id,
+      discordId,
+      sbRef,
+      expiresAt: Date.now() + 10 * 60 * 1000,
+    });
+    res.json({ success: true, pending_id: pendingId });
+  } catch (err) {
+    console.error('[Auth] link-discord/start error:', err);
+    res.status(500).json({ error: 'Failed to start Discord linking' });
+  }
+});
+
 // ─── POST /api/auth/confirm-discord ─────────────────────
-// Called by the website once SUPERBOT's existing /api/auth/verify-token
-// flow reports verified:true for this discord_id, so we don't duplicate
-// that 2FA challenge/session machinery here — just persist the outcome.
+// Takes ONLY the opaque pending_id. The Discord id comes from our own record
+// of the pending link, and the link is written only after SUPERBOT confirms
+// the DM button was actually clicked.
 router.post('/confirm-discord', requireAuth, async (req, res) => {
   try {
-    const { discord_id } = req.body;
-    if (!discord_id) return res.status(400).json({ error: 'discord_id is required' });
+    reapDiscordLinks();
+    const pendingId = String((req.body && req.body.pending_id) || '');
+    if (!pendingId) return res.status(400).json({ error: 'pending_id is required' });
+
+    const pending = discordLinkPending.get(pendingId);
+    // Bound to the session that started it, so one user cannot finish
+    // another's pending link.
+    if (!pending || String(pending.webUserId) !== String(req.user.id)) {
+      return res.status(400).json({ error: 'That linking request expired. Please start again.' });
+    }
+
+    let verified = false;
+    try {
+      const sb = await axios.post(`${SUPERBOT_URL}/api/auth/verify-token`, { userId: pending.sbRef });
+      verified = !!(sb.data && sb.data.verified);
+    } catch (e) {
+      return res.json({ verified: false, pending: true });
+    }
+    if (!verified) return res.json({ verified: false, pending: true });
+
+    discordLinkPending.delete(pendingId);
+
+    // Re-check at write time: another account could have linked this snowflake
+    // during the ten minutes the DM was outstanding.
+    const { rows: taken } = await query(
+      `SELECT id FROM web_users
+        WHERE guild_id = $1 AND discord_id = $2 AND discord_verified = true AND id <> $3`,
+      [GUILD_ID, pending.discordId, req.user.id]
+    );
+    if (taken.length) {
+      return res.status(409).json({ error: 'That Discord account is already linked to another site account.' });
+    }
+
     await query(
       `UPDATE web_users SET discord_id = $1, discord_verified = true WHERE id = $2`,
-      [discord_id, req.user.id]
+      [pending.discordId, req.user.id]
     );
-    res.json({ success: true });
+    res.json({ success: true, verified: true, discord_id: pending.discordId });
   } catch (err) {
+    console.error('[Auth] confirm-discord error:', err);
     res.status(500).json({ error: 'Failed to link Discord' });
   }
 });
@@ -371,6 +763,10 @@ router.post('/set-role', async (req, res) => {
     // role from web_users on every request (see utils/auth.js), so a demoted
     // admin loses panel access on their very next call without logging out.
 
+    await logAdminAction(req, 'set_role', target.id, {
+      role, previous_role: target.role, username: rows[0].username, via: 'api_secret',
+    });
+
     res.json({
       success: true,
       user: { ...rows[0], id: String(rows[0].id) },
@@ -398,10 +794,28 @@ router.post('/ban', async (req, res) => {
       [!!banned, GUILD_ID, username]
     );
     if (!rows.length) return res.status(404).json({ error: 'User not found' });
+    await logAdminAction(req, banned ? 'ban' : 'unban', rows[0].id, { username: rows[0].username, via: 'api_secret' });
     res.json({ success: true, user: rows[0] });
   } catch (err) {
     res.status(500).json({ error: 'Failed to update ban state' });
   }
+});
+
+// ─── GET /api/auth/staff-context ─────────────────────────
+// Authoritative answer to "may this session open the staff panel, and as
+// what". The staff panel used to decide this entirely in the browser: it read
+// a ghostUsers record out of localStorage, checked a PLAINTEXT password field
+// on it, and unlocked the Tickets / Users / Ban Log tabs without a single
+// request leaving the page — so anyone could inject a record with a staffRole
+// in devtools and walk straight in. The role now comes from web_users on the
+// server, per request, over the session token.
+router.get('/staff-context', requireAdmin, async (req, res) => {
+  res.json({
+    ok: true,
+    username: req.user.username,
+    role: req.user.role,
+    is_owner_admin: req.user.role === 'admin',
+  });
 });
 
 // ─── GET /api/auth/admin/users ───────────────────────────
@@ -443,7 +857,7 @@ router.get('/admin/users', requireAdmin, async (req, res) => {
 // ─── POST /api/auth/admin/reset-password ─────────────────
 // Admin sets a new password for a user by id. Hashes it, and invalidates all
 // of that user's sessions so the old credentials stop working immediately.
-router.post('/admin/reset-password', requireAdmin, async (req, res) => {
+router.post('/admin/reset-password', requireOwnerAdmin, async (req, res) => {
   try {
     const { user_id, new_password } = req.body;
     if (!user_id || !new_password) return res.status(400).json({ error: 'user_id and new_password are required' });
@@ -456,6 +870,7 @@ router.post('/admin/reset-password', requireAdmin, async (req, res) => {
     );
     if (!rows.length) return res.status(404).json({ error: 'User not found' });
     await query('DELETE FROM web_sessions WHERE web_user_id = $1', [user_id]);
+    await logAdminAction(req, 'reset_password', user_id, { username: rows[0].username });
     res.json({ success: true, user: { id: String(rows[0].id), username: rows[0].username } });
   } catch (err) {
     console.error('[Auth] Admin reset-password error:', err);
@@ -466,17 +881,23 @@ router.post('/admin/reset-password', requireAdmin, async (req, res) => {
 // ─── POST /api/auth/admin/set-role ───────────────────────
 // Session-gated (admin) counterpart to the secret-gated /set-role above, by
 // user id, so the panel can promote/demote without the API_SECRET.
-router.post('/admin/set-role', requireAdmin, async (req, res) => {
+router.post('/admin/set-role', requireOwnerAdmin, async (req, res) => {
   try {
     const { user_id, role } = req.body;
     if (!['member', 'staff', 'admin', 'reseller'].includes(role)) {
       return res.status(400).json({ error: 'Invalid role' });
+    }
+    // No self-edit: an owner cannot demote themselves into a lockout, and this
+    // also closes the self-promotion path if the gate above is ever loosened.
+    if (String(user_id) === String(req.user.id)) {
+      return res.status(400).json({ error: 'Cannot change your own role' });
     }
     const { rows } = await query(
       `UPDATE web_users SET role = $1 WHERE id = $2 AND guild_id = $3 RETURNING id, username, role`,
       [role, user_id, GUILD_ID]
     );
     if (!rows.length) return res.status(404).json({ error: 'User not found' });
+    await logAdminAction(req, 'set_role', user_id, { role, username: rows[0].username });
     res.json({ success: true, user: { ...rows[0], id: String(rows[0].id) } });
   } catch (err) {
     res.status(500).json({ error: 'Failed to set role' });
@@ -487,12 +908,23 @@ router.post('/admin/set-role', requireAdmin, async (req, res) => {
 router.post('/admin/ban', requireAdmin, async (req, res) => {
   try {
     const { user_id, banned } = req.body;
+    // Staff may ban members, but not an owner admin — otherwise a staff
+    // account can lock the owner out of their own store.
+    const { rows: targetRows } = await query(
+      'SELECT role FROM web_users WHERE id = $1 AND guild_id = $2',
+      [user_id, GUILD_ID]
+    );
+    if (!targetRows.length) return res.status(404).json({ error: 'User not found' });
+    if (targetRows[0].role === 'admin' && req.user.role !== 'admin') {
+      return res.status(403).json({ error: 'Only an owner admin can ban an admin account' });
+    }
     const { rows } = await query(
       `UPDATE web_users SET banned = $1 WHERE id = $2 AND guild_id = $3 RETURNING id, username, banned`,
       [!!banned, user_id, GUILD_ID]
     );
     if (!rows.length) return res.status(404).json({ error: 'User not found' });
     if (banned) await query('DELETE FROM web_sessions WHERE web_user_id = $1', [user_id]);
+    await logAdminAction(req, banned ? 'ban' : 'unban', user_id, { username: rows[0].username });
     res.json({ success: true, user: { ...rows[0], id: String(rows[0].id) } });
   } catch (err) {
     res.status(500).json({ error: 'Failed to update ban state' });
@@ -552,16 +984,17 @@ router.post('/panel-unlock', async (req, res) => {
 });
 
 // ─── DELETE /api/auth/admin/user/:id ─────────────────────
-router.delete('/admin/user/:id', requireAdmin, async (req, res) => {
+router.delete('/admin/user/:id', requireOwnerAdmin, async (req, res) => {
   try {
     if (String(req.params.id) === String(req.user.id)) {
       return res.status(400).json({ error: 'You cannot delete your own account' });
     }
     const { rows } = await query(
-      `DELETE FROM web_users WHERE id = $1 AND guild_id = $2 RETURNING id`,
+      `DELETE FROM web_users WHERE id = $1 AND guild_id = $2 RETURNING id, username`,
       [req.params.id, GUILD_ID]
     );
     if (!rows.length) return res.status(404).json({ error: 'User not found' });
+    await logAdminAction(req, 'delete_user', req.params.id, { username: rows[0].username });
     res.json({ success: true });
   } catch (err) {
     res.status(500).json({ error: 'Failed to delete user' });

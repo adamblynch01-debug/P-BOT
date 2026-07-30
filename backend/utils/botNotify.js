@@ -32,16 +32,33 @@ async function notifyBot(event, data) {
     // The bot answers 200 with handled:false for events it has no route for.
     // That is a deliberate "not an outage" signal, but it still means this
     // event went nowhere, so say so.
-    if (res.data && res.data.handled === false) {
+    //
+    // `posted:false` is the other way an event dies: the route ran, but there
+    // was no channel to send to. That case used to come back as
+    // `{ok:true, posted:false}` and this function only looked at `handled` —
+    // so a notification that reached nobody was indistinguishable from one
+    // that landed. That is exactly how the order log failed silently while
+    // returning 200. Both are now surfaced, and the caller can see it.
+    const d = res.data || {};
+    if (d.handled === false) {
       console.warn(`[BotNotify] Bot has no handler for '${event}' — notification dropped`);
+    } else if (d.posted === false || d.log_channel_missing) {
+      console.error(
+        `[BotNotify] '${event}' reached the bot but was NOT posted` +
+        (d.reason ? ` (${d.reason})` : '') +
+        ' — check ORDER_LOG_CHANNEL_ID on the bot service'
+      );
     }
     return res.data || null;
   } catch (err) {
     const status = err.response && err.response.status;
+    const botMsg = err.response && err.response.data && err.response.data.error;
     if (status === 404) {
       console.warn(`[BotNotify] Bot returned 404 for '${event}' — the bot is running an older build without /internal routes`);
-    } else if (status === 401 || status === 503) {
-      console.warn(`[BotNotify] Bot rejected '${event}' (${status}) — API_SECRET mismatch or not set on the bot`);
+    } else if (status === 401) {
+      console.warn(`[BotNotify] Bot rejected '${event}' (401) — API_SECRET mismatch or not set on the bot`);
+    } else if (status === 503) {
+      console.error(`[BotNotify] Bot could not deliver '${event}': ${botMsg || 'service not configured'}`);
     } else if (status) {
       console.warn(`[BotNotify] Bot returned ${status} for '${event}':`, err.message);
     } else {
