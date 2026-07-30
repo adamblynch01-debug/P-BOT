@@ -201,13 +201,18 @@ async function deliver(order) {
         { severity: 'error', order_id: order.id, context: { attempted_status: finalStatus } }).catch(() => {});
     }
 
-    await notifyBot('deliver_goods', {
+    // Not awaited: deliver() runs inside the customer's checkout request, and
+    // this is a Discord round-trip that can burn the full 8s notify timeout.
+    // The goods are already written to the order row above, and the storefront
+    // reads them back from /api/orders/mine — so nothing the customer sees
+    // depends on this resolving. Its result was never inspected either.
+    notifyBot('deliver_goods', {
       order_id: order.id,
       email: order.email,
       discord_id: order.discord_id,
       goods: deliveredGoods,
       needs_attention: failures.length > 0,
-    });
+    }).catch(() => {});
 
     if (failures.length) {
       await raiseAlert('delivery_incomplete',
@@ -218,7 +223,9 @@ async function deliver(order) {
     }
 
     // Email confirmation — best-effort, never blocks the delivered state.
-    await sendOrderConfirmation(order, deliveredGoods).catch(e =>
+    // Also not awaited: SMTP is the slowest hop in this function and the
+    // customer's checkout response was waiting on it.
+    sendOrderConfirmation(order, deliveredGoods).catch(e =>
       console.error('[Delivery] Email notify failed:', e.message)
     );
 

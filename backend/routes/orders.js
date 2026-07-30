@@ -275,17 +275,26 @@ async function createOrder({ items, email, discord_id, payment_method, web_user_
     // common path for a returning customer — produced no Discord entry at all.
     // Fired BEFORE delivery so the order is visible even if delivery then
     // fails and flips the order to needs_attention.
-    await notifyBot('new_order', {
+    //
+    // NOT awaited. This is a network call to Discord that can take the full
+    // 8s timeout, and it used to sit directly in the customer's checkout
+    // response — so a slow Discord API left the browser stuck on "PROCESSING…"
+    // for an order that had already been paid and delivered. Nothing here
+    // affects the money or the goods: notifyBot is non-fatal by contract and
+    // returns null on any failure, so there is no result worth waiting for.
+    notifyBot('new_order', {
       order: { ...freshOrder, id: String(order.id), status: 'paid' },
       payment_info,
-    });
+    }).catch(() => {});
 
     // Delivery only after COMMIT. Inside the transaction a later rollback would
     // un-charge the customer while the keys were already sent — the one failure
     // mode worse than the one being fixed.
     if (paidOrder) await require('../utils/delivery').deliver(paidOrder);
   } else {
-    await notifyBot('new_order', { order: { ...freshOrder, id: String(order.id) }, payment_info });
+    // Same reasoning as the balance branch above — the customer waits on a
+    // payment page, not on Discord.
+    notifyBot('new_order', { order: { ...freshOrder, id: String(order.id) }, payment_info }).catch(() => {});
   }
 
   return { order: freshOrder, payment_info, total, fee_note };
