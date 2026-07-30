@@ -7,6 +7,9 @@ const { generateCryptoAddress, registerWebhook, quoteCrypto } = require('../util
 const { notifyBot } = require('../utils/botNotify');
 const { attachUser, requireAuth, requireAdmin, botAuthorized, botAuthUnavailable } = require('../utils/auth');
 const { safeCompare } = require('../utils/rateLimit');
+const {
+  normalizeCode, previewCoupon, reserveCoupon, attachRedemptionOrder, releaseCoupon, publicView,
+} = require('../utils/coupons');
 
 const GUILD_ID = process.env.GUILD_ID;
 
@@ -54,6 +57,12 @@ async function repriceItems(items, { paidFromBalance, discountPercent }) {
   }
 
   const out = [];
+  // The portion of the cart a coupon is allowed to discount: catalog lines
+  // only. A custom payment is an amount the customer typed and a legacy
+  // synthetic slug carries a browser-set price — taking a percentage off
+  // either would be discounting a number we did not choose, which is the same
+  // rule the reseller discount already follows a few lines below.
+  let catalogSubtotalCents = 0;
   for (const item of items) {
     const qty = parseInt(item.qty, 10) || 1;
     if (!Number.isInteger(qty) || qty < 1 || qty > MAX_ITEM_QTY) {
@@ -75,6 +84,7 @@ async function repriceItems(items, { paidFromBalance, discountPercent }) {
         price: cents / 100,
         ...(discountBp ? { list_price: listCents / 100 } : {}),
       });
+      catalogSubtotalCents += cents * qty;
       continue;
     }
 
@@ -99,7 +109,7 @@ async function repriceItems(items, { paidFromBalance, discountPercent }) {
     if (!Number.isFinite(price) || price <= 0) return { error: 'Invalid item price' };
     out.push({ id, qty, name: item.name || 'Item', price });
   }
-  return { items: out, discount_percent: pct };
+  return { items: out, discount_percent: pct, catalogSubtotalCents };
 }
 
 const FEES = { cashapp: ['CASHAPP_FEE_PERCENT', 10, 'Cash App'],
@@ -125,18 +135,71 @@ function applyFee(subtotalCents, payment_method) {
   };
 }
 
-// Shared by POST /create and balance top-ups (backend/routes/balance.js) so
-// both paths go through the exact same fee/note/crypto-address/notify logic.
-async function createOrder({ items, email, discord_id, payment_method, web_user_id }) {
-  // Money is summed in integer cents. Item prices are dollars-as-floats at the
-  // API boundary, so each line is rounded once on the way in and never again;
-  // accumulating the floats and rounding the sum lets binary representation
-  // error decide the last cent.
-  const subtotalCents = items.reduce(
+// Money is summed in integer cents. Item prices are dollars-as-floats at the
+// API boundary, so each line is rounded once on the way in and never again;
+// accumulating the floats and rounding the sum lets binary representation
+// error decide the last cent.
+function subtotalCentsOf(items) {
+  return items.reduce(
     (sum, item) => sum + Math.round(item.price * 100) * (item.qty || 1), 0
   );
+}
 
-  const { totalCents, fee_note } = applyFee(subtotalCents, payment_method);
+// Reserving the coupon wraps order creation rather than sitting inside it. The
+// use must be consumed BEFORE the total is computed — otherwise two checkouts
+// race past the last use of a limited code — and it must be handed back if
+// anything downstream throws, or a customer whose checkout failed permanently
+// burns a use they never received. Expressing that inline would mean a
+// try/catch around the whole of createOrderPriced for the sake of one
+// statement at the top.
+async function createOrder(opts) {
+  const code = normalizeCode(opts.coupon_code);
+  if (code === false) {
+    const e = new Error('That coupon code is not valid.');
+    e.statusCode = 400;
+    throw e;
+  }
+  if (!code) return createOrderPriced({ ...opts, coupon: null, couponDiscountCents: 0 });
+
+  // Callers pass the coupon-eligible subtotal (catalog lines only) separately
+  // from the cart subtotal. Falling back to the whole subtotal would let a
+  // percentage code discount a donation.
+  const eligibleCents = opts.coupon_eligible_cents == null
+    ? subtotalCentsOf(opts.items)
+    : opts.coupon_eligible_cents;
+
+  const reserved = await reserveCoupon({ code, eligibleCents, web_user_id: opts.web_user_id });
+  if (reserved.error) {
+    const e = new Error(reserved.error);
+    e.statusCode = 400;
+    throw e;
+  }
+
+  try {
+    const result = await createOrderPriced({
+      ...opts,
+      coupon: reserved.coupon,
+      couponDiscountCents: reserved.discountCents,
+    });
+    await attachRedemptionOrder(reserved.redemptionId, result.order.id);
+    return result;
+  } catch (err) {
+    await releaseCoupon(reserved.redemptionId, reserved.coupon && reserved.coupon.id);
+    throw err;
+  }
+}
+
+// Shared by POST /create and balance top-ups (backend/routes/balance.js) so
+// both paths go through the exact same fee/note/crypto-address/notify logic.
+async function createOrderPriced({ items, email, discord_id, payment_method, web_user_id,
+                                   coupon, couponDiscountCents }) {
+  const subtotalCents = subtotalCentsOf(items);
+
+  // The coupon comes off the subtotal BEFORE the payment-method fee, so the
+  // fee is charged on what the customer actually pays. Fee-then-discount would
+  // bill a 10% Cash App fee on money nobody sent.
+  const discountCents = Math.max(0, Math.min(subtotalCents, Number(couponDiscountCents) || 0));
+  const { totalCents, fee_note } = applyFee(subtotalCents - discountCents, payment_method);
 
   const total = totalCents / 100;
 
@@ -154,13 +217,18 @@ async function createOrder({ items, email, discord_id, payment_method, web_user_
       const { rows } = await query(
         `INSERT INTO orders
            (guild_id, web_user_id, email, discord_id, items_snapshot, subtotal_cents, total_cents,
-            payment_method, payment_note, public_ref, status, created_at, expires_at)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,'waiting', now(), now() + interval '24 hours')
+            payment_method, payment_note, public_ref, coupon_code, coupon_discount_cents,
+            status, created_at, expires_at)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,'waiting', now(), now() + interval '24 hours')
          RETURNING *`,
         [
           GUILD_ID, web_user_id || null, email, discord_id || null, JSON.stringify(items),
+          // subtotal_cents stays GROSS and the discount is stored beside it, so
+          // a receipt can show the coupon line instead of an unexplained gap
+          // between subtotal and total.
           subtotalCents, totalCents,
           payment_method, note, publicRef,
+          coupon ? coupon.code : null, discountCents,
         ]
       );
       order = rows[0];
@@ -312,7 +380,12 @@ async function createOrder({ items, email, discord_id, payment_method, web_user_
     notifyBot('new_order', { order: { ...freshOrder, id: String(order.id) }, payment_info }).catch(() => {});
   }
 
-  return { order: freshOrder, payment_info, total, fee_note };
+  return {
+    order: freshOrder, payment_info, total, fee_note,
+    subtotal: subtotalCents / 100,
+    coupon: coupon ? publicView(coupon, discountCents) : null,
+    coupon_discount: discountCents / 100,
+  };
 }
 
 // ─── POST /api/orders/quote ─────────────────────────────
@@ -331,7 +404,7 @@ async function createOrder({ items, email, discord_id, payment_method, web_user_
 // One authority for money: this route.
 router.post('/quote', attachUser, async (req, res) => {
   try {
-    const { items, payment_method } = req.body;
+    const { items, payment_method, coupon_code } = req.body;
     if (!items || !Array.isArray(items) || !items.length) {
       return res.status(400).json({ error: 'items[] is required' });
     }
@@ -348,16 +421,41 @@ router.post('/quote', attachUser, async (req, res) => {
     });
     if (repriced.error) return res.status(400).json({ error: repriced.error });
 
-    const subtotalCents = repriced.items.reduce(
-      (sum, item) => sum + Math.round(item.price * 100) * (item.qty || 1), 0
-    );
-    const { totalCents, fee_note } = applyFee(subtotalCents, payment_method);
+    const subtotalCents = subtotalCentsOf(repriced.items);
+
+    // A bad coupon does NOT fail the quote. The overlay needs the totals in
+    // order to render at all, so returning 400 here would blank the summary
+    // over a typo; the code is simply not applied and `coupon_error` says why.
+    // /create is the one that must refuse, so a customer can never be charged
+    // full price against a screen that showed a discount.
+    let couponDiscountCents = 0;
+    let coupon = null;
+    let coupon_error = null;
+    if (normalizeCode(coupon_code)) {
+      const preview = await previewCoupon({
+        code: coupon_code,
+        eligibleCents: repriced.catalogSubtotalCents || 0,
+        web_user_id: req.user ? req.user.id : null,
+      });
+      if (preview.error) coupon_error = preview.error;
+      else if (preview.coupon) {
+        coupon = preview.coupon;
+        couponDiscountCents = preview.discountCents;
+      }
+    } else if (coupon_code != null && String(coupon_code).trim() !== '') {
+      coupon_error = 'That coupon code is not valid.';
+    }
+
+    const { totalCents, fee_note } = applyFee(subtotalCents - couponDiscountCents, payment_method);
 
     res.json({
       items: repriced.items,
       discount_percent: repriced.discount_percent || 0,
       subtotal: subtotalCents / 100,
-      fee: (totalCents - subtotalCents) / 100,
+      coupon: coupon ? publicView(coupon, couponDiscountCents) : null,
+      coupon_discount: couponDiscountCents / 100,
+      coupon_error,
+      fee: (totalCents - (subtotalCents - couponDiscountCents)) / 100,
       fee_note,
       total: totalCents / 100,
     });
@@ -370,7 +468,7 @@ router.post('/quote', attachUser, async (req, res) => {
 // ─── POST /api/orders/create ────────────────────────────
 router.post('/create', attachUser, async (req, res) => {
   try {
-    const { items, email, discord_id, payment_method } = req.body;
+    const { items, email, discord_id, payment_method, coupon_code } = req.body;
 
     if (!items || !Array.isArray(items) || !items.length || !payment_method) {
       return res.status(400).json({ error: 'Missing required fields' });
@@ -393,8 +491,23 @@ router.post('/create', attachUser, async (req, res) => {
     const safeItems = repriced.items;
 
     if (paidFromBalance) {
-      const subtotal = safeItems.reduce((sum, item) => sum + (item.price * item.qty), 0);
-      if ((req.user.balance_cents || 0) < Math.round(subtotal * 100)) {
+      // Sized with a PREVIEW of the coupon, never a reservation. This check is
+      // only here to produce a friendly error ahead of the atomic debit, and a
+      // reservation at this point would consume a use on a checkout that is
+      // about to be rejected. It also cannot be skipped: without the discount
+      // a wallet holding exactly the discounted total would be turned away.
+      let previewDiscountCents = 0;
+      if (normalizeCode(coupon_code)) {
+        const preview = await previewCoupon({
+          code: coupon_code,
+          eligibleCents: repriced.catalogSubtotalCents || 0,
+          web_user_id: req.user.id,
+        });
+        if (preview.error) return res.status(400).json({ error: preview.error });
+        previewDiscountCents = preview.discountCents || 0;
+      }
+      const subtotalCents = subtotalCentsOf(safeItems);
+      if ((req.user.balance_cents || 0) < Math.max(0, subtotalCents - previewDiscountCents)) {
         return res.status(400).json({ error: 'Insufficient balance' });
       }
     }
@@ -403,12 +516,14 @@ router.post('/create', attachUser, async (req, res) => {
       return res.status(400).json({ error: 'Missing required fields' });
     }
 
-    const { order, payment_info, total, fee_note } = await createOrder({
+    const { order, payment_info, total, fee_note, coupon, coupon_discount } = await createOrder({
       items: safeItems,
       email: email || req.user.email,
       discord_id: discord_id || (req.user && req.user.discord_id) || null,
       payment_method,
       web_user_id: req.user ? req.user.id : null,
+      coupon_code,
+      coupon_eligible_cents: repriced.catalogSubtotalCents || 0,
     });
 
     res.json({
@@ -421,6 +536,8 @@ router.post('/create', attachUser, async (req, res) => {
       // What the server actually applied, so the cart can render the server's
       // number instead of its own guess.
       discount_percent: repriced.discount_percent || 0,
+      coupon: coupon || null,
+      coupon_discount: coupon_discount || 0,
       items: safeItems,
       payment_method,
       payment_info,
@@ -488,6 +605,8 @@ function formatOrder(data) {
     payment_method: data.payment_method,
     items: data.items_snapshot,
     subtotal: data.subtotal_cents / 100,
+    coupon_code: data.coupon_code || null,
+    coupon_discount: (Number(data.coupon_discount_cents) || 0) / 100,
     total: data.total_cents / 100,
     delivered_goods: data.delivered_goods,
     email: data.email,
