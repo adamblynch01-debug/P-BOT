@@ -173,6 +173,69 @@ async function check(name, fn) {
     assert.strictEqual(r.body.subtotal, 40);
   });
 
+  console.log('\na custom payment may use the wallet — nothing else client-priced may');
+
+  // Custom orders are the one client-priced item allowed on the balance path.
+  // The reason it is safe is narrow and worth pinning: the id names no
+  // product, so there is nothing to underprice, and the customer debits their
+  // own wallet by the figure they typed. The moment that whitelist widens to
+  // any non-numeric id, a synthetic slug for a REAL product sells for a cent.
+  currentUser = { id: 9, username: 'c', email: 'c@x.c', role: 'member', banned: false, reseller_discount: 0, balance_cents: 500000 };
+
+  q = await post('/api/orders/quote', { items: [{ id: 'donation', qty: 1, price: 25, name: 'Custom Order' }], payment_method: 'balance' }, 'tok');
+  await check('a custom order can be paid from balance', () => {
+    assert.strictEqual(q.status, 200);
+    assert.strictEqual(q.body.subtotal, 25);
+  });
+  await check('and the wallet charges no fee', () => {
+    assert.strictEqual(q.body.fee, 0);
+    assert.strictEqual(q.body.total, 25);
+  });
+  await check('the alias id custom-amount works too', async () => {
+    const r = await post('/api/orders/quote', { items: [{ id: 'custom-amount', qty: 1, price: 12.5 }], payment_method: 'balance' }, 'tok');
+    assert.strictEqual(r.status, 200);
+    assert.strictEqual(r.body.total, 12.5);
+  });
+
+  await check('a NEGATIVE custom amount cannot credit the wallet', async () => {
+    const r = await post('/api/orders/quote', { items: [{ id: 'donation', qty: 1, price: -50 }], payment_method: 'balance' }, 'tok');
+    assert.strictEqual(r.status, 400);
+  });
+  await check('a zero custom amount is refused', async () => {
+    const r = await post('/api/orders/quote', { items: [{ id: 'donation', qty: 1, price: 0 }], payment_method: 'balance' }, 'tok');
+    assert.strictEqual(r.status, 400);
+  });
+
+  await check('a real product slug is STILL barred from balance', async () => {
+    // The whole point of the whitelist: this must keep failing.
+    const r = await post('/api/orders/quote',
+      { items: [{ id: 'ghost-pro-month', qty: 1, price: 0.01 }], payment_method: 'balance' }, 'tok');
+    assert.strictEqual(r.status, 400);
+  });
+  await check('and it stays barred when smuggled beside a valid custom payment', async () => {
+    const r = await post('/api/orders/quote', {
+      items: [{ id: 'donation', qty: 1, price: 5 }, { id: 'ghost-pro-month', qty: 1, price: 0.01 }],
+      payment_method: 'balance',
+    }, 'tok');
+    assert.strictEqual(r.status, 400);
+  });
+
+  await check('a reseller gets NO discount on a custom amount', async () => {
+    // The server deliberately does not discount a price it did not set. The
+    // storefront must not either, or the wallet reads "available" on a total
+    // the server then rejects as short.
+    currentUser = { id: 10, username: 'r2', email: 'r2@x.c', role: 'reseller', banned: false, reseller_discount: 25, balance_cents: 500000 };
+    const r = await post('/api/orders/quote', { items: [{ id: 'donation', qty: 1, price: 100 }], payment_method: 'balance' }, 'tok');
+    assert.strictEqual(r.body.subtotal, 100);
+    assert.strictEqual(r.body.total, 100);
+  });
+
+  await check('a custom payment still works on an external method', async () => {
+    const r = await post('/api/orders/quote', { items: [{ id: 'donation', qty: 1, price: 40 }], payment_method: 'cashapp' }, 'tok');
+    assert.strictEqual(r.status, 200);
+    assert.strictEqual(r.body.total, 44);   // 40 + 10%, undiscounted
+  });
+
   server.close();
   console.log(`\n${passed} passed, ${failed} failed\n`);
 })();

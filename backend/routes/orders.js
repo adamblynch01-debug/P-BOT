@@ -27,6 +27,11 @@ const MAX_ITEM_QTY = 25;
 // list price — so every reseller was overcharged by exactly their discount,
 // and the cart, the balance check and the actual debit were three different
 // numbers. The client's arithmetic is now display-only; this is the authority.
+// Item ids that mean "an amount the customer typed", not a product. Kept in
+// step with utils/delivery.js, which matches the same two ids to record a
+// manual-fulfillment note instead of claiming stock.
+const CUSTOM_PAYMENT_IDS = new Set(['donation', 'custom-amount']);
+
 async function repriceItems(items, { paidFromBalance, discountPercent }) {
   const ids = items
     .filter(i => /^\d+$/.test(String(i.id)))
@@ -77,7 +82,17 @@ async function repriceItems(items, { paidFromBalance, discountPercent }) {
     // the embedded catalog. Those still carry a client price, so they may only
     // be paid for externally where a human confirms the amount received.
     // No discount is applied to these — the price is not ours to trust.
-    if (paidFromBalance) {
+    //
+    // The one exception is an explicit custom payment. It maps to no catalog
+    // product, so there is nothing to underprice, and delivery.js hands it to
+    // staff as a manual-fulfillment note rather than releasing goods — the
+    // customer simply debits their own wallet by the figure they typed, which
+    // is not a way to gain anything. Every OTHER client-priced item stays
+    // barred from the wallet: a legacy synthetic slug names a REAL product,
+    // and letting a browser set its price would sell it for a cent.
+    // A negative or zero amount is rejected just below, so this cannot be run
+    // backwards to credit a balance.
+    if (paidFromBalance && !CUSTOM_PAYMENT_IDS.has(id)) {
       return { error: 'This item is not available for balance checkout. Please contact support.' };
     }
     const price = Number(item.price);
