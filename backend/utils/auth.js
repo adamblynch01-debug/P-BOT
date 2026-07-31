@@ -177,6 +177,10 @@ function publicUser(row) {
     id: String(row.id),
     username: row.username,
     email: row.email,
+    // The column has always existed; nothing ever surfaced it, so the
+    // storefront kept the chosen avatar in localStorage and lost it on any
+    // other device.
+    avatar: row.avatar || null,
     role: row.role,
     discord_id: row.discord_id,
     discord_verified: row.discord_verified,

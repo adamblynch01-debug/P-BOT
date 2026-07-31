@@ -785,6 +785,154 @@ router.post('/2fa/backup-codes', requireAuth, async (req, res) => {
   }
 });
 
+// ─── PATCH /api/auth/profile ────────────────────────────
+// Edit Profile had no backend at all. The storefront wrote the new username,
+// email, avatar and password into localStorage and said "Profile updated!",
+// so the account page showed an address the database had never heard of. It
+// surfaced through email 2FA — the enrolment code went to the ORIGINAL
+// address, because that is the only one that ever existed — but the password
+// field was the worse half: someone could change their password, be told it
+// worked, and still be signed in with the old one everywhere else.
+//
+// Changing the email is gated on the current password for the same reason
+// /2fa/disable is: an email address is the account-recovery pivot, so letting
+// a hijacked session move it is no better than letting it strip the second
+// factor.
+const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/;
+
+router.patch('/profile', requireAuth, async (req, res) => {
+  try {
+    const { username, email, avatar, new_password, current_password } = req.body;
+
+    const nextUsername = username != null ? String(username).trim() : req.user.username;
+    const nextEmail = email != null ? String(email).trim() : req.user.email;
+    const nextAvatar = avatar != null ? String(avatar).trim() : undefined;
+
+    if (!nextUsername) return res.status(400).json({ error: 'Username cannot be empty' });
+    if (nextUsername.length > 32) return res.status(400).json({ error: 'Username must be 32 characters or fewer' });
+    if (!nextEmail) return res.status(400).json({ error: 'Email cannot be empty' });
+    if (!EMAIL_RE.test(nextEmail)) return res.status(400).json({ error: 'That does not look like an email address' });
+    // The avatar is a single emoji; anything longer is not one, and this
+    // column is rendered straight into the page.
+    if (nextAvatar !== undefined && nextAvatar.length > 8) {
+      return res.status(400).json({ error: 'Invalid avatar' });
+    }
+    if (new_password != null && String(new_password).length && String(new_password).length < 6) {
+      return res.status(400).json({ error: 'Password must be at least 6 characters' });
+    }
+
+    // Case-insensitively, because the unique index is case-insensitive and
+    // "changing" GHOST.EXE@gmail.com to ghost.exe@gmail.com should not be
+    // treated as moving to a new mailbox.
+    const emailChanged = nextEmail.toLowerCase() !== String(req.user.email || '').toLowerCase();
+    const usernameChanged = nextUsername.toLowerCase() !== String(req.user.username || '').toLowerCase();
+    const passwordChanged = !!(new_password != null && String(new_password).length);
+
+    const { rows: cur } = await query('SELECT password_hash FROM web_users WHERE id = $1', [req.user.id]);
+    if (!cur.length) return res.status(404).json({ error: 'Account not found' });
+    const hasPassword = !!cur[0].password_hash;
+
+    // An account created through Discord has no password to prove anything
+    // with; its session is the only credential it has ever had. Demanding one
+    // would lock it out of its own profile.
+    if ((emailChanged || passwordChanged) && hasPassword) {
+      if (!current_password) {
+        return res.status(400).json({ error: 'Enter your current password to change your email or password' });
+      }
+      if (!verifyPassword(String(current_password), cur[0].password_hash)) {
+        if (loginLimiter.blocked(req, res)) return;
+        loginLimiter.fail(req);
+        return res.status(401).json({ error: 'Incorrect password' });
+      }
+    }
+
+    // Saving the form without touching anything — or retyping the same address
+    // in different case, which is the same mailbox as far as the unique index
+    // and the mail server are concerned. Same response shape as a real save so
+    // the storefront has one path to read.
+    if (!emailChanged && !usernameChanged && !passwordChanged && nextAvatar === undefined) {
+      return res.json({
+        success: true, unchanged: true, user: publicUser(req.user),
+        email_changed: false, password_changed: false,
+        email_2fa_disabled: false, sessions_revoked: 0,
+      });
+    }
+
+    // Checked up front so the common case gets a sentence a person can act on
+    // rather than a constraint name. The UPDATE still catches the race below.
+    if (emailChanged || usernameChanged) {
+      const { rows: clash } = await query(
+        `SELECT id FROM web_users
+          WHERE guild_id = $1 AND id <> $2 AND (lower(username) = lower($3) OR lower(email) = lower($4))`,
+        [GUILD_ID, req.user.id, nextUsername, nextEmail]
+      );
+      if (clash.length) return res.status(409).json({ error: 'That username or email is already in use' });
+    }
+
+    // Moving the address while email 2FA is on would leave the second factor
+    // pointed at a mailbox nobody has proved they can read. Rather than invent
+    // a second confirmation flow, the factor is switched off and the customer
+    // re-enables it — which sends a code to the new address and proves control
+    // there. The invariant holds either way: email 2FA is only ever on for an
+    // address that has received a code.
+    const dropEmail2fa = emailChanged && req.user.email_2fa_enabled;
+
+    const sets = ['username = $1', 'email = $2'];
+    const params = [nextUsername, nextEmail];
+    if (nextAvatar !== undefined) { params.push(nextAvatar); sets.push(`avatar = $${params.length}`); }
+    if (passwordChanged) { params.push(hashPassword(String(new_password))); sets.push(`password_hash = $${params.length}`); }
+    if (dropEmail2fa) sets.push('email_2fa_enabled = false');
+    params.push(req.user.id, GUILD_ID);
+
+    let updated;
+    try {
+      const { rows } = await query(
+        `UPDATE web_users SET ${sets.join(', ')}
+          WHERE id = $${params.length - 1} AND guild_id = $${params.length} RETURNING *`,
+        params
+      );
+      updated = rows[0];
+    } catch (err) {
+      // 23505 = unique_violation: someone took the name between the check and
+      // the write.
+      if (err.code === '23505') return res.status(409).json({ error: 'That username or email is already in use' });
+      throw err;
+    }
+    if (!updated) return res.status(404).json({ error: 'Account not found' });
+
+    if (dropEmail2fa) pendingEmailEnrollments.delete(String(req.user.id));
+
+    // Changing a password because you think someone else has it is worth
+    // nothing if their session keeps working, so every OTHER session is
+    // dropped — the admin reset does the same. This one is spared: logging
+    // someone out of the tab they just used is a bug, not security.
+    let sessionsRevoked = 0;
+    if (passwordChanged) {
+      const { bearerToken } = require('../utils/auth');
+      const token = bearerToken(req);
+      const { rowCount } = await query(
+        'DELETE FROM web_sessions WHERE web_user_id = $1 AND token IS DISTINCT FROM $2',
+        [req.user.id, token || null]
+      );
+      sessionsRevoked = rowCount || 0;
+    }
+
+    res.json({
+      success: true,
+      user: publicUser(updated),
+      // The storefront has to say these out loud: a silent 2FA switch-off is
+      // the kind of surprise a customer discovers at the worst moment.
+      email_changed: emailChanged,
+      password_changed: passwordChanged,
+      email_2fa_disabled: dropEmail2fa,
+      sessions_revoked: sessionsRevoked,
+    });
+  } catch (err) {
+    console.error('[Auth] profile update error:', err);
+    res.status(500).json({ error: 'Failed to update profile' });
+  }
+});
+
 // ─── GET /api/auth/me ────────────────────────────────────
 router.get('/me', requireAuth, (req, res) => {
   res.json({ user: publicUser(req.user) });
