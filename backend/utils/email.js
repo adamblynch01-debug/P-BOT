@@ -98,6 +98,14 @@ function fromHeader(storeName) {
 
 function money(n) { return '$' + (Number(n) || 0).toFixed(2); }
 
+// One place for the customer-facing name, and one fallback. It used to default
+// to 'Ghost Store' here while /health and routes/config.js defaulted to 'H8ED
+// Shop', so an unset STORE_NAME would have made the store call itself two
+// different things depending on which file answered.
+function storeName_() {
+  return process.env.STORE_NAME || 'H8ED Shop';
+}
+
 function renderGoodsHtml(goods) {
   if (!Array.isArray(goods) || !goods.length) return '';
   return goods.map(g => {
@@ -119,7 +127,7 @@ async function sendOrderConfirmation(order, goods) {
   if (!tx) { console.warn('[Email] Skipped — no usable SMTP route'); return false; }
   if (!order || !order.email) { console.warn('[Email] Skipped — no recipient'); return false; }
 
-  const storeName = process.env.STORE_NAME || 'Ghost Store';
+  const storeName = storeName_();
   const total = (order.total_cents != null ? order.total_cents / 100 : 0);
   const goodsHtml = renderGoodsHtml(goods);
 
@@ -173,7 +181,7 @@ async function sendLoginCode(to, code, purpose) {
   if (!tx) { console.warn('[Email] Login code skipped — no usable SMTP route'); return false; }
   if (!to) { console.warn('[Email] Login code skipped — no recipient'); return false; }
 
-  const storeName = process.env.STORE_NAME || 'Ghost Store';
+  const storeName = storeName_();
   const isSetup = purpose === 'setup';
   const heading = isSetup ? 'Confirm Email 2FA' : 'Login Verification';
   const lead = isSetup
