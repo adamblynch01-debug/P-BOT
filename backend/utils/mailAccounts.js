@@ -53,7 +53,16 @@ const PROVIDERS = {
   gmail: {
     imapHost: 'imap.gmail.com',
     imapPort: 993,
-    smtpService: 'gmail',
+    // nodemailer's `service: 'gmail'` shorthand dials 465 with implicit TLS,
+    // and our host cannot open that socket — it hangs until it times out,
+    // which is exactly how an enrolment code went missing while the browser
+    // gave up waiting. 587 is a separate port with separate luck, so it leads
+    // and 465 stays behind it as the fallback. IMAP on 993 was never affected,
+    // which is why payment watching kept working while sending did not.
+    smtpHost: 'smtp.gmail.com',
+    smtpPort: 587,
+    smtpSecure: false,          // STARTTLS on 587
+    smtpAltPorts: [465],
     // The first Authentication-Results header must be Google's own.
     authservId: 'mx.google.com',
   },
@@ -63,6 +72,7 @@ const PROVIDERS = {
     smtpHost: 'smtp-mail.outlook.com',
     smtpPort: 587,
     smtpSecure: false,          // STARTTLS on 587
+    smtpAltPorts: [465],
     // Microsoft does not emit an RFC 8601 authserv-id; its stamp is the
     // `compauth=` token, which no other provider writes.
     authservMarker: 'compauth=',
@@ -120,19 +130,38 @@ function outboundAccount() {
   const name = env('MAIL_PROVIDER') || (cred.family === 'gmail' ? 'gmail' : null)
     || providerFromAddress(user) || 'custom';
   const preset = PROVIDERS[name] || {};
-  const host = env('SMTP_HOST') || preset.smtpHost || null;
-  const port = Number(env('SMTP_PORT') || preset.smtpPort || 587);
+  const host = env('SMTP_HOST') || preset.smtpHost || 'localhost';
   // SMTP_SECURE is only consulted when it is actually set; otherwise implicit
   // TLS is assumed on 465 and STARTTLS everywhere else, which is the rule
   // every mainstream provider follows.
   const secureEnv = env('SMTP_SECURE');
-  const secure = secureEnv != null ? /^(1|true|yes)$/i.test(secureEnv) : (port === 465);
 
-  const transport = (!host && preset.smtpService)
-    ? { service: preset.smtpService, auth: { user, pass } }
-    : { host: host || 'localhost', port, secure, auth: { user, pass } };
+  // An explicitly configured port is the only port — someone who set SMTP_PORT
+  // meant it, and quietly dialling a second one behind their back would send
+  // mail down a route they did not choose. Everywhere else the preset's
+  // fallbacks come along, because a blocked port is the likeliest reason a
+  // send fails on a host we do not control.
+  const portEnv = env('SMTP_PORT');
+  const ports = portEnv
+    ? [Number(portEnv)]
+    : [Number(preset.smtpPort || 587), ...(preset.smtpAltPorts || [])];
 
-  return { transport, user, from: env('SMTP_FROM') || user, provider: name };
+  const transports = ports.map(port => ({
+    host,
+    port,
+    secure: secureEnv != null ? /^(1|true|yes)$/i.test(secureEnv) : (port === 465),
+    auth: { user, pass },
+    // nodemailer's own defaults are two minutes, which is longer than the
+    // storefront waits — an unreachable port used to surface as a browser
+    // timeout with no server-side error to read. These make a dead route
+    // announce itself, and leave room to try the next one.
+    connectionTimeout: 8000,
+    greetingTimeout: 8000,
+    socketTimeout: 20000,
+  }));
+
+  // `transport` stays for callers that only ever want the preferred route.
+  return { transports, transport: transports[0], user, from: env('SMTP_FROM') || user, provider: name };
 }
 
 // ─── Inbound ─────────────────────────────────────────────────────────────────

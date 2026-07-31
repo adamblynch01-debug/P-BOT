@@ -18,15 +18,48 @@ try { nodemailer = require('nodemailer'); } catch { /* dependency added in packa
 
 let transporter = null;
 let fromAddress = null;
-function getTransporter() {
+let lastProbeFailedAt = 0;
+
+// Enough to tell two routes apart in a log line, and nothing that is a secret.
+function describe(cfg) {
+  return `${cfg.host}:${cfg.port} ${cfg.secure ? 'implicit TLS' : 'STARTTLS'}`;
+}
+
+// The account can offer more than one port (see mailAccounts.js). Which of
+// them is actually reachable is a property of the machine we happen to be
+// running on, not of the configuration, so it is settled by connecting rather
+// than by guessing: verify() opens the socket and authenticates without
+// sending anything, and the first route that answers is kept for the life of
+// the process. A route that fails is logged by name — that log is the only
+// way to tell "the password is wrong" from "the port is blocked" after the
+// fact, and the difference used to be invisible.
+async function getTransporter() {
   if (transporter) return transporter;
   if (!nodemailer) return null;
   const acct = outboundAccount();
   if (!acct) return null;
-  transporter = nodemailer.createTransport(acct.transport);
+
+  // Every candidate failing costs a connection timeout apiece. Without this,
+  // a mail outage would make each send re-walk the whole list and drag every
+  // caller down with it.
+  if (Date.now() - lastProbeFailedAt < 60000) return null;
+
   fromAddress = acct.from;
-  console.log(`[Email] Outbound via ${acct.provider} as ${acct.from}`);
-  return transporter;
+  for (const cfg of acct.transports) {
+    const tx = nodemailer.createTransport(cfg);
+    try {
+      await tx.verify();
+      transporter = tx;
+      console.log(`[Email] Outbound via ${acct.provider} as ${acct.from} — ${describe(cfg)}`);
+      return transporter;
+    } catch (err) {
+      console.warn(`[Email] ${describe(cfg)} unusable: ${err.message}`);
+      try { tx.close(); } catch { /* nothing to close */ }
+    }
+  }
+  lastProbeFailedAt = Date.now();
+  console.error('[Email] No usable SMTP route — outbound email is down');
+  return null;
 }
 
 // The envelope From. Falls back to the transport's own login, which is what
@@ -55,8 +88,8 @@ function escapeHtml(s) {
 // Sends the order-confirmation email. `order` is the DB row; `goods` is the
 // delivered_goods array. Returns true if the email was handed to SMTP.
 async function sendOrderConfirmation(order, goods) {
-  const tx = getTransporter();
-  if (!tx) { console.warn('[Email] Skipped — SMTP not configured'); return false; }
+  const tx = await getTransporter();
+  if (!tx) { console.warn('[Email] Skipped — no usable SMTP route'); return false; }
   if (!order || !order.email) { console.warn('[Email] Skipped — no recipient'); return false; }
 
   const storeName = process.env.STORE_NAME || 'Ghost Store';
@@ -109,8 +142,8 @@ async function sendOrderConfirmation(order, goods) {
 // "here is a code someone asked for" reads very differently when you did not
 // ask for it — the login copy has to say the password was already accepted.
 async function sendLoginCode(to, code, purpose) {
-  const tx = getTransporter();
-  if (!tx) { console.warn('[Email] Login code skipped — SMTP not configured'); return false; }
+  const tx = await getTransporter();
+  if (!tx) { console.warn('[Email] Login code skipped — no usable SMTP route'); return false; }
   if (!to) { console.warn('[Email] Login code skipped — no recipient'); return false; }
 
   const storeName = process.env.STORE_NAME || 'Ghost Store';

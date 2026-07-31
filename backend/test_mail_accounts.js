@@ -91,7 +91,14 @@ function run() {
     const out = outboundAccount();
     check('outbound falls back to the Gmail pair', !!out && out.user === 'ghoststore.mail@gmail.com');
     check('outbound guesses gmail from the address', out.provider === 'gmail');
-    check('outbound uses the gmail service shorthand, not a host', out.transport.service === 'gmail' && !out.transport.host);
+    // The `service: 'gmail'` shorthand meant port 465, which our host cannot
+    // reach; the preferred route is now an explicit 587 with 465 behind it.
+    check('outbound dials smtp.gmail.com on 587 with STARTTLS',
+      out.transport.host === 'smtp.gmail.com' && out.transport.port === 587 && out.transport.secure === false);
+    check('465 is kept as a fallback route, not dropped',
+      out.transports.length === 2 && out.transports[1].port === 465 && out.transports[1].secure === true);
+    check('every route fails faster than the storefront gives up',
+      out.transports.every(t => t.connectionTimeout > 0 && t.connectionTimeout < 30000));
     check('From defaults to the authenticated mailbox', out.from === 'ghoststore.mail@gmail.com');
 
     const inbound = inboundAccounts();
@@ -144,8 +151,8 @@ function run() {
     // it would say "custom" and dial localhost. GMAIL in the variable name is
     // the only thing that gets this right.
     check('a Workspace address on a custom domain is still Gmail', out.provider === 'gmail');
-    check('and so uses the gmail service, not a made-up host',
-      out.transport.service === 'gmail' && !out.transport.host);
+    check('and so dials Google\'s SMTP host, not a made-up one',
+      out.transport.host === 'smtp.gmail.com' && out.transport.port === 587);
 
     const inbound = inboundAccounts();
     check('three logins mean two watched inboxes', inbound.length === 2);
