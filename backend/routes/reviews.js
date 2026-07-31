@@ -1,10 +1,55 @@
 const express = require('express');
+const axios = require('axios');
 const router = express.Router();
 const { query } = require('../db');
 const { requireAuth, requireAdmin, getSessionUser, bearerToken, botAuthorized, botAuthUnavailable, discordLinked } = require('../utils/auth');
 const { notifyBot } = require('../utils/botNotify');
 
 const GUILD_ID = process.env.GUILD_ID;
+
+// Never `SELECT *` off this table any more — image_data is bytea, and a JSON
+// response would carry every screenshot as a base64 blob on a list endpoint.
+const REVIEW_COLS = `id, guild_id, web_user_id, display_name, product_id, rating, body,
+                     source, external_id, discord_id, approved, created_at, image_url,
+                     image_mime, (image_data IS NOT NULL) AS has_image`;
+
+const MAX_IMAGE_BYTES = 8 * 1024 * 1024;
+
+// Pull the picture down once, at sync time, instead of pointing the storefront
+// at Discord's CDN. Those URLs are signed and expire within the day, so a
+// stored link shows the image right up until the moment someone checks it
+// again. Fetch failures are not errors: the vouch itself is the thing that
+// matters, and image_url is kept so it can be retried later.
+async function fetchImage(url) {
+  if (!url || !/^https?:\/\//i.test(url)) return null;
+  try {
+    const res = await axios.get(url, {
+      responseType: 'arraybuffer',
+      timeout: 15000,
+      maxContentLength: MAX_IMAGE_BYTES,
+      maxRedirects: 3,
+    });
+    const mime = String(res.headers['content-type'] || '').split(';')[0].trim().toLowerCase();
+    if (!mime.startsWith('image/')) {
+      console.warn('[Reviews] vouch image is not an image:', mime || 'no content-type');
+      return null;
+    }
+    const data = Buffer.from(res.data);
+    if (!data.length || data.length > MAX_IMAGE_BYTES) return null;
+    return { data, mime };
+  } catch (err) {
+    console.warn('[Reviews] vouch image download failed:', err.message);
+    return null;
+  }
+}
+
+// What the storefront should put in <img src>. Our own copy when we have one,
+// the original link as a last resort so a failed download still shows
+// something while it lasts.
+function imageSrc(req, row) {
+  if (row.has_image) return `${req.protocol}://${req.get('host')}/api/reviews/${row.id}/image`;
+  return row.image_url || null;
+}
 
 // Bot (secret) and admin panel (logged-in admin/staff session) both moderate
 // reviews — same dual-gate pattern as routes/status.js and routes/products.js.
@@ -20,7 +65,7 @@ async function requireAdminOrBot(req, res, next) {
 // admin panel. Sending it is deliberately fire-and-forget: the review is
 // already committed, and a Discord outage must not turn a saved vouch into a
 // 500 the customer reads as "it didn't work".
-function postVouchToDiscord(review) {
+function postVouchToDiscord(review, imageUrl) {
   notifyBot('web_review', {
     guild_id: GUILD_ID,
     review: {
@@ -30,6 +75,7 @@ function postVouchToDiscord(review) {
       body: review.body,
       product_id: review.product_id ? String(review.product_id) : null,
       discord_id: review.discord_id || null,
+      image_url: imageUrl || null,
     },
   }).catch(() => {});
 }
@@ -38,11 +84,23 @@ function postVouchToDiscord(review) {
 router.get('/', async (req, res) => {
   try {
     const { rows } = await query(
-      `SELECT id, display_name, rating, body, source, product_id, created_at
+      `SELECT id, display_name, rating, body, source, product_id, created_at,
+              image_url, (image_data IS NOT NULL) AS has_image
        FROM reviews WHERE guild_id = $1 AND approved = true ORDER BY created_at DESC LIMIT 200`,
       [GUILD_ID]
     );
-    res.json({ reviews: rows.map(r => ({ ...r, id: String(r.id), product_id: r.product_id ? String(r.product_id) : null })) });
+    res.json({
+      reviews: rows.map(r => ({
+        id: String(r.id),
+        display_name: r.display_name,
+        rating: r.rating,
+        body: r.body,
+        source: r.source,
+        product_id: r.product_id ? String(r.product_id) : null,
+        created_at: r.created_at,
+        image: imageSrc(req, r),
+      })),
+    });
   } catch (err) {
     res.status(500).json({ error: 'Failed to fetch reviews' });
   }
@@ -64,7 +122,7 @@ router.post('/', requireAuth, async (req, res) => {
 
     const { rows } = await query(
       `INSERT INTO reviews (guild_id, web_user_id, display_name, product_id, rating, body, source, discord_id, approved)
-       VALUES ($1,$2,$3,$4,$5,$6,'website',$7,$8) RETURNING *`,
+       VALUES ($1,$2,$3,$4,$5,$6,'website',$7,$8) RETURNING ${REVIEW_COLS}`,
       [GUILD_ID, req.user.id, req.user.username, product_id || null, r, body || null,
        req.user.discord_id || null, live]
     );
@@ -83,14 +141,45 @@ router.post('/', requireAuth, async (req, res) => {
   }
 });
 
+// ─── GET /api/reviews/:id/image ──────────────────────────
+// Public and unauthenticated on purpose: it is the <img src> of a vouch that
+// is already on the public storefront. Only approved reviews are served, so a
+// screenshot attached to a queued vouch stays private until a human clears it.
+router.get('/:id/image', async (req, res) => {
+  try {
+    const { rows } = await query(
+      `SELECT image_data, image_mime, approved FROM reviews
+       WHERE id = $1 AND guild_id = $2 AND image_data IS NOT NULL`,
+      [req.params.id, GUILD_ID]
+    );
+    if (!rows.length) return res.status(404).end();
+    if (!rows[0].approved) {
+      // Staff still need to see the picture they are being asked to publish,
+      // so the moderation queue can load it — nobody else can.
+      const user = await getSessionUser(bearerToken(req));
+      if (!(botAuthorized(req) || (user && ['admin', 'staff'].includes(user.role)))) {
+        return res.status(404).end();
+      }
+    }
+    // The bytes for a given review id never change, so this can be cached hard.
+    res.set('Content-Type', rows[0].image_mime || 'image/png');
+    res.set('Cache-Control', 'public, max-age=31536000, immutable');
+    res.send(rows[0].image_data);
+  } catch (err) {
+    res.status(500).end();
+  }
+});
+
 // ─── GET /api/reviews/admin/all ──────────────────────────
 router.get('/admin/all', requireAdminOrBot, async (req, res) => {
   try {
     const { rows } = await query(
-      `SELECT * FROM reviews WHERE guild_id = $1 ORDER BY created_at DESC`,
+      `SELECT ${REVIEW_COLS} FROM reviews WHERE guild_id = $1 ORDER BY created_at DESC`,
       [GUILD_ID]
     );
-    res.json({ reviews: rows.map(r => ({ ...r, id: String(r.id) })) });
+    // `image` is what /importvouches re-posts from, so it has to be an
+    // absolute URL — the bot is a different service on a different host.
+    res.json({ reviews: rows.map(r => ({ ...r, id: String(r.id), image: imageSrc(req, r) })) });
   } catch (err) {
     res.status(500).json({ error: 'Failed to fetch reviews' });
   }
@@ -108,7 +197,7 @@ router.patch('/:id/approve', requireAdminOrBot, async (req, res) => {
     const { rows } = await query(
       `UPDATE reviews SET approved = $1
        WHERE id = $2 AND guild_id = $3 AND approved IS DISTINCT FROM $1
-       RETURNING *`,
+       RETURNING ${REVIEW_COLS}`,
       [makeApproved, req.params.id, GUILD_ID]
     );
     // No transition (already in that state) — still a success, just nothing to do.
@@ -117,7 +206,7 @@ router.patch('/:id/approve', requireAdminOrBot, async (req, res) => {
     const review = rows[0];
     // Newly approved + came from the website → post it as a Discord vouch.
     // Discord-sourced reviews are already visible in the server, so skip those.
-    if (makeApproved && review.source === 'website') postVouchToDiscord(review);
+    if (makeApproved && review.source === 'website') postVouchToDiscord(review, imageSrc(req, review));
     res.json({ success: true });
   } catch (err) {
     res.status(500).json({ error: 'Failed to update review' });
@@ -141,7 +230,7 @@ router.delete('/:id', requireAdminOrBot, async (req, res) => {
 // (guild_id, source, external_id) when the bot supplies a message id.
 router.post('/bot', async (req, res) => {
   try {
-    const { display_name, rating, body, product_id, external_id, discord_id } = req.body;
+    const { display_name, rating, body, product_id, external_id, discord_id, image_url } = req.body;
     if (botAuthUnavailable()) return res.status(503).json({ error: 'Server not configured' });
     if (!botAuthorized(req)) return res.status(401).json({ error: 'Unauthorized' });
     const r = parseInt(rating, 10) || 5;
@@ -150,18 +239,42 @@ router.post('/bot', async (req, res) => {
 
     if (external_id) {
       const { rows: dup } = await query(
-        `SELECT id FROM reviews WHERE guild_id = $1 AND source = 'discord' AND external_id = $2`,
+        `SELECT id, image_url, (image_data IS NOT NULL) AS has_image FROM reviews
+         WHERE guild_id = $1 AND source = 'discord' AND external_id = $2`,
         [GUILD_ID, String(external_id)]
       );
-      if (dup.length) return res.json({ success: true, deduped: true, id: String(dup[0].id) });
+      if (dup.length) {
+        // The screenshot usually arrives AFTER the vouch. The bot posts the
+        // vouch, then waits up to a minute for the customer to drop an image
+        // in the channel, then calls back here with the same external_id. So a
+        // duplicate is not always a no-op: if this call is carrying a picture
+        // the stored row does not have, that is the whole point of it.
+        if (image_url && !dup[0].has_image) {
+          const img = await fetchImage(image_url);
+          await query(
+            `UPDATE reviews SET image_url = $1, image_data = $2, image_mime = $3 WHERE id = $4`,
+            [String(image_url), img ? img.data : null, img ? img.mime : null, dup[0].id]
+          );
+          return res.json({ success: true, deduped: true, image_added: !!img, id: String(dup[0].id) });
+        }
+        return res.json({ success: true, deduped: true, id: String(dup[0].id) });
+      }
     }
 
+    const img = image_url ? await fetchImage(image_url) : null;
     const { rows } = await query(
-      `INSERT INTO reviews (guild_id, display_name, product_id, rating, body, source, external_id, discord_id, approved)
-       VALUES ($1,$2,$3,$4,$5,'discord',$6,$7,true) RETURNING *`,
-      [GUILD_ID, display_name, product_id || null, r, body || null, external_id ? String(external_id) : null, discord_id || null]
+      `INSERT INTO reviews (guild_id, display_name, product_id, rating, body, source, external_id, discord_id, approved,
+                            image_url, image_data, image_mime)
+       VALUES ($1,$2,$3,$4,$5,'discord',$6,$7,true,$8,$9,$10) RETURNING ${REVIEW_COLS}`,
+      [GUILD_ID, display_name, product_id || null, r, body || null,
+       external_id ? String(external_id) : null, discord_id || null,
+       image_url ? String(image_url) : null, img ? img.data : null, img ? img.mime : null]
     );
-    res.json({ success: true, review: { ...rows[0], id: String(rows[0].id) } });
+    res.json({
+      success: true,
+      image_stored: !!img,
+      review: { ...rows[0], id: String(rows[0].id), image: imageSrc(req, rows[0]) },
+    });
   } catch (err) {
     console.error('[Reviews] Bot create error:', err);
     res.status(500).json({ error: 'Failed to sync review' });

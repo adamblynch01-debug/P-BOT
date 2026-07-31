@@ -47,34 +47,49 @@ const exec = async (text, params) => {
   }
 
   // ── reviews ──
+  // has_image is a computed column in the real query, so the stub carries the
+  // bytes and derives it the same way the SQL does.
+  const pub = r => ({ ...r, has_image: r.image_data != null });
+
   if (/INSERT INTO reviews/.test(t)) {
     const website = /'website'/.test(t);
     const row = website
       ? { id: nextReviewId++, guild_id: params[0], web_user_id: params[1], display_name: params[2],
           product_id: params[3], rating: params[4], body: params[5], source: 'website',
-          discord_id: params[6], approved: params[7], external_id: null, created_at: new Date() }
+          discord_id: params[6], approved: params[7], external_id: null, created_at: new Date(),
+          image_url: null, image_data: null, image_mime: null }
       : { id: nextReviewId++, guild_id: params[0], web_user_id: null, display_name: params[1],
           product_id: params[2], rating: params[3], body: params[4], source: 'discord',
-          external_id: params[5], discord_id: params[6], approved: true, created_at: new Date() };
+          external_id: params[5], discord_id: params[6], approved: true, created_at: new Date(),
+          image_url: params[7], image_data: params[8], image_mime: params[9] };
     REVIEWS.push(row);
-    return { rows: [row] };
+    return { rows: [pub(row)] };
   }
-  if (/SELECT id FROM reviews WHERE guild_id/.test(t)) {
+  if (/SELECT id, image_url, \(image_data IS NOT NULL\) AS has_image FROM reviews/.test(t)) {
     const hit = REVIEWS.filter(r => r.source === 'discord' && String(r.external_id) === String(params[1]));
-    return { rows: hit.map(r => ({ id: r.id })) };
+    return { rows: hit.map(r => ({ id: r.id, image_url: r.image_url, has_image: r.image_data != null })) };
+  }
+  if (/UPDATE reviews SET image_url/.test(t)) {
+    const r = REVIEWS.find(x => String(x.id) === String(params[3]));
+    if (r) { r.image_url = params[0]; r.image_data = params[1]; r.image_mime = params[2]; }
+    return { rows: [] };
+  }
+  if (/SELECT image_data, image_mime, approved FROM reviews/.test(t)) {
+    const r = REVIEWS.find(x => String(x.id) === String(params[0]) && x.image_data != null);
+    return { rows: r ? [{ image_data: r.image_data, image_mime: r.image_mime, approved: r.approved }] : [] };
   }
   if (/UPDATE reviews SET approved/.test(t)) {
     const r = REVIEWS.find(x => String(x.id) === String(params[1]));
     // Mirrors `approved IS DISTINCT FROM $1` — no row back when nothing changed.
     if (!r || r.approved === params[0]) return { rows: [] };
     r.approved = params[0];
-    return { rows: [r] };
+    return { rows: [pub(r)] };
   }
-  if (/SELECT \* FROM reviews WHERE guild_id/.test(t)) {
-    return { rows: REVIEWS.slice() };
+  if (/FROM reviews WHERE guild_id = \$1 AND approved = true/.test(t)) {
+    return { rows: REVIEWS.filter(r => r.approved).map(pub) }; // public list
   }
-  if (/FROM reviews WHERE guild_id/.test(t)) {
-    return { rows: REVIEWS.filter(r => r.approved) };
+  if (/FROM reviews WHERE guild_id = \$1 ORDER BY/.test(t)) {
+    return { rows: REVIEWS.map(pub) };                         // admin/all
   }
   return { rows: [] };
 };
@@ -117,6 +132,44 @@ const post = (p, b, t) => call('POST', p, b, t);
 const patch = (p, b, t) => call('PATCH', p, b, t);
 const get = (p, t) => call('GET', p, null, t);
 
+// The image endpoint answers bytes, not JSON, so it needs a raw reader.
+function rawGet(path, token) {
+  return new Promise((resolve, reject) => {
+    const headers = token ? { Authorization: 'Bearer ' + token } : {};
+    const req = http.request({ host: '127.0.0.1', port: server.address().port, path, method: 'GET', headers }, (res) => {
+      const chunks = [];
+      res.on('data', c => chunks.push(c));
+      res.on('end', () => resolve({ status: res.statusCode, headers: res.headers, body: Buffer.concat(chunks) }));
+    });
+    req.on('error', reject);
+    req.end();
+  });
+}
+
+// ─── A stand-in for Discord's CDN ────────────────────────
+// The smallest valid PNG there is. Nothing here cares what the picture looks
+// like, only that the exact bytes that went in come back out.
+const PNG = Buffer.from(
+  'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==',
+  'base64'
+);
+let CDN_HITS = 0;
+const cdn = http.createServer((req, res) => {
+  CDN_HITS++;
+  if (req.url.startsWith('/shot.png')) {
+    res.writeHead(200, { 'Content-Type': 'image/png' });
+    return res.end(PNG);
+  }
+  if (req.url.startsWith('/page.html')) {
+    // Not an image. Storing whatever a URL happens to return would let the
+    // vouch pipeline cache arbitrary content on our own domain.
+    res.writeHead(200, { 'Content-Type': 'text/html' });
+    return res.end('<html>not a picture</html>');
+  }
+  res.writeHead(404).end();       // an expired attachment link
+});
+let CDN = '';
+
 const LINKED = { id: 7, username: 'buyer', email: 'b@x.c', role: 'member', banned: false,
                  discord_id: '123456789', discord_verified: true, reseller_discount: 0 };
 const UNVERIFIED = { ...LINKED, discord_verified: false };
@@ -141,6 +194,8 @@ const DOORS = [
 
 (async () => {
   await new Promise(r => server.listen(0, '127.0.0.1', r));
+  await new Promise(r => cdn.listen(0, '127.0.0.1', r));
+  CDN = `http://127.0.0.1:${cdn.address().port}`;
 
   // ─────────────────────────────────────────────────────────
   section('every door into the money asks for the Discord link');
@@ -289,7 +344,111 @@ const DOORS = [
     assert.strictEqual(r.status, 401);
     assert.strictEqual(REVIEWS.length, 1);
   });
+  // ─────────────────────────────────────────────────────────
+  section('the screenshot travels with the vouch');
+
+  REVIEWS = [];
+  await check('a vouch posted with an image keeps its own copy of the bytes', async () => {
+    const r = await post('/api/reviews/bot', {
+      secret: 'test-secret', display_name: 'shooter', rating: 5, body: 'proof attached',
+      discord_id: '777', external_id: 'msg-img', image_url: `${CDN}/shot.png`,
+    });
+    assert.strictEqual(r.status, 200, JSON.stringify(r.body));
+    assert.strictEqual(r.body.image_stored, true);
+    // Stored, not linked: Discord's attachment URLs are signed and expire, so
+    // a saved link would show the picture today and 404 tomorrow.
+    assert.ok(Buffer.isBuffer(REVIEWS[0].image_data));
+    assert.strictEqual(REVIEWS[0].image_mime, 'image/png');
+    assert.strictEqual(REVIEWS[0].image_url, `${CDN}/shot.png`);
+  });
+  await check('the storefront is pointed at our copy, not at Discord', async () => {
+    const r = await get('/api/reviews');
+    assert.ok(/\/api\/reviews\/\d+\/image$/.test(r.body.reviews[0].image || ''), r.body.reviews[0].image);
+  });
+  await check('and that URL actually serves the image', async () => {
+    const raw = await rawGet(`/api/reviews/${REVIEWS[0].id}/image`);
+    assert.strictEqual(raw.status, 200);
+    assert.strictEqual(raw.headers['content-type'], 'image/png');
+    assert.ok(raw.body.equals(PNG), 'served bytes differ from what was fetched');
+  });
+
+  REVIEWS = [];
+  await check('a screenshot uploaded AFTER the vouch is backfilled onto it', async () => {
+    // This is the normal case, not the edge case: the bot posts the vouch,
+    // then waits up to a minute for the customer to drop a screenshot, then
+    // calls back with the same external_id. If a duplicate were a plain no-op
+    // the picture would never arrive.
+    const first = await post('/api/reviews/bot', {
+      secret: 'test-secret', display_name: 'late', rating: 5, body: 'pic coming',
+      discord_id: '888', external_id: 'msg-late',
+    });
+    assert.strictEqual(first.body.image_stored, false);
+    assert.strictEqual(REVIEWS[0].image_data, null);
+
+    const second = await post('/api/reviews/bot', {
+      secret: 'test-secret', display_name: 'late', rating: 5, body: 'pic coming',
+      discord_id: '888', external_id: 'msg-late', image_url: `${CDN}/shot.png`,
+    });
+    assert.strictEqual(second.body.deduped, true);
+    assert.strictEqual(second.body.image_added, true);
+    assert.strictEqual(REVIEWS.length, 1, 'the backfill must not create a second vouch');
+    assert.ok(Buffer.isBuffer(REVIEWS[0].image_data));
+  });
+  await check('a third call does not re-download what we already have', async () => {
+    const before = CDN_HITS;
+    const r = await post('/api/reviews/bot', {
+      secret: 'test-secret', display_name: 'late', rating: 5,
+      discord_id: '888', external_id: 'msg-late', image_url: `${CDN}/shot.png`,
+    });
+    assert.strictEqual(r.body.deduped, true);
+    assert.strictEqual(r.body.image_added, undefined);
+    assert.strictEqual(CDN_HITS, before, 'the image was fetched again for no reason');
+  });
+
+  REVIEWS = [];
+  await check('a dead image link does not cost us the vouch', async () => {
+    // The picture is worth having; the vouch is worth more. A CDN 404 or a
+    // timeout must leave the text vouch standing.
+    const r = await post('/api/reviews/bot', {
+      secret: 'test-secret', display_name: 'gone', rating: 4, body: 'link rotted',
+      discord_id: '999', external_id: 'msg-404', image_url: `${CDN}/missing.png`,
+    });
+    assert.strictEqual(r.status, 200);
+    assert.strictEqual(r.body.image_stored, false);
+    assert.strictEqual(REVIEWS.length, 1);
+    // The address is kept so it can be retried rather than silently forgotten.
+    assert.strictEqual(REVIEWS[0].image_url, `${CDN}/missing.png`);
+  });
+  await check('a link that is not an image is refused', async () => {
+    REVIEWS = [];
+    const r = await post('/api/reviews/bot', {
+      secret: 'test-secret', display_name: 'sneaky', rating: 5, body: 'x',
+      external_id: 'msg-html', image_url: `${CDN}/page.html`,
+    });
+    assert.strictEqual(r.body.image_stored, false);
+    assert.strictEqual(REVIEWS[0].image_data, null);
+  });
+  await check('an unapproved vouch does not publish its screenshot', async () => {
+    REVIEWS[0].image_data = PNG;
+    REVIEWS[0].image_mime = 'image/png';
+    REVIEWS[0].approved = false;
+    currentUser = null;
+    const raw = await rawGet(`/api/reviews/${REVIEWS[0].id}/image`);
+    assert.strictEqual(raw.status, 404);
+  });
+  await check('...but staff reviewing the queue can see it', async () => {
+    currentUser = { ...LINKED, role: 'staff' };
+    const raw = await rawGet(`/api/reviews/${REVIEWS[0].id}/image`, 'tok');
+    assert.strictEqual(raw.status, 200);
+    currentUser = null;
+  });
+
+  REVIEWS = []; NOTIFIED.length = 0;
   await check('the export the bot re-imports from carries everything back', async () => {
+    await post('/api/reviews/bot', {
+      secret: 'test-secret', display_name: 'vexor', rating: 5,
+      body: 'legit', discord_id: '555', external_id: 'msg-1',
+    });
     // /importvouches source:website reads this. If it does not carry the
     // Discord id, a restored server cannot re-attribute a single vouch.
     const r = await get('/api/reviews/admin/all?secret=test-secret');
@@ -302,5 +461,6 @@ const DOORS = [
   });
 
   server.close();
+  cdn.close();
   console.log(`\n${passed} passed, ${failed} failed`);
 })();
