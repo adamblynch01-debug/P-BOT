@@ -5,6 +5,9 @@ const { requireAdmin, getSessionUser, bearerToken, botAuthorized } = require('..
 
 const GUILD_ID = process.env.GUILD_ID;
 
+// The website product statuses, in display order.
+const STATUSES = ['undetected', 'testing', 'updating', 'detected'];
+
 // ─── GET /api/status ─────────────────────────────────────
 // Per-product status (fixes the old localStorage page only showing
 // categories, not individual products). product_status overrides win when
@@ -76,8 +79,12 @@ router.post('/update', async (req, res) => {
       const user = await getSessionUser(bearerToken(req));
       if (!user || !['admin', 'staff'].includes(user.role)) return res.status(401).json({ error: 'Unauthorized' });
     }
-    if (!['undetected', 'updating', 'detected'].includes(status)) {
-      return res.status(400).json({ error: 'status must be undetected, updating, or detected' });
+    // 'testing' is the fourth status — a product that is up but not yet
+    // signed off. This list is the ONLY validation there is (neither
+    // products.status nor product_status.status carries a CHECK constraint),
+    // so anything the site or the bot can pick has to be named here.
+    if (!STATUSES.includes(status)) {
+      return res.status(400).json({ error: `status must be one of: ${STATUSES.join(', ')}` });
     }
 
     let gname = game_name, pname = product_name, pid = product_id || null;
