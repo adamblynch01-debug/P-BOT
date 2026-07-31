@@ -81,4 +81,58 @@ async function sendOrderConfirmation(order, goods) {
   }
 }
 
-module.exports = { sendOrderConfirmation };
+// ─── Email second factor ─────────────────────────────────────────────────────
+// Sends a 6-digit login code. Unlike the order confirmation, this one is NOT
+// best-effort from the caller's point of view: if it doesn't send, the customer
+// is staring at a code prompt for a code that never arrives, so it returns
+// false and the route turns that into a real error instead of a silent wait.
+//
+// `purpose` distinguishes a login challenge from the enrolment check, because
+// "here is a code someone asked for" reads very differently when you did not
+// ask for it — the login copy has to say the password was already accepted.
+async function sendLoginCode(to, code, purpose) {
+  const tx = getTransporter();
+  if (!tx) { console.warn('[Email] Login code skipped — SMTP not configured'); return false; }
+  if (!to) { console.warn('[Email] Login code skipped — no recipient'); return false; }
+
+  const storeName = process.env.STORE_NAME || 'Ghost Store';
+  const isSetup = purpose === 'setup';
+  const heading = isSetup ? 'Confirm Email 2FA' : 'Login Verification';
+  const lead = isSetup
+    ? 'Enter this code on the security page to turn on email two-factor authentication.'
+    : 'Someone entered the correct password for your account and is being asked for a second factor. Enter this code to finish signing in.';
+
+  const html = `
+  <div style="background:#03040a;padding:28px;font-family:Arial,Helvetica,sans-serif;color:#c9d6e5;">
+    <div style="max-width:460px;margin:0 auto;background:#080b16;border:1px solid #0ff3;border-radius:8px;overflow:hidden;">
+      <div style="padding:20px 24px;border-bottom:1px solid #0ff2;">
+        <div style="font-size:18px;letter-spacing:2px;color:#0ff;font-weight:700;">${escapeHtml(storeName.toUpperCase())}</div>
+        <div style="font-size:12px;color:#5a7080;margin-top:2px;">${escapeHtml(heading)}</div>
+      </div>
+      <div style="padding:22px 24px;">
+        <p style="margin:0 0 16px;font-size:14px;line-height:1.6;">${escapeHtml(lead)}</p>
+        <div style="font-family:monospace;font-size:30px;letter-spacing:10px;color:#0ff;background:#04121a;border:1px solid #0ff3;border-radius:6px;padding:16px;text-align:center;font-weight:700;">${escapeHtml(code)}</div>
+        <p style="margin:16px 0 0;font-size:12px;color:#5a7080;line-height:1.6;">
+          This code expires in 10 minutes and can be used once.
+          ${isSetup ? '' : 'If this was not you, your password is no longer safe — change it as soon as you can.'}
+        </p>
+      </div>
+      <div style="padding:14px 24px;border-top:1px solid #0ff2;font-size:11px;color:#3d5060;text-align:center;">${escapeHtml(storeName)} • Never share this code with anyone</div>
+    </div>
+  </div>`;
+
+  try {
+    await tx.sendMail({
+      from: `${storeName} <${process.env.GMAIL_USER}>`,
+      to,
+      subject: `${code} is your ${storeName} ${isSetup ? 'confirmation' : 'login'} code`,
+      html,
+    });
+    return true;
+  } catch (err) {
+    console.error('[Email] Login code send failed:', err.message);
+    return false;
+  }
+}
+
+module.exports = { sendOrderConfirmation, sendLoginCode };

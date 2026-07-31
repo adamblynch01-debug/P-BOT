@@ -12,6 +12,7 @@ const { logAdminAction } = require('../utils/adminLog');
 const {
   generateSecret, verifyTOTP, generateBackupCodes, hashBackupCode, otpauthUrl,
 } = require('../utils/totp');
+const { sendLoginCode } = require('../utils/email');
 
 const GUILD_ID = process.env.GUILD_ID;
 
@@ -46,6 +47,28 @@ const secretLimiter = failureLimiter({ windowMs: 15 * 60 * 1000, max: 30, global
 // doesn't.
 const signupLimiter = rateLimit({ windowMs: 60 * 60 * 1000, max: 10, name: 'signup' });
 const discordLoginLimiter = rateLimit({ windowMs: 15 * 60 * 1000, max: 15, name: 'discord-login' });
+// Same reasoning again for the email second factor: each call sends a real
+// message to a real inbox, so the request is the cost. Tighter than the Discord
+// one because a mail provider will start treating us as a spammer long before
+// Discord does.
+const emailCodeLimiter = rateLimit({ windowMs: 15 * 60 * 1000, max: 8, name: 'email-2fa-code' });
+
+// The emailed second factor is stored the same way a backup code is: hashed,
+// never in the clear, in web_login_challenges.ref. A 6-digit code is only
+// 1,000,000 wide, but the challenge already caps attempts at 8 and expires in
+// ten minutes, so the hash is about what a leaked database row would give an
+// attacker, not about brute force.
+function hashLoginCode(code) {
+  return crypto.createHash('sha256').update(String(code), 'utf8').digest('hex');
+}
+// Rejection sampling rather than % 1000000, which would make the low 576576
+// codes very slightly more likely than the rest.
+function generateEmailCode() {
+  for (;;) {
+    const n = crypto.randomBytes(4).readUInt32BE(0);
+    if (n < 4294000000) return String(n % 1000000).padStart(6, '0');
+  }
+}
 
 // SUPERBOT (Discord 2FA server) base URL — same service the storefront's 2FA
 // modal talks to, but here we call it server-to-server so the browser never
@@ -145,6 +168,36 @@ router.get('/discord-oauth/start', (req, res) => {
   res.redirect(url);
 });
 
+// ─── POST /api/auth/discord-oauth/link-start ────────────
+// The same consent screen, used to LINK rather than to log in: the customer is
+// already signed in and wants their Discord attached without going to look up
+// their own snowflake.
+//
+// It is a POST, not a link, because the account it will write to has to be the
+// session's — and a session lives in an Authorization header, which a browser
+// navigation cannot carry. So the page asks here first, we bind the pending
+// link to req.user.id under a one-time state, and only then hand back a URL for
+// the browser to walk to. The alternative — putting the session token in the
+// start URL — parks a 30-day bearer in browser history and our access logs.
+router.post('/discord-oauth/link-start', requireAuth, discordLoginLimiter, (req, res) => {
+  reapOauthStates();
+  if (!OAUTH_CLIENT_ID || !OAUTH_CLIENT_SECRET) {
+    return res.status(503).json({ error: 'Discord OAuth is not configured on the server.' });
+  }
+  const state = crypto.randomBytes(16).toString('hex');
+  const returnTo = pickReturnTo(req.body && req.body.return_to);
+  oauthStates.set(state, { returnTo, linkUserId: req.user.id, expiresAt: Date.now() + 10 * 60 * 1000 });
+  const url = 'https://discord.com/oauth2/authorize?' + new URLSearchParams({
+    client_id: OAUTH_CLIENT_ID,
+    redirect_uri: OAUTH_REDIRECT_URI,
+    response_type: 'code',
+    scope: 'identify',
+    state,
+    prompt: 'consent',
+  }).toString();
+  res.json({ success: true, url });
+});
+
 router.get('/discord-oauth/callback', async (req, res) => {
   reapOauthStates();
   const { code, state } = req.query;
@@ -153,9 +206,15 @@ router.get('/discord-oauth/callback', async (req, res) => {
   if (state) oauthStates.delete(state);
 
   const bounce = (params) => res.redirect(`${returnTo}/?${new URLSearchParams(params).toString()}`);
+  // One callback, two errands. Which one this is was decided when the state was
+  // minted — by an authenticated POST for a link, by an anonymous GET for a
+  // login — so a linking round-trip can never be turned into a login for
+  // somebody else's account by editing the URL on the way back.
+  const linkUserId = entry && entry.linkUserId;
+  const fail = (msg) => bounce(linkUserId ? { discord_link_error: msg } : { discord_login_error: msg });
 
   if (!code || !entry) {
-    return bounce({ discord_login_error: 'Login was cancelled or the request expired. Please try again.' });
+    return fail('The request was cancelled or expired. Please try again.');
   }
 
   try {
@@ -170,13 +229,35 @@ router.get('/discord-oauth/callback', async (req, res) => {
       { headers: { 'Content-Type': 'application/x-www-form-urlencoded' } }
     );
     const accessToken = tokenRes.data && tokenRes.data.access_token;
-    if (!accessToken) return bounce({ discord_login_error: 'Discord did not return an access token.' });
+    if (!accessToken) return fail('Discord did not return an access token.');
 
     const me = await axios.get('https://discord.com/api/users/@me', {
       headers: { Authorization: `Bearer ${accessToken}` },
     });
     const discordId = me.data && me.data.id;
-    if (!discordId) return bounce({ discord_login_error: 'Could not read your Discord account.' });
+    if (!discordId) return fail('Could not read your Discord account.');
+
+    if (linkUserId) {
+      // Consent on Discord's own domain IS the proof of ownership — stronger
+      // than the typed-id path, which needs a DM click precisely because the id
+      // is just a number anyone can copy. So no SUPERBOT round-trip here.
+      const { rows: taken } = await query(
+        `SELECT id FROM web_users
+          WHERE guild_id = $1 AND discord_id = $2 AND discord_verified = true AND id <> $3`,
+        [GUILD_ID, discordId, linkUserId]
+      );
+      if (taken.length) {
+        return bounce({ discord_link_error: 'That Discord account is already linked to another site account.' });
+      }
+      await query(
+        `UPDATE web_users SET discord_id = $1, discord_verified = true WHERE id = $2 AND guild_id = $3`,
+        [discordId, linkUserId, GUILD_ID]
+      );
+      // The id itself is not echoed back in the URL — the page re-reads it from
+      // /2fa/status with its own session, which is also the only way it can
+      // report the truth if the browser changed accounts mid-flow.
+      return bounce({ discord_link: 'ok' });
+    }
 
     const { pending_id, decoy } = await beginDiscordLogin(discordId);
     // A verified linked account gets the DM; a decoy (no linked account) still
@@ -185,7 +266,7 @@ router.get('/discord-oauth/callback', async (req, res) => {
     return bounce({ discord_login: pending_id, ...(decoy ? { discord_login_hint: 'no_account' } : {}) });
   } catch (err) {
     console.error('[Auth] discord-oauth callback error:', err.response?.data || err.message);
-    return bounce({ discord_login_error: 'Discord login failed. Please try again.' });
+    return fail(linkUserId ? 'Discord linking failed. Please try again.' : 'Discord login failed. Please try again.');
   }
 });
 
@@ -264,6 +345,11 @@ router.post('/login', async (req, res) => {
     const methods = [];
     if (user.totp_enabled && user.totp_secret) methods.push('totp');
     if (user.discord_id && user.discord_verified) methods.push('discord');
+    // Email goes last: methods[0] seeds the challenge row's `kind`, and an
+    // inbox round-trip is the slowest of the three, so it should not be the
+    // default for an account that also has an authenticator. Each method's own
+    // route rewrites `kind` when the browser picks it.
+    if (user.email_2fa_enabled && user.email) methods.push('email');
 
     if (methods.length) {
       const challengeId = crypto.randomBytes(24).toString('hex');
@@ -341,6 +427,57 @@ router.post('/login/discord-challenge', async (req, res) => {
   }
 });
 
+// ─── POST /api/auth/login/email-challenge ───────────────
+// Email leg of a 2FA login: mail a 6-digit code to the address ON THE ACCOUNT.
+// The browser supplies only the challenge id — it never names the recipient, so
+// this cannot be pointed at an inbox of the caller's choosing.
+router.post('/login/email-challenge', emailCodeLimiter, async (req, res) => {
+  try {
+    const { challenge_id } = req.body;
+    if (!challenge_id) return res.status(400).json({ error: 'challenge_id is required' });
+
+    const { rows } = await query(
+      `SELECT c.id, c.web_user_id, u.email, u.email_2fa_enabled, u.banned
+         FROM web_login_challenges c JOIN web_users u ON u.id = c.web_user_id
+        WHERE c.id = $1 AND c.guild_id = $2 AND c.consumed_at IS NULL AND c.expires_at > now()`,
+      [challenge_id, GUILD_ID]
+    );
+    const row = rows[0];
+    if (!row) return res.status(401).json({ error: 'This login request has expired. Please log in again.' });
+    if (row.banned) return res.status(403).json({ error: 'This account has been banned' });
+    if (!row.email_2fa_enabled || !row.email) {
+      return res.status(400).json({ error: 'Email verification is not enabled on this account.' });
+    }
+
+    const code = generateEmailCode();
+    // Written BEFORE the send. The other order loses the code entirely if the
+    // UPDATE fails after a mail the customer is already holding.
+    await query('UPDATE web_login_challenges SET ref = $1, kind = $2 WHERE id = $3',
+      [hashLoginCode(code), 'email', challenge_id]);
+
+    const sent = await sendLoginCode(row.email, code, 'login');
+    if (!sent) {
+      // Don't leave the browser waiting on a code that was never posted.
+      return res.status(502).json({ error: 'Could not send the verification email. Please try another method.' });
+    }
+    res.json({ success: true, sent: true, email: maskEmail(row.email) });
+  } catch (err) {
+    console.error('[Auth] email-challenge error:', err);
+    res.status(500).json({ error: 'Failed to send the verification email' });
+  }
+});
+
+// a***@example.com — enough for the customer to recognise the inbox, not enough
+// to hand the whole address to someone who only had the password.
+function maskEmail(email) {
+  const s = String(email || '');
+  const at = s.indexOf('@');
+  if (at < 1) return s;
+  const name = s.slice(0, at);
+  const head = name.slice(0, 1);
+  return head + '*'.repeat(Math.max(1, name.length - 1)) + s.slice(at);
+}
+
 // ─── POST /api/auth/login/verify ────────────────────────
 // Second factor. The ONLY place a session is minted for a 2FA account.
 //
@@ -380,8 +517,10 @@ router.post('/login/verify', async (req, res) => {
     let verified = false;
     let usedBackupCode = false;
 
-    if (!code && challenge.ref) {
+    if (!code && challenge.ref && challenge.kind !== 'email') {
       // Discord leg: ask SUPERBOT whether the DM button was actually clicked.
+      // `kind` is checked because both legs park their state in `ref`, and an
+      // email hash handed to SUPERBOT as a session id is a pointless round-trip.
       // The reference came from OUR record of the challenge, not the browser.
       try {
         const sb = await axios.post(`${SUPERBOT_URL}/api/auth/verify-token`, { userId: challenge.ref });
@@ -392,6 +531,12 @@ router.post('/login/verify', async (req, res) => {
       // Still waiting on the user to click — not a failed attempt, so do not
       // burn one of the eight tries on it.
       if (!verified) return res.json({ verified: false, pending: true });
+    } else if (code && challenge.kind === 'email' && challenge.ref &&
+               safeCompare(hashLoginCode(String(code).trim()), challenge.ref)) {
+      // Emailed code. Checked before TOTP because when kind is 'email' that is
+      // what the customer was asked for; a TOTP code still works below, since an
+      // account can hold both and the person may reach for the app instead.
+      verified = true;
     } else if (code && user.totp_enabled && user.totp_secret && verifyTOTP(user.totp_secret, code)) {
       verified = true;
     } else if (code) {
@@ -451,6 +596,13 @@ router.get('/2fa/status', requireAuth, async (req, res) => {
       enabled: !!req.user.totp_enabled,
       discord_available: !!(req.user.discord_id && req.user.discord_verified),
       backup_codes_remaining: rows[0] ? rows[0].codes_left : 0,
+      // The security panel used to draw its "✅ LINKED" badge and its Discord id
+      // field from the localStorage copy of the account, which is whatever the
+      // browser last wrote there — it showed LINKED for an id the server had
+      // never verified. These two come from the session's own row.
+      email_2fa_enabled: !!req.user.email_2fa_enabled,
+      email: req.user.email || null,
+      discord_id: (req.user.discord_id && req.user.discord_verified) ? req.user.discord_id : null,
     });
   } catch (err) {
     res.status(500).json({ error: 'Failed to read 2FA status' });
@@ -525,6 +677,92 @@ router.post('/2fa/disable', requireAuth, async (req, res) => {
     res.json({ success: true, enabled: false });
   } catch (err) {
     res.status(500).json({ error: 'Failed to disable 2FA' });
+  }
+});
+
+// ─── Email second factor: enrolment ─────────────────────
+// Turning this on is a two-step check for one reason: the address on the
+// account has never been proved to reach anybody. Signup takes an email and
+// writes it, and the order confirmation is best-effort, so a typo sits there
+// unnoticed. Flipping the flag on an unreachable address would lock the account
+// out at the next login. So enabling means: we send a code, and it comes back.
+//
+// Pending email enrolments, in memory: web_user_id → { hash, expiresAt }.
+const pendingEmailEnrollments = new Map();
+function reapEmailEnrollments() {
+  const now = Date.now();
+  for (const [k, v] of pendingEmailEnrollments) if (v.expiresAt < now) pendingEmailEnrollments.delete(k);
+}
+
+// ─── POST /api/auth/2fa/email/start ─────────────────────
+router.post('/2fa/email/start', requireAuth, emailCodeLimiter, async (req, res) => {
+  try {
+    reapEmailEnrollments();
+    if (!req.user.email) return res.status(400).json({ error: 'This account has no email address on file.' });
+    if (req.user.email_2fa_enabled) return res.status(400).json({ error: 'Email verification is already enabled.' });
+
+    const code = generateEmailCode();
+    const sent = await sendLoginCode(req.user.email, code, 'setup');
+    if (!sent) return res.status(502).json({ error: 'Could not send the confirmation email. Try again shortly.' });
+
+    pendingEmailEnrollments.set(String(req.user.id), {
+      hash: hashLoginCode(code),
+      attempts: 0,
+      expiresAt: Date.now() + 10 * 60 * 1000,
+    });
+    res.json({ success: true, sent: true, email: maskEmail(req.user.email) });
+  } catch (err) {
+    console.error('[Auth] 2fa/email/start error:', err);
+    res.status(500).json({ error: 'Failed to start email verification' });
+  }
+});
+
+// ─── POST /api/auth/2fa/email/confirm ───────────────────
+router.post('/2fa/email/confirm', requireAuth, async (req, res) => {
+  try {
+    reapEmailEnrollments();
+    const pending = pendingEmailEnrollments.get(String(req.user.id));
+    if (!pending) return res.status(400).json({ error: 'That code expired. Send a new one.' });
+    // Same eight-guess ceiling the login challenge uses; without it this is an
+    // unlimited oracle on a six-digit code.
+    if (pending.attempts >= 8) {
+      pendingEmailEnrollments.delete(String(req.user.id));
+      return res.status(429).json({ error: 'Too many incorrect codes. Send a new one.' });
+    }
+    const code = String((req.body && req.body.code) || '').trim();
+    if (!safeCompare(hashLoginCode(code), pending.hash)) {
+      pending.attempts++;
+      return res.status(400).json({ error: 'That code is not valid.' });
+    }
+    pendingEmailEnrollments.delete(String(req.user.id));
+    await query('UPDATE web_users SET email_2fa_enabled = true WHERE id = $1 AND guild_id = $2',
+      [req.user.id, GUILD_ID]);
+    res.json({ success: true, email_2fa_enabled: true });
+  } catch (err) {
+    console.error('[Auth] 2fa/email/confirm error:', err);
+    res.status(500).json({ error: 'Failed to enable email verification' });
+  }
+});
+
+// ─── POST /api/auth/2fa/email/disable ───────────────────
+// Password-gated for the same reason /2fa/disable is: a stolen session must not
+// be able to take the second factor off the account it is sitting in.
+router.post('/2fa/email/disable', requireAuth, async (req, res) => {
+  try {
+    const { password } = req.body;
+    if (!password) return res.status(400).json({ error: 'Your password is required to disable email verification' });
+    const { rows } = await query('SELECT password_hash FROM web_users WHERE id = $1', [req.user.id]);
+    if (!rows.length || !verifyPassword(password, rows[0].password_hash)) {
+      if (loginLimiter.blocked(req, res)) return;
+      loginLimiter.fail(req);
+      return res.status(401).json({ error: 'Incorrect password' });
+    }
+    await query('UPDATE web_users SET email_2fa_enabled = false WHERE id = $1 AND guild_id = $2',
+      [req.user.id, GUILD_ID]);
+    pendingEmailEnrollments.delete(String(req.user.id));
+    res.json({ success: true, email_2fa_enabled: false });
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to disable email verification' });
   }
 });
 
