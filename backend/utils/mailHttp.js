@@ -62,22 +62,38 @@ function assertAccepted(provider, res) {
   }
 }
 
+// axios reports a rejection as "Request failed with status code 422" and keeps
+// the useful part in the response body. That default cost a debugging round:
+// the provider had said precisely what was wrong with the message and the log
+// showed only the number. Everything these APIs return here is a diagnostic —
+// a domain that is not verified, a malformed From — never a secret.
+async function post(provider, url, data, headers) {
+  try {
+    const res = await axios.post(url, data, { headers, timeout: 15000 });
+    assertAccepted(provider, res);
+    return res.data || {};
+  } catch (err) {
+    const body = err.response && err.response.data;
+    const detail = body && typeof body === 'object'
+      ? (body.message || (body.error && (body.error.message || body.error)) || JSON.stringify(body))
+      : (body || err.message);
+    const status = err.response ? ` (HTTP ${err.response.status})` : '';
+    throw new Error(`${provider}${status}: ${detail}`);
+  }
+}
+
 const PROVIDERS = [
   {
     label: 'resend',
     key: 'RESEND_API_KEY',
     async send(apiKey, msg) {
-      const res = await axios.post('https://api.resend.com/emails', {
+      const data = await post('Resend', 'https://api.resend.com/emails', {
         from: msg.from,
         to: recipients(msg.to),
         subject: msg.subject,
         html: msg.html,
-      }, {
-        headers: { Authorization: `Bearer ${apiKey}`, 'Content-Type': 'application/json' },
-        timeout: 15000,
-      });
-      assertAccepted('Resend', res);
-      return res.data && res.data.id;
+      }, { Authorization: `Bearer ${apiKey}`, 'Content-Type': 'application/json' });
+      return data.id;
     },
   },
   {
@@ -85,17 +101,13 @@ const PROVIDERS = [
     key: 'BREVO_API_KEY',
     async send(apiKey, msg) {
       const from = splitAddress(msg.from);
-      const res = await axios.post('https://api.brevo.com/v3/smtp/email', {
+      const data = await post('Brevo', 'https://api.brevo.com/v3/smtp/email', {
         sender: from.name ? { name: from.name, email: from.email } : { email: from.email },
         to: recipients(msg.to).map(email => ({ email })),
         subject: msg.subject,
         htmlContent: msg.html,
-      }, {
-        headers: { 'api-key': apiKey, 'Content-Type': 'application/json', accept: 'application/json' },
-        timeout: 15000,
-      });
-      assertAccepted('Brevo', res);
-      return res.data && res.data.messageId;
+      }, { 'api-key': apiKey, 'Content-Type': 'application/json', accept: 'application/json' });
+      return data.messageId;
     },
   },
 ];

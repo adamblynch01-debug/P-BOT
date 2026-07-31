@@ -188,6 +188,51 @@ async function run() {
     REPLY = { status: 200, body: { id: 'ok' } };
   }
 
+  console.log('\n=== the From header utils/email.js actually builds ===');
+  {
+    // The bug this covers reached a live send: MAIL_FROM is naturally written
+    // with a display name, and email.js wrapped it in a second one, producing
+    // `Ghost Store <Ghost Store <addr>>`. Resend answered 422 and the code
+    // never arrived. Order confirmations were building the same header.
+    setEnv({ RESEND_API_KEY: 'k', MAIL_FROM: 'Ghost Store <no-reply@uhservices.xyz>', STORE_NAME: 'Ghost Store' });
+    const m = fresh();
+    redirect(m, 'resend', base);
+    const { sendLoginCode, sendOrderConfirmation } = require(path.join(BACKEND, 'utils', 'email.js'));
+
+    await checkAsync('a MAIL_FROM that already has a display name is not wrapped again', async () => {
+      assert.strictEqual(await sendLoginCode('b@x.c', '123456', 'setup'), true);
+      assert.strictEqual(LAST.body.from, 'Ghost Store <no-reply@uhservices.xyz>');
+    });
+    await checkAsync('order confirmations build the same header, not a nested one', async () => {
+      await sendOrderConfirmation({ id: 'o1', email: 'b@x.c', total_cents: 100, payment_method: 'cashapp' }, []);
+      assert.strictEqual(LAST.body.from, 'Ghost Store <no-reply@uhservices.xyz>');
+    });
+  }
+  {
+    setEnv({ RESEND_API_KEY: 'k', MAIL_FROM: 'no-reply@uhservices.xyz', STORE_NAME: 'Ghost Store' });
+    const m = fresh();
+    redirect(m, 'resend', base);
+    const { sendLoginCode } = require(path.join(BACKEND, 'utils', 'email.js'));
+    await checkAsync('a bare MAIL_FROM still gets the store name attached', async () => {
+      await sendLoginCode('b@x.c', '123456', 'setup');
+      assert.strictEqual(LAST.body.from, 'Ghost Store <no-reply@uhservices.xyz>');
+    });
+  }
+  {
+    // axios reduces a rejection to "Request failed with status code 422" and
+    // hides the reason in the body. That cost a debugging round.
+    setEnv({ RESEND_API_KEY: 'k', MAIL_FROM: 'a@uhservices.xyz' });
+    const m = fresh();
+    redirect(m, 'resend', base);
+    REPLY = { status: 403, body: { message: 'The uhservices.xyz domain is not verified' } };
+    await checkAsync('the provider\'s own explanation reaches the log, not just a status code', async () => {
+      await assert.rejects(
+        () => m.httpMailer().sendMail({ to: 'b@x.c', subject: 's', html: 'h' }),
+        /HTTP 403.*domain is not verified/);
+    });
+    REPLY = { status: 200, body: { id: 'ok' } };
+  }
+
   console.log('\n=== address parsing ===');
   {
     const m = fresh();

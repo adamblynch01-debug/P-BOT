@@ -86,6 +86,16 @@ function senderAddress() {
   return fromAddress || process.env.SMTP_FROM || process.env.SMTP_USER || process.env.GMAIL_USER || '';
 }
 
+// The configured sender may already be a full header — MAIL_FROM is naturally
+// written as `Ghost Store <no-reply@uhservices.xyz>`. Wrapping that in another
+// display name yields `Ghost Store <Ghost Store <no-reply@…>>`, which is not a
+// valid address: Resend answers 422 and nothing is delivered. Only a bare
+// address gets the store name attached.
+function fromHeader(storeName) {
+  const addr = senderAddress();
+  return addr.includes('<') ? addr : `${storeName} <${addr}>`;
+}
+
 function money(n) { return '$' + (Number(n) || 0).toFixed(2); }
 
 function renderGoodsHtml(goods) {
@@ -136,7 +146,7 @@ async function sendOrderConfirmation(order, goods) {
 
   try {
     await tx.sendMail({
-      from: `${storeName} <${senderAddress()}>`,
+      from: fromHeader(storeName),
       to: order.email,
       subject: `Order #${order.id} confirmed — ${storeName}`,
       html,
@@ -191,7 +201,7 @@ async function sendLoginCode(to, code, purpose) {
 
   try {
     await tx.sendMail({
-      from: `${storeName} <${senderAddress()}>`,
+      from: fromHeader(storeName),
       to,
       subject: `${code} is your ${storeName} ${isSetup ? 'confirmation' : 'login'} code`,
       html,
