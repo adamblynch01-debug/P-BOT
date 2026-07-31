@@ -5,7 +5,7 @@ const { query, withTransaction } = require('../db');
 const { generateNote } = require('../utils/noteGenerator');
 const { generateCryptoAddress, registerWebhook, quoteCrypto } = require('../utils/cryptoUtils');
 const { notifyBot } = require('../utils/botNotify');
-const { attachUser, requireAuth, requireAdmin, botAuthorized, botAuthUnavailable } = require('../utils/auth');
+const { attachUser, requireAuth, requireAdmin, requireDiscordLinked, botAuthorized, botAuthUnavailable } = require('../utils/auth');
 const { safeCompare } = require('../utils/rateLimit');
 const {
   normalizeCode, previewCoupon, reserveCoupon, attachRedemptionOrder, releaseCoupon, publicView,
@@ -466,9 +466,15 @@ router.post('/quote', attachUser, async (req, res) => {
 });
 
 // ─── POST /api/orders/create ────────────────────────────
-router.post('/create', attachUser, async (req, res) => {
+// Anonymous checkout is gone, and so is checkout from an account with no
+// verified Discord link — see requireDiscordLinked in utils/auth.js for why.
+// The pair also closes a smaller hole this route had all along: `discord_id`
+// arrived in the BODY, so an order could name any snowflake the buyer liked,
+// and the delivery DM went to a stranger. It is now read from the session and
+// the body field is ignored.
+router.post('/create', requireAuth, requireDiscordLinked, async (req, res) => {
   try {
-    const { items, email, discord_id, payment_method, coupon_code } = req.body;
+    const { items, email, payment_method, coupon_code } = req.body;
 
     if (!items || !Array.isArray(items) || !items.length || !payment_method) {
       return res.status(400).json({ error: 'Missing required fields' });
@@ -476,16 +482,13 @@ router.post('/create', attachUser, async (req, res) => {
     if (items.length > 50) return res.status(400).json({ error: 'Too many items' });
 
     const paidFromBalance = payment_method === 'balance';
-    if (paidFromBalance && !req.user) {
-      return res.status(401).json({ error: 'Log in to pay with balance' });
-    }
 
     // Prices come from product_tiers, never from the request body. The
-    // reseller discount likewise comes from the session's own web_users row —
-    // an anonymous checkout gets none, and the client cannot ask for one.
+    // reseller discount likewise comes from the session's own web_users row,
+    // so the client cannot ask for one it has not been granted.
     const repriced = await repriceItems(items, {
       paidFromBalance,
-      discountPercent: (req.user && req.user.reseller_discount) || 0,
+      discountPercent: req.user.reseller_discount || 0,
     });
     if (repriced.error) return res.status(400).json({ error: repriced.error });
     const safeItems = repriced.items;
@@ -512,16 +515,16 @@ router.post('/create', attachUser, async (req, res) => {
       }
     }
 
-    if (!email && !(req.user && req.user.email)) {
+    if (!email && !req.user.email) {
       return res.status(400).json({ error: 'Missing required fields' });
     }
 
     const { order, payment_info, total, fee_note, coupon, coupon_discount } = await createOrder({
       items: safeItems,
       email: email || req.user.email,
-      discord_id: discord_id || (req.user && req.user.discord_id) || null,
+      discord_id: req.user.discord_id,
       payment_method,
-      web_user_id: req.user ? req.user.id : null,
+      web_user_id: req.user.id,
       coupon_code,
       coupon_eligible_cents: repriced.catalogSubtotalCents || 0,
     });

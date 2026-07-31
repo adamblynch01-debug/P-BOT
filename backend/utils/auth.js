@@ -122,6 +122,34 @@ async function requireAdmin(req, res, next) {
   }
 }
 
+// ─── Discord link gate ───────────────────────────────────────────────────────
+// Every part of this store that happens AFTER the money — delivery, support,
+// replacements, disputes, the vouch — happens in Discord. An order placed by an
+// account with no verified Discord id therefore has no reachable owner: the
+// goods land in a web account nobody can be pinged about, and a refund request
+// arrives with nothing to tie it to. Requiring the link before the purchase,
+// rather than chasing it afterwards, is the only point where refusing is free.
+//
+// `discord_verified` is what matters, not `discord_id` alone. The id can be
+// typed into a profile field by anyone; only the OAuth round-trip sets the flag
+// (see routes/auth.js confirm-discord and the partial unique index in
+// migrations/discord_link_unique.sql), so an unverified id is a claim, not a
+// link.
+function discordLinked(user) {
+  return !!(user && user.discord_id && user.discord_verified);
+}
+
+// 403 + a machine-readable code, because the storefront has to tell this apart
+// from every other refusal: it is the one error whose fix is a button (start
+// the OAuth flow) rather than a message.
+async function requireDiscordLinked(req, res, next) {
+  if (discordLinked(req.user)) return next();
+  return res.status(403).json({
+    error: 'Link your Discord account before purchasing',
+    code: 'discord_link_required',
+  });
+}
+
 // Stricter gate for the routes that can hand out authority or move money:
 // role changes, password resets, account deletion, wallet adjustment.
 //
@@ -161,5 +189,6 @@ function publicUser(row) {
 module.exports = {
   hashPassword, verifyPassword, createSession, getSessionUser, bearerToken,
   attachUser, requireAuth, requireAdmin, requireOwnerAdmin, publicUser,
+  discordLinked, requireDiscordLinked,
   botAuthorized, botAuthUnavailable,
 };

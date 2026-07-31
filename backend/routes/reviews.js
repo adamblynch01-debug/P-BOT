@@ -1,7 +1,7 @@
 const express = require('express');
 const router = express.Router();
 const { query } = require('../db');
-const { requireAuth, requireAdmin, getSessionUser, bearerToken, botAuthorized, botAuthUnavailable } = require('../utils/auth');
+const { requireAuth, requireAdmin, getSessionUser, bearerToken, botAuthorized, botAuthUnavailable, discordLinked } = require('../utils/auth');
 const { notifyBot } = require('../utils/botNotify');
 
 const GUILD_ID = process.env.GUILD_ID;
@@ -13,6 +13,25 @@ async function requireAdminOrBot(req, res, next) {
   const user = await getSessionUser(bearerToken(req));
   if (user && ['admin', 'staff'].includes(user.role)) { req.user = user; return next(); }
   return res.status(401).json({ error: 'Unauthorized' });
+}
+
+// A website vouch is only worth anything to the store if it reaches the
+// #vouches channel, so the post is fired from here rather than left to the
+// admin panel. Sending it is deliberately fire-and-forget: the review is
+// already committed, and a Discord outage must not turn a saved vouch into a
+// 500 the customer reads as "it didn't work".
+function postVouchToDiscord(review) {
+  notifyBot('web_review', {
+    guild_id: GUILD_ID,
+    review: {
+      id: String(review.id),
+      display_name: review.display_name,
+      rating: review.rating,
+      body: review.body,
+      product_id: review.product_id ? String(review.product_id) : null,
+      discord_id: review.discord_id || null,
+    },
+  }).catch(() => {});
 }
 
 // ─── GET /api/reviews ────────────────────────────────────
@@ -36,12 +55,28 @@ router.post('/', requireAuth, async (req, res) => {
     const r = parseInt(rating, 10);
     if (!r || r < 1 || r > 5) return res.status(400).json({ error: 'rating must be 1-5' });
 
+    // A vouch from an account whose Discord is verified goes live immediately
+    // and posts itself to #vouches — that account belongs to a real member who
+    // can be found and, if it turns out to be abuse, removed. Everything else
+    // still waits for a human in the admin panel; the alternative is a public
+    // channel any signup can write into.
+    const live = discordLinked(req.user);
+
     const { rows } = await query(
-      `INSERT INTO reviews (guild_id, web_user_id, display_name, product_id, rating, body, source)
-       VALUES ($1,$2,$3,$4,$5,$6,'website') RETURNING *`,
-      [GUILD_ID, req.user.id, req.user.username, product_id || null, r, body || null]
+      `INSERT INTO reviews (guild_id, web_user_id, display_name, product_id, rating, body, source, discord_id, approved)
+       VALUES ($1,$2,$3,$4,$5,$6,'website',$7,$8) RETURNING *`,
+      [GUILD_ID, req.user.id, req.user.username, product_id || null, r, body || null,
+       req.user.discord_id || null, live]
     );
-    res.json({ success: true, review: { ...rows[0], id: String(rows[0].id) } });
+    if (live) postVouchToDiscord(rows[0]);
+    res.json({
+      success: true,
+      approved: live,
+      // The storefront says either "thanks, it's live" or "thanks, it's waiting
+      // for review" — guessing wrong in either direction reads as a bug.
+      pending: !live,
+      review: { ...rows[0], id: String(rows[0].id) },
+    });
   } catch (err) {
     console.error('[Reviews] Create error:', err);
     res.status(500).json({ error: 'Failed to submit review' });
@@ -82,19 +117,7 @@ router.patch('/:id/approve', requireAdminOrBot, async (req, res) => {
     const review = rows[0];
     // Newly approved + came from the website → post it as a Discord vouch.
     // Discord-sourced reviews are already visible in the server, so skip those.
-    if (makeApproved && review.source === 'website') {
-      notifyBot('web_review', {
-        guild_id: GUILD_ID,
-        review: {
-          id: String(review.id),
-          display_name: review.display_name,
-          rating: review.rating,
-          body: review.body,
-          product_id: review.product_id ? String(review.product_id) : null,
-          discord_id: review.discord_id || null,
-        },
-      }).catch(() => {});
-    }
+    if (makeApproved && review.source === 'website') postVouchToDiscord(review);
     res.json({ success: true });
   } catch (err) {
     res.status(500).json({ error: 'Failed to update review' });

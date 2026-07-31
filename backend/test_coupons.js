@@ -185,7 +185,8 @@ function reset() {
   COUPONS = []; REDEMPTIONS = []; ORDERS = [];
   nextCouponId = 1; nextRedId = 1;
   balanceCents = 1000000;
-  currentUser = { id: 7, username: 'u', email: 'u@x.c', role: 'member', banned: false, reseller_discount: 0 };
+  currentUser = { id: 7, username: 'u', email: 'u@x.c', role: 'member', banned: false, reseller_discount: 0,
+                  discord_id: '111', discord_verified: true };
 }
 
 (async () => {
@@ -310,7 +311,8 @@ function reset() {
 
   reset();
   makeCoupon({ code: 'STACK', percent_off: 10 });
-  currentUser = { id: 7, username: 'r', email: 'r@x.c', role: 'reseller', banned: false, reseller_discount: 25 };
+  currentUser = { id: 7, username: 'r', email: 'r@x.c', role: 'reseller', banned: false, reseller_discount: 25,
+                 discord_id: '111', discord_verified: true };
   q = await quote({ items: [PRO], payment_method: 'cashapp', coupon_code: 'STACK' }, 'tok');
   await check('a coupon stacks on top of the reseller discount, in that order', () => {
     // $40 → reseller 25% → $30 → coupon 10% of $30 = $3 → $27 → +10% fee.
@@ -408,7 +410,8 @@ function reset() {
     assert.ok(/already used/i.test(r.body.error || ''), r.body.error);
   });
   await check('but a different account may still use it', async () => {
-    currentUser = { id: 99, username: 'other', email: 'o@x.c', role: 'member', banned: false, reseller_discount: 0 };
+    currentUser = { id: 99, username: 'other', email: 'o@x.c', role: 'member', banned: false, reseller_discount: 0,
+                   discord_id: '222', discord_verified: true };
     const r = await create({ items: [PRO], payment_method: 'cashapp', email: 'o@x.c', coupon_code: 'PERPERSON' }, 'tok');
     assert.strictEqual(r.status, 200);
   });

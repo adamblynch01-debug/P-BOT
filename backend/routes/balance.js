@@ -1,7 +1,7 @@
 const express = require('express');
 const router = express.Router();
 const { query, withTransaction } = require('../db');
-const { requireAuth, requireAdmin, requireOwnerAdmin, publicUser, botAuthorized, botAuthUnavailable } = require('../utils/auth');
+const { requireAuth, requireAdmin, requireOwnerAdmin, requireDiscordLinked, publicUser, botAuthorized, botAuthUnavailable } = require('../utils/auth');
 const { logAdminAction } = require('../utils/adminLog');
 
 const GUILD_ID = process.env.GUILD_ID;
@@ -80,7 +80,7 @@ router.get('/mine', requireAuth, async (req, res) => {
 // notify) with a single synthetic "balance top-up" line item; delivery.js
 // recognizes item.id === 'balance-topup' and credits the wallet instead of
 // claiming stock once the order is confirmed paid.
-router.post('/topup/create', requireAuth, async (req, res) => {
+router.post('/topup/create', requireAuth, requireDiscordLinked, async (req, res) => {
   try {
     const { amount, payment_method } = req.body;
     const amt = parseFloat(amount);

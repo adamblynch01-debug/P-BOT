@@ -1,7 +1,7 @@
 const express = require('express');
 const router = express.Router();
 const { query, withTransaction } = require('../db');
-const { requireAuth, requireAdmin, requireOwnerAdmin, getSessionUser, bearerToken, botAuthorized } = require('../utils/auth');
+const { requireAuth, requireAdmin, requireOwnerAdmin, requireDiscordLinked, getSessionUser, bearerToken, botAuthorized } = require('../utils/auth');
 const { logAdminAction } = require('../utils/adminLog');
 const { notifyBot } = require('../utils/botNotify');
 
@@ -203,7 +203,7 @@ router.post('/adjust', async (req, res) => {
 // or key list is ignored, because the browser's tier <option> value is the
 // price itself and a reseller could edit it in devtools to mint keys for a
 // cent — and browser-minted keys were never real inventory to begin with.
-router.post('/purchase', requireAuth, async (req, res) => {
+router.post('/purchase', requireAuth, requireDiscordLinked, async (req, res) => {
   try {
     // A wallet debit must never be available to a non-reseller. requireAuth
     // only proves "logged in", so gate on the role the admin actually granted.
