@@ -1,21 +1,39 @@
-// Outbound order-confirmation email over the SAME Gmail account the
-// emailWatcher already reads from (GMAIL_USER / GMAIL_PASSWORD, an app
-// password). Sending is best-effort: if creds are missing or SMTP fails we
-// log and move on — a delivery must never be blocked on an email.
+// Outbound store email: order confirmations and 2FA codes.
+//
+// This used to be hardwired to the SAME Gmail login the payment watcher reads
+// (GMAIL_USER / GMAIL_PASSWORD), which forced the address customers see to be
+// the address PayPal notifications land in. It now resolves its own account —
+// see utils/mailAccounts.js — and only falls back to the Gmail pair when no
+// SMTP_* vars are set, so an unconfigured deployment behaves as before.
+//
+// Order confirmations are best-effort: if creds are missing or SMTP fails we
+// log and move on — a delivery must never be blocked on an email. Login codes
+// are NOT (see sendLoginCode).
 'use strict';
+
+const { outboundAccount } = require('./mailAccounts');
 
 let nodemailer = null;
 try { nodemailer = require('nodemailer'); } catch { /* dependency added in package.json */ }
 
 let transporter = null;
+let fromAddress = null;
 function getTransporter() {
   if (transporter) return transporter;
-  if (!nodemailer || !process.env.GMAIL_USER || !process.env.GMAIL_PASSWORD) return null;
-  transporter = nodemailer.createTransport({
-    service: 'gmail',
-    auth: { user: process.env.GMAIL_USER, pass: process.env.GMAIL_PASSWORD },
-  });
+  if (!nodemailer) return null;
+  const acct = outboundAccount();
+  if (!acct) return null;
+  transporter = nodemailer.createTransport(acct.transport);
+  fromAddress = acct.from;
+  console.log(`[Email] Outbound via ${acct.provider} as ${acct.from}`);
   return transporter;
+}
+
+// The envelope From. Falls back to the transport's own login, which is what
+// every provider requires anyway — a From that is not the authenticated
+// mailbox is rejected outright by Gmail and lands in spam elsewhere.
+function senderAddress() {
+  return fromAddress || process.env.SMTP_FROM || process.env.SMTP_USER || process.env.GMAIL_USER || '';
 }
 
 function money(n) { return '$' + (Number(n) || 0).toFixed(2); }
@@ -68,7 +86,7 @@ async function sendOrderConfirmation(order, goods) {
 
   try {
     await tx.sendMail({
-      from: `${storeName} <${process.env.GMAIL_USER}>`,
+      from: `${storeName} <${senderAddress()}>`,
       to: order.email,
       subject: `Order #${order.id} confirmed — ${storeName}`,
       html,
@@ -123,7 +141,7 @@ async function sendLoginCode(to, code, purpose) {
 
   try {
     await tx.sendMail({
-      from: `${storeName} <${process.env.GMAIL_USER}>`,
+      from: `${storeName} <${senderAddress()}>`,
       to,
       subject: `${code} is your ${storeName} ${isSetup ? 'confirmation' : 'login'} code`,
       html,

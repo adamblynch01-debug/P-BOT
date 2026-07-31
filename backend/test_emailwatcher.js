@@ -658,18 +658,20 @@ const CASH_ORDER = { ...ORDER, payment_method: 'cashapp' };
   check('TLS validation is not disabled', !/rejectUnauthorized:\s*false/.test(watcherSrc));
   // Overlapping scans must still be serialised — but the latch is no longer an
   // unconditional `if (scanning) return`. That version could wedge forever: the
-  // flag is module-global and survives a reconnect, so one fetch that never
-  // fired 'end' silently stopped the watcher reading mail at all. It now
-  // force-releases a scan that has held the latch past SCAN_STUCK_MS.
-  check('overlapping scans are still serialised', /if \(scanning\)/.test(watcherSrc));
+  // flag survived a reconnect, so one fetch that never fired 'end' silently
+  // stopped the watcher reading mail at all. It now force-releases a scan that
+  // has held the latch past SCAN_STUCK_MS. The latch also moved off the module
+  // onto the per-mailbox watcher object, so it is `w.scanning` now — one wedged
+  // inbox must not be able to stop the other one scanning.
+  check('overlapping scans are still serialised', /if \(w\.scanning\)/.test(watcherSrc));
   check('a wedged scan is force-released rather than blocking forever',
-    /SCAN_STUCK_MS/.test(watcherSrc) && /scanStartedAt/.test(watcherSrc));
+    /SCAN_STUCK_MS/.test(watcherSrc) && /w\.scanStartedAt/.test(watcherSrc));
   check('every latch release also clears the scan start time',
-    /const endScan = \(\) => \{ scanning = false; scanStartedAt = null; \}/.test(watcherSrc));
+    /const endScan = \(\) => \{ w\.scanning = false; w\.scanStartedAt = null; \}/.test(watcherSrc));
   // A failed openBox must force a reconnect. Returning bare left the client
   // connected with no 'mail' listener attached — permanently deaf.
   check('a failed inbox open schedules a reconnect',
-    /Failed to open inbox[\s\S]{0,320}scheduleReconnect\(\)/.test(watcherSrc));
+    /Failed to open inbox[\s\S]{0,320}scheduleReconnect\(w\)/.test(watcherSrc));
 
   console.log('\n=== noteGenerator entropy ===');
   const { generateNote } = require(path.join(BACKEND, 'utils', 'noteGenerator.js'));

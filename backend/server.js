@@ -22,12 +22,33 @@ const app = express();
     WEBHOOK_SECRET: 'the crypto webhook endpoint will reject all callbacks',
     PAYPAL_EMAIL: 'PayPal checkout shows a placeholder address',
     CASHAPP_CASHTAG: 'Cash App checkout shows a placeholder cashtag',
-    GMAIL_USER: 'the email payment watcher cannot start',
     BLOCKCYPHER_TOKEN: 'crypto address monitoring is rate-limited or unavailable',
   };
 
   const missingRequired = Object.keys(required).filter(k => !process.env[k]);
   const missingRecommended = Object.keys(recommended).filter(k => !process.env[k]);
+
+  // Not a plain key check any more: GMAIL_USER used to be the one and only way
+  // to feed the payment watcher, but each method can now point at its own
+  // mailbox, so naming a single variable here would warn about a perfectly
+  // configured split deployment. Ask the resolver what it actually found.
+  try {
+    const { inboundAccounts, outboundAccount } = require('./utils/mailAccounts');
+    const inbound = inboundAccounts();
+    if (!inbound.length) {
+      console.warn('[Startup] no payment mailbox configured — the email payment watcher cannot start ' +
+        '(set PAYPAL_IMAP_USER/_PASSWORD and CASHAPP_IMAP_USER/_PASSWORD, or the GMAIL_USER/GMAIL_PASSWORD pair)');
+    } else {
+      // Names and routing only. The addresses themselves are never logged.
+      console.log(`[Startup] payment mailboxes: ${inbound.map(a => `${a.methods.join('+')} via ${a.provider}`).join(', ')}`);
+    }
+    if (!outboundAccount()) {
+      console.warn('[Startup] no outbound mail account — order confirmations and email 2FA codes will not send ' +
+        '(set SMTP_USER/SMTP_PASSWORD, or the GMAIL_USER/GMAIL_PASSWORD pair)');
+    }
+  } catch (e) {
+    console.warn('[Startup] mail account check failed:', e.message);
+  }
 
   for (const k of missingRequired) console.error(`[Startup] MISSING ${k} — ${required[k]}`);
   for (const k of missingRecommended) console.warn(`[Startup] missing ${k} — ${recommended[k]}`);

@@ -92,8 +92,11 @@ const { raiseAlert } = require('./utils/alerts');
     assert.ok(/probeConnection/.test(src), 'no probeConnection');
     assert.ok(/imapClient\.status\(/.test(src), 'probe does not query the mailbox');
   });
+  // Per-mailbox now: the connection state moved off the module and onto a
+  // watcher object, one per configured payment inbox, so the probe and the
+  // alarm flag are both reached through `w`.
   check('a successful probe clears the alarm', () => {
-    assert.ok(/const healthy = await probeConnection\(\)[\s\S]{0,200}deadAlertSent = false/.test(src));
+    assert.ok(/const healthy = await probeConnection\(w\)[\s\S]{0,200}w\.deadAlertSent = false/.test(src));
   });
   check('the probe cannot hang the heartbeat forever', () => {
     assert.ok(/setTimeout\(\(\) => done\(false\), \d+\)/.test(src));

@@ -1239,6 +1239,72 @@ router.delete('/admin/user/:id', requireOwnerAdmin, async (req, res) => {
   }
 });
 
+// ─── POST /api/auth/admin/unlink-discord ─────────────────
+// A snowflake can only be verified on ONE account — the OAuth callback and the
+// DM handshake both refuse a duplicate rather than stealing it. That is the
+// right default (otherwise anyone who links first owns the identity), but it
+// leaves the owner stuck when the id is sitting on an account they no longer
+// use: every re-link attempt just answers "already linked to another site
+// account" with nowhere to go. This is that way out.
+//
+// requireAdmin, not requireOwnerAdmin: unlinking removes an authentication
+// path, it does not grant one, so it is the same blast radius as a ban.
+router.post('/admin/unlink-discord', requireAdmin, async (req, res) => {
+  try {
+    const { user_id } = req.body || {};
+    if (!user_id) return res.status(400).json({ error: 'user_id is required' });
+    const { rows: target } = await query(
+      'SELECT id, username, role, discord_id FROM web_users WHERE id = $1 AND guild_id = $2',
+      [user_id, GUILD_ID]
+    );
+    if (!target.length) return res.status(404).json({ error: 'User not found' });
+    // Same rule the ban route uses: staff must not be able to strip a factor
+    // off the owner's account and lock them out of their own store.
+    if (target[0].role === 'admin' && req.user.role !== 'admin') {
+      return res.status(403).json({ error: 'Only an owner admin can unlink an admin account' });
+    }
+    await query(
+      'UPDATE web_users SET discord_id = NULL, discord_verified = false WHERE id = $1 AND guild_id = $2',
+      [user_id, GUILD_ID]
+    );
+    await logAdminAction(req, 'unlink_discord', user_id,
+      { username: target[0].username, had_discord: !!target[0].discord_id });
+    res.json({ success: true, user_id: String(user_id) });
+  } catch (err) {
+    console.error('[Auth] admin/unlink-discord error:', err);
+    res.status(500).json({ error: 'Failed to unlink Discord' });
+  }
+});
+
+// ─── POST /api/auth/2fa/discord/unlink ───────────────────
+// The self-service half. Password-gated for the same reason /2fa/disable is: a
+// hijacked session must not be able to strip a factor off the account it walked
+// into. An account whose ONLY second factor is Discord keeps it — dropping the
+// link there would quietly downgrade the account to a password alone.
+router.post('/2fa/discord/unlink', requireAuth, async (req, res) => {
+  try {
+    const { password } = req.body || {};
+    if (!password) return res.status(400).json({ error: 'Password is required' });
+    const { rows } = await query('SELECT password_hash FROM web_users WHERE id = $1', [req.user.id]);
+    if (!rows.length || !verifyPassword(password, rows[0].password_hash)) {
+      return res.status(401).json({ error: 'Incorrect password' });
+    }
+    if (req.user.discord_verified && !req.user.totp_enabled && !req.user.email_2fa_enabled) {
+      return res.status(400).json({
+        error: 'Discord is the only second factor on this account. Enable the authenticator app or email verification first.',
+      });
+    }
+    await query(
+      'UPDATE web_users SET discord_id = NULL, discord_verified = false WHERE id = $1 AND guild_id = $2',
+      [req.user.id, GUILD_ID]
+    );
+    res.json({ success: true });
+  } catch (err) {
+    console.error('[Auth] 2fa/discord/unlink error:', err);
+    res.status(500).json({ error: 'Failed to unlink Discord' });
+  }
+});
+
 // ─── POST /api/auth/discord-login/initiate ───────────────
 // Passwordless "Login with Discord" from the storefront login page. Given a
 // Discord User ID (or username), we look up the matching web_users row, then

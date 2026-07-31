@@ -3,18 +3,18 @@ const { simpleParser } = require('mailparser');
 const axios = require('axios');
 const { query } = require('../db');
 const { raiseAlert } = require('../utils/alerts');
+const { inboundAccounts } = require('../utils/mailAccounts');
 
 const GUILD_ID = process.env.GUILD_ID;
 
-let imapClient = null;
-let failCount = 0;
-let reconnectTimer = null;
-let heartbeatTimer = null;
-let lastActivityAt = Date.now();
-let deadAlertSent = false;
-let scanning = false;
-// When the current scan started, so a wedged one can be force-released.
-let scanStartedAt = null;
+// One watcher instance per MAILBOX, not one per process. PayPal and Cash App
+// notifications used to be required to land in the same inbox because there
+// was a single module-global IMAP client; each payment method can now have its
+// own login (see utils/mailAccounts.js), and every piece of connection state
+// that used to be a module global lives on the instance instead. Two methods
+// configured with identical credentials still share ONE connection — otherwise
+// the same mailbox would be fetched twice and every message parsed twice.
+const watchers = [];
 
 // Backoff caps at 5 minutes and never gives up. The watcher used to stop
 // permanently after 5 failures with only a console.error — after which every
@@ -28,16 +28,36 @@ const SILENCE_ALERT_MS = 20 * 60 * 1000;
 // above a normal two-day fetch, well below the 20-minute silence alarm.
 const SCAN_STUCK_MS = 5 * 60 * 1000;
 
+function makeWatcher(account) {
+  return {
+    account,
+    // `label` is what shows up in logs and alerts. The mailbox address is
+    // deliberately NOT logged — the methods it serves identify it well enough.
+    label: account.methods.join('+'),
+    imapClient: null,
+    failCount: 0,
+    reconnectTimer: null,
+    heartbeatTimer: null,
+    lastActivityAt: Date.now(),
+    deadAlertSent: false,
+    scanning: false,
+    scanStartedAt: null,
+  };
+}
+
 function start() {
-  if (!process.env.GMAIL_USER || !process.env.GMAIL_PASSWORD) {
-    console.warn('[EmailWatcher] Gmail credentials not set — disabled');
+  const accounts = inboundAccounts();
+  if (!accounts.length) {
+    console.warn('[EmailWatcher] No payment mailbox configured — disabled');
     return;
   }
-  failCount = 0;
-  lastActivityAt = Date.now();
-  connectImap();
-  startHeartbeat();
-  console.log('[EmailWatcher] Started');
+  for (const account of accounts) {
+    const w = makeWatcher(account);
+    watchers.push(w);
+    connectImap(w);
+    startHeartbeat(w);
+    console.log(`[EmailWatcher] Started ${w.label} via ${account.provider}`);
+  }
 }
 
 // Being connected is not the same as being alive: a wedged IDLE keeps the
@@ -55,67 +75,71 @@ function start() {
 // spoken to. A probe that succeeds proves the watcher can still see the
 // mailbox, whether or not anyone has emailed. Only a failed probe — or a
 // client that is not in the authenticated state — is an actual outage.
-function startHeartbeat() {
-  if (heartbeatTimer) clearInterval(heartbeatTimer);
-  heartbeatTimer = setInterval(async () => {
-    const healthy = await probeConnection();
+function startHeartbeat(w) {
+  if (w.heartbeatTimer) clearInterval(w.heartbeatTimer);
+  w.heartbeatTimer = setInterval(async () => {
+    const healthy = await probeConnection(w);
     if (healthy) {
-      lastActivityAt = Date.now();
-      deadAlertSent = false;
+      w.lastActivityAt = Date.now();
+      w.deadAlertSent = false;
       return;
     }
-    const silentFor = Date.now() - lastActivityAt;
-    if (silentFor > SILENCE_ALERT_MS && !deadAlertSent) {
-      deadAlertSent = true;
-      await raiseAlert('email_watcher_silent',
-        `Payment email watcher cannot reach the mailbox (no successful IMAP probe for ${Math.round(silentFor / 60000)} minutes) — Cash App/PayPal payments may not be confirming`,
-        { severity: 'error', context: { failCount, imapState: imapClient ? imapClient.state : 'none' } }).catch(() => {});
+    const silentFor = Date.now() - w.lastActivityAt;
+    if (silentFor > SILENCE_ALERT_MS && !w.deadAlertSent) {
+      w.deadAlertSent = true;
+      // The alert key carries the label, so with the inboxes split one dead
+      // mailbox's alarm cannot be de-duplicated away by the other one's.
+      await raiseAlert(`email_watcher_silent_${w.label}`,
+        `Payment email watcher (${w.label}) cannot reach its mailbox (no successful IMAP probe for ${Math.round(silentFor / 60000)} minutes) — those payments may not be confirming`,
+        { severity: 'error', context: { mailbox: w.label, failCount: w.failCount, imapState: w.imapClient ? w.imapClient.state : 'none' } }).catch(() => {});
     }
   }, HEARTBEAT_CHECK_MS);
-  if (heartbeatTimer.unref) heartbeatTimer.unref();
+  if (w.heartbeatTimer.unref) w.heartbeatTimer.unref();
 }
 
 // Cheap liveness check: ask the server for the mailbox status. Resolves true
 // only if the round trip actually completes, so a half-open socket that no
 // longer answers is correctly reported as dead.
-function probeConnection() {
+function probeConnection(w) {
   return new Promise((resolve) => {
-    if (!imapClient || imapClient.state !== 'authenticated') return resolve(false);
+    if (!w.imapClient || w.imapClient.state !== 'authenticated') return resolve(false);
     let settled = false;
     const done = (ok) => { if (!settled) { settled = true; resolve(ok); } };
     // Don't hang the heartbeat on a wedged connection.
     const t = setTimeout(() => done(false), 15000);
     if (t.unref) t.unref();
     try {
-      imapClient.status('INBOX', (err) => {
+      w.imapClient.status('INBOX', (err) => {
         clearTimeout(t);
-        if (err) console.warn('[EmailWatcher] health probe failed:', err.message);
+        if (err) console.warn(`[EmailWatcher:${w.label}] health probe failed:`, err.message);
         done(!err);
       });
     } catch (e) {
       clearTimeout(t);
-      console.warn('[EmailWatcher] health probe threw:', e.message);
+      console.warn(`[EmailWatcher:${w.label}] health probe threw:`, e.message);
       done(false);
     }
   });
 }
 
-function markAlive() {
-  lastActivityAt = Date.now();
-  deadAlertSent = false;
+function markAlive(w) {
+  w.lastActivityAt = Date.now();
+  w.deadAlertSent = false;
 }
 
-function connectImap() {
-  imapClient = new Imap({
-    user: process.env.GMAIL_USER,
-    password: process.env.GMAIL_PASSWORD,
-    host: 'imap.gmail.com',
-    port: 993,
+function connectImap(w) {
+  const a = w.account;
+  w.imapClient = new Imap({
+    user: a.user,
+    password: a.password,
+    host: a.host,
+    port: a.port,
     tls: true,
-    // Gmail presents a valid certificate. Skipping validation would let anyone
-    // able to intercept the connection feed us forged "payment" mail and
-    // harvest the mailbox password.
-    tlsOptions: { servername: 'imap.gmail.com' },
+    // The provider presents a valid certificate. Skipping validation would let
+    // anyone able to intercept the connection feed us forged "payment" mail and
+    // harvest the mailbox password. servername has to be the host we actually
+    // dialled, so it comes from the account rather than a hardcoded Gmail.
+    tlsOptions: { servername: a.host },
     authTimeout: 15000,
     connTimeout: 15000,
     keepalive: {
@@ -125,85 +149,86 @@ function connectImap() {
     },
   });
 
-  imapClient.once('ready', () => {
-    failCount = 0;
-    markAlive();
-    console.log('[EmailWatcher] IMAP connected');
-    openInbox();
+  w.imapClient.once('ready', () => {
+    w.failCount = 0;
+    markAlive(w);
+    console.log(`[EmailWatcher:${w.label}] IMAP connected`);
+    openInbox(w);
   });
 
-  imapClient.once('error', (err) => {
-    failCount++;
-    console.error(`[EmailWatcher] IMAP error (attempt ${failCount}):`, err.message);
-    if (failCount === 3) {
-      raiseAlert('email_watcher_failing',
-        `Payment email watcher has failed to connect ${failCount} times: ${err.message}`,
+  w.imapClient.once('error', (err) => {
+    w.failCount++;
+    console.error(`[EmailWatcher:${w.label}] IMAP error (attempt ${w.failCount}):`, err.message);
+    if (w.failCount === 3) {
+      raiseAlert(`email_watcher_failing_${w.label}`,
+        `Payment email watcher (${w.label}) has failed to connect ${w.failCount} times: ${err.message}`,
         { severity: 'warn' }).catch(() => {});
     }
-    scheduleReconnect();
+    scheduleReconnect(w);
   });
 
-  imapClient.once('end', () => {
-    console.log('[EmailWatcher] IMAP disconnected — reconnecting...');
-    scheduleReconnect();
+  w.imapClient.once('end', () => {
+    console.log(`[EmailWatcher:${w.label}] IMAP disconnected — reconnecting...`);
+    scheduleReconnect(w);
   });
 
-  imapClient.connect();
+  w.imapClient.connect();
 }
 
-function scheduleReconnect() {
-  if (reconnectTimer) clearTimeout(reconnectTimer);
-  const delay = BACKOFF_MS[Math.min(failCount, BACKOFF_MS.length - 1)];
-  reconnectTimer = setTimeout(connectImap, delay);
+function scheduleReconnect(w) {
+  if (w.reconnectTimer) clearTimeout(w.reconnectTimer);
+  const delay = BACKOFF_MS[Math.min(w.failCount, BACKOFF_MS.length - 1)];
+  w.reconnectTimer = setTimeout(() => connectImap(w), delay);
 }
 
-function openInbox() {
-  imapClient.openBox('INBOX', false, (err) => {
+function openInbox(w) {
+  w.imapClient.openBox('INBOX', false, (err) => {
     if (err) {
       // This used to just `return`. The IMAP connection stayed up, so the
       // 'end'/'error' handlers that schedule a reconnect never fired, and no
       // 'mail' listener was ever attached — the watcher sat there connected
       // and permanently deaf. Payments stopped confirming with no error after
       // this one line. Force the reconnect instead.
-      console.error('[EmailWatcher] Failed to open inbox:', err.message, '— forcing reconnect');
-      scanning = false;
-      try { imapClient.end(); } catch { /* already gone */ }
-      scheduleReconnect();
+      console.error(`[EmailWatcher:${w.label}] Failed to open inbox:`, err.message, '— forcing reconnect');
+      w.scanning = false;
+      try { w.imapClient.end(); } catch { /* already gone */ }
+      scheduleReconnect(w);
       return;
     }
-    console.log('[EmailWatcher] Inbox open — watching for payments');
-    imapClient.on('mail', (numNew) => {
-      markAlive();
-      console.log(`[EmailWatcher] ${numNew} new email(s) — checking for payments`);
-      fetchRecent();
+    console.log(`[EmailWatcher:${w.label}] Inbox open — watching for payments`);
+    w.imapClient.on('mail', (numNew) => {
+      markAlive(w);
+      console.log(`[EmailWatcher:${w.label}] ${numNew} new email(s) — checking for payments`);
+      fetchRecent(w);
     });
-    fetchRecent();
+    fetchRecent(w);
   });
 }
 
-function fetchRecent() {
+function fetchRecent(w) {
   // Serialised deliberately. Overlapping scans used to hand the same UID to two
   // parallel processEmail calls, and PayPal sends more than one notification per
   // payment, so concurrent confirmations of a single order were routine.
   //
-  // The latch needs a way out, though: it is module-global and survives a
-  // reconnect, so a fetch that never fires 'end' (a dropped socket mid-stream,
-  // a parser that never calls back) left `scanning` true forever and EVERY
-  // later scan returned on the first line. The mailbox kept receiving payments
-  // and the watcher silently stopped reading them. A stuck scan is now
-  // force-released so the next 'mail' event can proceed.
-  if (scanning) {
-    if (scanStartedAt && Date.now() - scanStartedAt > SCAN_STUCK_MS) {
-      console.error(`[EmailWatcher] previous scan stuck for ${Math.round((Date.now() - scanStartedAt) / 1000)}s — releasing the latch`);
-      scanning = false;
+  // The latch needs a way out, though: it survives a reconnect, so a fetch that
+  // never fires 'end' (a dropped socket mid-stream, a parser that never calls
+  // back) left `scanning` true forever and EVERY later scan returned on the
+  // first line. The mailbox kept receiving payments and the watcher silently
+  // stopped reading them. A stuck scan is now force-released so the next 'mail'
+  // event can proceed. The latch is per-mailbox: one wedged inbox must not stop
+  // the other one from scanning.
+  if (w.scanning) {
+    if (w.scanStartedAt && Date.now() - w.scanStartedAt > SCAN_STUCK_MS) {
+      console.error(`[EmailWatcher:${w.label}] previous scan stuck for ${Math.round((Date.now() - w.scanStartedAt) / 1000)}s — releasing the latch`);
+      w.scanning = false;
     } else {
       return;
     }
   }
-  scanning = true;
-  scanStartedAt = Date.now();
+  w.scanning = true;
+  w.scanStartedAt = Date.now();
 
-  const endScan = () => { scanning = false; scanStartedAt = null; };
+  const endScan = () => { w.scanning = false; w.scanStartedAt = null; };
 
   // Two days back, and NOT filtered on UNSEEN. The old `UNSEEN SINCE today`
   // window dropped mail permanently in two ways: a restart just after local
@@ -215,11 +240,11 @@ function fetchRecent() {
   const months = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
   const sinceDate = `${dd}-${months[since.getMonth()]}-${since.getFullYear()}`;
 
-  imapClient.search([['SINCE', sinceDate]], (err, results) => {
+  w.imapClient.search([['SINCE', sinceDate]], (err, results) => {
     if (err || !results || results.length === 0) { endScan(); return; }
-    markAlive();
+    markAlive(w);
 
-    const fetch = imapClient.fetch(results, { bodies: '' });
+    const fetch = w.imapClient.fetch(results, { bodies: '' });
     const pending = [];
 
     fetch.on('message', (msg) => {
@@ -227,13 +252,13 @@ function fetchRecent() {
         msg.on('body', (stream) => {
           simpleParser(stream, async (parseErr, parsed) => {
             if (parseErr) {
-              console.error('[EmailWatcher] Parse error:', parseErr.message);
+              console.error(`[EmailWatcher:${w.label}] Parse error:`, parseErr.message);
               return resolve();
             }
             try {
-              await processEmail(parsed);
+              await processEmail(parsed, w.account);
             } catch (e) {
-              console.error('[EmailWatcher] processEmail threw:', e.message);
+              console.error(`[EmailWatcher:${w.label}] processEmail threw:`, e.message);
             }
             resolve();
           });
@@ -242,7 +267,7 @@ function fetchRecent() {
     });
 
     fetch.once('error', (fetchErr) => {
-      console.error('[EmailWatcher] Fetch error:', fetchErr.message);
+      console.error(`[EmailWatcher:${w.label}] Fetch error:`, fetchErr.message);
       endScan();
     });
 
@@ -260,11 +285,18 @@ function fetchRecent() {
 // notification. A From line is trivially forged and `subject.includes(...)`
 // let any stranger's email reach the confirm path, so neither is trusted here.
 //
-// Gmail has already run SPF/DKIM/DMARC by the time we fetch the message over
-// IMAP and stamps its verdict into an Authentication-Results header. That
-// verdict is the trustworthy signal. Only the FIRST such header is read:
-// Gmail prepends its own on receipt, so anything below it was supplied by the
-// sender and is attacker-controlled.
+// The RECEIVING mail server has already run SPF/DKIM/DMARC by the time we fetch
+// the message over IMAP and stamps its verdict into an Authentication-Results
+// header. That verdict is the trustworthy signal. Only the FIRST such header is
+// read: the receiving server prepends its own on arrival, so anything below it
+// was supplied by the sender and is attacker-controlled.
+//
+// Whose stamp counts depends on where the mailbox lives, which is why each
+// account carries it (see utils/mailAccounts.js). Google writes an authserv-id
+// — `mx.google.com; ... dmarc=pass` — while Microsoft writes none at all and
+// instead adds its own `compauth=` token, which no sender can forge into the
+// first header position because Microsoft strips inbound copies of it. Point a
+// mailbox at the wrong provider and every payment email is silently ignored.
 
 const DEFAULT_CASHAPP_DOMAINS = ['cash.app', 'square.com', 'squareup.com'];
 const DEFAULT_PAYPAL_DOMAINS = ['paypal.com'];
@@ -283,13 +315,30 @@ function domainMatches(domain, allowed) {
   return allowed.some(a => d === a || d.endsWith('.' + a));
 }
 
-function verifiedSenderDomain(parsed) {
+// GMAIL_USER-only deployments have no account object at all in the tests that
+// predate the split, so the Gmail rule stays the default when none is passed.
+const DEFAULT_AUTHSERV = { authservId: 'mx.google.com', authservMarker: null };
+
+function verifiedSenderDomain(parsed, account) {
   const header = (parsed.headerLines || []).find(h => h.key === 'authentication-results');
   if (!header) return null;
 
   const body = String(header.line).replace(/^authentication-results:\s*/i, '');
-  // The verdict must be Gmail's own, not one the sender wrote themselves.
-  if (!/^mx\.google\.com\b/i.test(body.split(';')[0].trim())) return null;
+  const rule = account || DEFAULT_AUTHSERV;
+
+  // The verdict must be the receiving server's own, not one the sender wrote
+  // themselves. An authserv-id is checked at the very start of the header,
+  // where only the receiving server can put it; a marker (Microsoft) is checked
+  // anywhere in that same first header, since it has no id to anchor to.
+  if (rule.authservId) {
+    const esc = String(rule.authservId).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    if (!new RegExp('^' + esc + '\\b', 'i').test(body.split(';')[0].trim())) return null;
+  } else if (rule.authservMarker) {
+    if (!body.toLowerCase().includes(String(rule.authservMarker).toLowerCase())) return null;
+  } else {
+    // Neither configured: refuse rather than trust an unidentified stamp.
+    return null;
+  }
 
   // DMARC only. The old dkim=pass fallback was strictly weaker: DKIM alone
   // accepts a signature that is not aligned with the From domain, which is
@@ -464,14 +513,14 @@ async function releaseClaim(messageId) {
   await query('DELETE FROM processed_emails WHERE message_id = $1', [messageId]).catch(() => {});
 }
 
-async function processEmail(email) {
+async function processEmail(email, account) {
   const subject = email.subject || '';
   // Plain text only — HTML carries CSS noise like "0px" that breaks parsing.
   const text = (email.text || '');
 
-  const verified = verifiedSenderDomain(email);
+  const verified = verifiedSenderDomain(email, account);
   if (!verified) {
-    console.warn(`[EmailWatcher] Ignored "${subject}" — no Gmail DMARC pass on the sender`);
+    console.warn(`[EmailWatcher] Ignored "${subject}" — no DMARC pass stamped by this mailbox's own server`);
     return;
   }
 
@@ -481,6 +530,17 @@ async function processEmail(email) {
 
   if (!method) {
     console.log(`[EmailWatcher] Ignored "${subject}" — ${verified} is not a payment provider domain`);
+    return;
+  }
+
+  // A mailbox only confirms the methods routed to it. With the inboxes split,
+  // a Cash App notification landing in the PayPal inbox is not evidence of
+  // anything we asked for — it means mail is being forwarded or the wrong
+  // address was given out — so splitting the logins also narrows what each one
+  // is trusted for. An unsplit deployment carries both methods on the one
+  // account and behaves exactly as before.
+  if (account && Array.isArray(account.methods) && !account.methods.includes(method)) {
+    console.warn(`[EmailWatcher] Ignored "${subject}" — ${method} mail in the ${account.methods.join('+')} mailbox`);
     return;
   }
 
