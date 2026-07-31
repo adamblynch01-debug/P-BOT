@@ -42,9 +42,16 @@ const app = express();
       // Names and routing only. The addresses themselves are never logged.
       console.log(`[Startup] payment mailboxes: ${inbound.map(a => `${a.methods.join('+')} via ${a.provider}`).join(', ')}`);
     }
-    if (!outboundAccount()) {
+    // An HTTPS provider is a complete outbound setup on its own — this host
+    // blocks outbound SMTP, so a deployment with only an API key is the
+    // working case, not the broken one.
+    const { httpMailer } = require('./utils/mailHttp');
+    const outHttp = httpMailer((outboundAccount() || {}).from);
+    if (outHttp) {
+      console.log(`[Startup] outbound mail: ${outHttp.label} HTTPS API`);
+    } else if (!outboundAccount()) {
       console.warn('[Startup] no outbound mail account — order confirmations and email 2FA codes will not send ' +
-        '(set UHSERVICES_GMAIL_USER/_PASSWORD, or the GMAIL_USER/GMAIL_PASSWORD pair)');
+        '(set RESEND_API_KEY or BREVO_API_KEY plus MAIL_FROM, or the UHSERVICES_GMAIL_USER/_PASSWORD SMTP pair)');
     }
   } catch (e) {
     console.warn('[Startup] mail account check failed:', e.message);

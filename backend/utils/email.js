@@ -12,6 +12,7 @@
 'use strict';
 
 const { outboundAccount } = require('./mailAccounts');
+const { httpMailer } = require('./mailHttp');
 
 let nodemailer = null;
 try { nodemailer = require('nodemailer'); } catch { /* dependency added in package.json */ }
@@ -35,8 +36,22 @@ function describe(cfg) {
 // fact, and the difference used to be invisible.
 async function getTransporter() {
   if (transporter) return transporter;
-  if (!nodemailer) return null;
   const acct = outboundAccount();
+
+  // An HTTPS provider is tried first and needs no probing — there is one route
+  // to it, port 443, and the whole API already depends on that port working.
+  // It also takes precedence over SMTP deliberately: the only reason to set an
+  // API key is that SMTP is unavailable here, so falling back to a transport
+  // we know times out would just make every send wait for nothing.
+  const http = httpMailer(acct && acct.from);
+  if (http) {
+    fromAddress = http.from;
+    transporter = http;
+    console.log(`[Email] Outbound via ${http.label} HTTPS API as ${http.from}`);
+    return transporter;
+  }
+
+  if (!nodemailer) return null;
   if (!acct) return null;
 
   // Every candidate failing costs a connection timeout apiece. Without this,
@@ -58,7 +73,9 @@ async function getTransporter() {
     }
   }
   lastProbeFailedAt = Date.now();
-  console.error('[Email] No usable SMTP route — outbound email is down');
+  console.error('[Email] No usable SMTP route — outbound email is down. '
+    + 'If every port timed out, this host blocks outbound SMTP: set RESEND_API_KEY '
+    + 'or BREVO_API_KEY plus MAIL_FROM and it will send over HTTPS instead.');
   return null;
 }
 
