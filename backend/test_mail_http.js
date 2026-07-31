@@ -258,6 +258,85 @@ async function run() {
       assert.strictEqual(LAST.body.from, 'H8ED Shop <no-reply@ontop.uhservices.xyz>'));
   }
 
+  console.log('\n=== what the receipt actually tells the customer ===');
+  {
+    // The complaint that prompted this: a five-line order confirmed as a list
+    // of five bare product names. No duration, no quantity, no unit price, no
+    // date, and an order id of "#10" that says how many orders the shop has
+    // ever taken.
+    setEnv({ RESEND_API_KEY: 'k', MAIL_FROM: 'H8ED Shop <user@example.com>' });
+    process.env.DISCORD_INVITE_URL = 'https://discord.gg/example';
+    const m = fresh();
+    redirect(m, 'resend', base);
+    const { sendOrderConfirmation } = require(path.join(BACKEND, 'utils', 'email.js'));
+
+    const order = {
+      id: 10,
+      invoice_no: 'K7QM-3XR9',
+      email: 'b@x.c',
+      payment_method: 'cashapp',
+      subtotal_cents: 2000,
+      coupon_code: 'SAVE10',
+      coupon_discount_cents: 200,
+      total_cents: 1980,
+      paid_at: '2026-07-31T12:54:00.000Z',
+      items_snapshot: [
+        { id: '11', product_name: 'Ancient', tier_label: 'Day', qty: 4, price: 2.50 },
+        { id: '12', product_name: "HEAVEN'S BLINDSPOT", tier_label: 'Month', qty: 1, price: 10.00 },
+      ],
+    };
+    const goods = [
+      { product: 'Ancient', tier_label: 'Day', qty: 4, unit_price: 2.5, items: ['K-1', 'K-2', 'K-3', 'K-4'] },
+      { product: "HEAVEN'S BLINDSPOT", tier_label: 'Month', qty: 1, unit_price: 10, items: ['K-5'] },
+    ];
+
+    await checkAsync('every line names its product, its term, its count and its unit price', async () => {
+      assert.strictEqual(await sendOrderConfirmation(order, goods), true);
+      const h = LAST.body.html;
+      assert.ok(h.includes('Ancient'), 'product name');
+      assert.ok(h.includes('Day') && h.includes('Month'), 'subscription term');
+      assert.ok(/>4</.test(h), 'quantity');
+      assert.ok(h.includes('$2.50'), 'unit price');
+      assert.ok(h.includes('$10.00'), 'line total for the 4× line');
+    });
+    check('the apostrophe in a product name is escaped, not rendered as markup', () =>
+      assert.ok(LAST.body.html.includes('HEAVEN&#39;S BLINDSPOT')));
+    check('the order carries a date', () =>
+      assert.ok(/Jul 31, 2026.*UTC/.test(LAST.body.html)));
+    check('the printed reference is the invoice number, not the sequential id', () =>
+      assert.ok(LAST.body.html.includes('K7QM-3XR9') && !/#10/.test(LAST.body.html)));
+    check('the subject line carries it too', () =>
+      assert.ok(LAST.body.subject.includes('K7QM-3XR9')));
+    check('subtotal, coupon, fee and total are all shown', () => {
+      const h = LAST.body.html;
+      assert.ok(h.includes('$20.00'), 'subtotal');
+      assert.ok(h.includes('-$2.00'), 'coupon line');
+      assert.ok(h.includes('$1.80'), 'the cashapp fee, as the gap between the two');
+      assert.ok(h.includes('$19.80'), 'total');
+    });
+    check('there is a Discord button, pointing at the configured invite', () =>
+      assert.ok(/<a href="https:\/\/discord\.gg\/example"[^>]*>Join our Discord<\/a>/.test(LAST.body.html)));
+    check('and it says what to bring to claim the customer role', () =>
+      assert.ok(/Claim your customer role/.test(LAST.body.html)));
+
+    await checkAsync('an order with no invoice number still shows something usable', async () => {
+      await sendOrderConfirmation({ ...order, invoice_no: null }, goods);
+      assert.ok(LAST.body.html.includes('#10'));
+    });
+    // A pre-existing order predates the split columns: its duration is inside
+    // the collapsed name and there is nothing to put in the term column.
+    await checkAsync('a legacy items_snapshot without split columns still renders', async () => {
+      await sendOrderConfirmation(
+        { ...order, items_snapshot: [{ id: 'x', name: 'Ancient (Day)', qty: 1, price: 5 }] }, goods);
+      assert.ok(LAST.body.html.includes('Ancient (Day)'));
+    });
+    await checkAsync('a JSON string items_snapshot is parsed, not printed', async () => {
+      await sendOrderConfirmation({ ...order, items_snapshot: JSON.stringify(order.items_snapshot) }, goods);
+      assert.ok(LAST.body.html.includes('$2.50') && !LAST.body.html.includes('items_snapshot'));
+    });
+    delete process.env.DISCORD_INVITE_URL;
+  }
+
   console.log('\n=== address parsing ===');
   {
     const m = fresh();

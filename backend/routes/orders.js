@@ -5,6 +5,7 @@ const { query, withTransaction } = require('../db');
 const { generateNote } = require('../utils/noteGenerator');
 const { generateCryptoAddress, registerWebhook, quoteCrypto } = require('../utils/cryptoUtils');
 const { notifyBot } = require('../utils/botNotify');
+const { invoiceNo, normalizeInvoiceNo } = require('../utils/invoiceNo');
 const { attachUser, requireAuth, requireAdmin, requireDiscordLinked, botAuthorized, botAuthUnavailable } = require('../utils/auth');
 const { safeCompare } = require('../utils/rateLimit');
 const {
@@ -78,9 +79,16 @@ async function repriceItems(items, { paidFromBalance, discountPercent }) {
       const cents = discountBp
         ? Math.round((listCents * (10000 - discountBp)) / 10000)
         : listCents;
+      // product_name and label are carried SEPARATELY as well as jammed into
+      // `name`. items_snapshot is what every receipt renders from, and with only
+      // the collapsed string a confirmation could not say which subscription
+      // duration was bought without re-parsing "Ancient (Day)" back apart.
+      // `name` stays for the callers (and stored orders) that already read it.
       out.push({
         id, qty,
         name: row.label ? `${row.product_name} (${row.label})` : row.product_name,
+        product_name: row.product_name,
+        tier_label: row.label || null,
         price: cents / 100,
         ...(discountBp ? { list_price: listCents / 100 } : {}),
       });
@@ -107,7 +115,7 @@ async function repriceItems(items, { paidFromBalance, discountPercent }) {
     }
     const price = Number(item.price);
     if (!Number.isFinite(price) || price <= 0) return { error: 'Invalid item price' };
-    out.push({ id, qty, name: item.name || 'Item', price });
+    out.push({ id, qty, name: item.name || 'Item', product_name: item.name || 'Item', tier_label: null, price });
   }
   return { items: out, discount_percent: pct, catalogSubtotalCents };
 }
@@ -208,18 +216,24 @@ async function createOrderPriced({ items, email, discord_id, payment_method, web
   // collision is rare but not impossible, and the crypto-address path already
   // retries its own 23505 — the note path never did, so an unlucky customer
   // got a bare 500 with nothing to act on. Retry with a fresh note instead.
+  //
+  // invoice_no rides the same retry. It is the reference printed on receipts
+  // and typed into /claim-customer, and uniq_orders_invoice_no makes a repeat
+  // impossible rather than merely unlikely — a second customer holding the
+  // first one's invoice number could claim against their order.
   let order = null;
   let lastErr = null;
   for (let attempt = 0; attempt < 5; attempt++) {
     const note = generateNote();
     const publicRef = crypto.randomBytes(16).toString('hex');
+    const invNo = invoiceNo();
     try {
       const { rows } = await query(
         `INSERT INTO orders
            (guild_id, web_user_id, email, discord_id, items_snapshot, subtotal_cents, total_cents,
-            payment_method, payment_note, public_ref, coupon_code, coupon_discount_cents,
+            payment_method, payment_note, public_ref, invoice_no, coupon_code, coupon_discount_cents,
             status, created_at, expires_at)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,'waiting', now(), now() + interval '24 hours')
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,'waiting', now(), now() + interval '24 hours')
          RETURNING *`,
         [
           GUILD_ID, web_user_id || null, email, discord_id || null, JSON.stringify(items),
@@ -227,7 +241,7 @@ async function createOrderPriced({ items, email, discord_id, payment_method, web
           // a receipt can show the coupon line instead of an unexplained gap
           // between subtotal and total.
           subtotalCents, totalCents,
-          payment_method, note, publicRef,
+          payment_method, note, publicRef, invNo,
           coupon ? coupon.code : null, discountCents,
         ]
       );
@@ -252,12 +266,20 @@ async function createOrderPriced({ items, email, discord_id, payment_method, web
   // Snapshot line items into order_items when checkout sent real numeric
   // tier ids (the new /api/products-backed catalog); older synthetic slugs
   // from the legacy embedded catalog just skip this without failing.
+  // product_name is the PRODUCT and tier_label is the duration, in their own
+  // columns. This used to write the collapsed "Ancient (Day)" into product_name
+  // and leave tier_label NULL, so the one table that exists specifically to
+  // hold a per-line breakdown could not answer "which duration" without string
+  // surgery — and every receipt built from it said nothing about the term or
+  // the quantity bought.
   for (const item of items) {
     if (!/^\d+$/.test(String(item.id))) continue;
     await query(
-      `INSERT INTO order_items (order_id, guild_id, tier_id, product_name, unit_cents, qty)
-       VALUES ($1,$2,$3,$4,$5,$6)`,
-      [order.id, GUILD_ID, item.id, item.name || 'Item', Math.round((item.price || 0) * 100), item.qty || 1]
+      `INSERT INTO order_items (order_id, guild_id, tier_id, product_name, tier_label, unit_cents, qty)
+       VALUES ($1,$2,$3,$4,$5,$6,$7)`,
+      [order.id, GUILD_ID, item.id,
+       item.product_name || item.name || 'Item', item.tier_label || null,
+       Math.round((item.price || 0) * 100), item.qty || 1]
     ).catch(() => {}); // tier_id may not exist (FK) — non-fatal, items_snapshot is the source of truth
   }
 
@@ -532,6 +554,7 @@ router.post('/create', requireAuth, requireDiscordLinked, async (req, res) => {
     res.json({
       success: true,
       order_id: String(order.id),
+      invoice_no: order.invoice_no || null,
       // Returned exactly once, to whoever created the order. GET /api/orders/:id
       // requires it (or an owning/admin session) — the numeric id alone is not
       // a credential.
@@ -604,6 +627,11 @@ router.get('/admin/user/:userId', requireAdmin, async (req, res) => {
 function formatOrder(data) {
   return {
     order_id: String(data.id),
+    // What the customer is shown and what they type into /claim-customer.
+    // Older rows predate the column; the migration backfills them, but a row
+    // written between deploy and migration would be null, and printing "null"
+    // on a receipt is worse than printing the internal id.
+    invoice_no: data.invoice_no || null,
     status: data.status,
     payment_method: data.payment_method,
     items: data.items_snapshot,
@@ -651,12 +679,26 @@ router.get('/:id', attachUser, async (req, res) => {
       return res.status(404).json({ error: 'Order not found' });
     }
 
+    // The confirmation overlay polls this and then renders the receipt from
+    // it. It used to get four scalars, so the "ORDER CONFIRMED" screen could
+    // only list the collapsed item names it still had in the browser's cart —
+    // no duration, no quantity, no unit price, no date. Everything below is
+    // already the caller's own order: this route is gated on the ref, the
+    // owning session, or staff.
     res.json({
       order_id: String(data.id),
+      invoice_no: data.invoice_no || null,
       status: data.status,
       payment_method: data.payment_method,
+      items: data.items_snapshot,
+      subtotal: data.subtotal_cents / 100,
+      coupon_code: data.coupon_code || null,
+      coupon_discount: (Number(data.coupon_discount_cents) || 0) / 100,
       total: data.total_cents / 100,
+      delivered_goods: data.delivered_goods,
       created_at: data.created_at,
+      paid_at: data.paid_at,
+      delivered_at: data.delivered_at,
       expires_at: data.expires_at,
       delivered: data.status === 'delivered',
     });
@@ -677,9 +719,19 @@ router.post('/verify-claim', async (req, res) => {
     if (!botAuthorized(req)) return res.status(401).json({ error: 'Unauthorized' });
     if (!order_id || !email) return res.status(400).json({ error: 'order_id and email are required' });
 
+    // Customers are now given an invoice number, not the internal id, so that
+    // is what they will type into /claim-customer. The numeric id still works:
+    // every order placed before this existed was confirmed with one, and those
+    // receipts are already in people's inboxes.
+    const invNo = normalizeInvoiceNo(order_id);
+    const numericId = /^\d+$/.test(String(order_id).trim()) ? String(order_id).trim() : null;
+    if (!invNo && !numericId) return res.status(404).json({ error: 'Order not found' });
+
     const { rows } = await query(
-      'SELECT status, email, discord_id FROM orders WHERE id = $1 AND guild_id = $2',
-      [order_id, GUILD_ID]
+      invNo
+        ? 'SELECT id, invoice_no, status, email, discord_id FROM orders WHERE invoice_no = $1 AND guild_id = $2'
+        : 'SELECT id, invoice_no, status, email, discord_id FROM orders WHERE id = $1 AND guild_id = $2',
+      [invNo || numericId, GUILD_ID]
     );
     const order = rows[0];
     if (!order) return res.status(404).json({ error: 'Order not found' });
@@ -687,7 +739,8 @@ router.post('/verify-claim', async (req, res) => {
     const emailMatch = !!order.email && order.email.toLowerCase() === String(email).toLowerCase();
     const isPaid = ['paid', 'delivered'].includes(order.status);
     res.json({
-      order_id: String(order_id),
+      order_id: String(order.id),
+      invoice_no: order.invoice_no || null,
       status: order.status,
       email_match: emailMatch,
       paid: isPaid,

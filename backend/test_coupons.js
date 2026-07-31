@@ -102,8 +102,8 @@ const exec = async (text, params) => {
       id: nextOrderId++, guild_id: params[0], web_user_id: params[1], email: params[2],
       discord_id: params[3], items_snapshot: JSON.parse(params[4]),
       subtotal_cents: params[5], total_cents: params[6], payment_method: params[7],
-      payment_note: params[8], public_ref: params[9],
-      coupon_code: params[10], coupon_discount_cents: params[11],
+      payment_note: params[8], public_ref: params[9], invoice_no: params[10],
+      coupon_code: params[11], coupon_discount_cents: params[12],
       status: 'waiting',
     };
     ORDERS.push(row);
@@ -380,6 +380,11 @@ function reset() {
     // rather than an unexplained gap.
     assert.strictEqual(ORDERS[0].subtotal_cents, 4000);
     assert.strictEqual(ORDERS[0].total_cents, 3300);
+    // The reference the customer is shown and types into /claim-customer. It is
+    // written at INSERT time, not backfilled later, so an order can never exist
+    // without one — the positional map above is what catches a column being
+    // added to the statement without this test noticing.
+    assert.match(ORDERS[0].invoice_no, /^[2-9A-HJ-NP-Z]{4}-[2-9A-HJ-NP-Z]{4}$/);
   });
   await check('the redemption is linked to the order it paid for', () => {
     assert.strictEqual(REDEMPTIONS.length, 1);

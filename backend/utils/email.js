@@ -13,6 +13,7 @@
 
 const { outboundAccount } = require('./mailAccounts');
 const { httpMailer } = require('./mailHttp');
+const { discordInvite } = require('./storeLinks');
 
 let nodemailer = null;
 try { nodemailer = require('nodemailer'); } catch { /* dependency added in package.json */ }
@@ -106,12 +107,77 @@ function storeName_() {
   return process.env.STORE_NAME || 'H8ED Shop';
 }
 
+// A delivered line, with the term and count it was bought under. The heading
+// used to be the bare product name, so a receipt for four months of one thing
+// and one month of another was indistinguishable from two single purchases.
+function goodsHeading(g) {
+  const bits = [escapeHtml(g.product || 'Item')];
+  if (g.tier_label) bits.push(`<span style="color:#0ff;font-weight:400;"> — ${escapeHtml(g.tier_label)}</span>`);
+  if ((g.qty || 1) > 1) bits.push(`<span style="color:#5a7080;font-weight:400;"> ×${escapeHtml(g.qty)}</span>`);
+  return bits.join('');
+}
+
 function renderGoodsHtml(goods) {
   if (!Array.isArray(goods) || !goods.length) return '';
   return goods.map(g => {
-    const items = (g.items || []).map(i => `<div style="font-family:monospace;font-size:13px;color:#0ff;background:#04121a;padding:6px 10px;margin:4px 0;border:1px solid #0ff3;border-radius:4px;">${escapeHtml(i)}</div>`).join('');
-    return `<div style="margin:14px 0;"><div style="font-weight:700;color:#fff;margin-bottom:4px;">${escapeHtml(g.product || 'Item')}</div>${items}</div>`;
+    const items = (g.items || []).map(i => `<div style="font-family:monospace;font-size:13px;color:#0ff;background:#04121a;padding:6px 10px;margin:4px 0;border:1px solid #0ff3;border-radius:4px;word-break:break-all;">${escapeHtml(i)}</div>`).join('');
+    return `<div style="margin:14px 0;"><div style="font-weight:700;color:#fff;margin-bottom:4px;">${goodsHeading(g)}</div>${items}</div>`;
   }).join('');
+}
+
+// The order lines, priced. This is the part the customer asked for and the
+// part the receipt never had: what was bought, for how long, how many, at what
+// each, and what that came to.
+//
+// It renders from items_snapshot, which is the authoritative priced cart the
+// server built — not from delivered_goods, which only knows about lines that
+// produced something deliverable.
+function renderItemsHtml(order) {
+  let items = order && order.items_snapshot;
+  if (typeof items === 'string') { try { items = JSON.parse(items); } catch { items = null; } }
+  if (!Array.isArray(items) || !items.length) return '';
+
+  const rows = items.map(i => {
+    const qty = Number(i.qty) || 1;
+    const unit = Number(i.price) || 0;
+    const name = i.product_name || i.name || 'Item';
+    // Older orders (and legacy synthetic slugs) have no separate label; the
+    // duration is inside the collapsed name and there is nothing to split out.
+    const term = i.tier_label ? escapeHtml(i.tier_label) : '<span style="color:#3d5060;">—</span>';
+    return `<tr>
+      <td style="padding:7px 0;border-bottom:1px solid #0ff1;color:#fff;">${escapeHtml(name)}</td>
+      <td style="padding:7px 6px;border-bottom:1px solid #0ff1;color:#9fb4c7;white-space:nowrap;">${term}</td>
+      <td style="padding:7px 6px;border-bottom:1px solid #0ff1;color:#9fb4c7;text-align:center;">${qty}</td>
+      <td style="padding:7px 6px;border-bottom:1px solid #0ff1;color:#9fb4c7;text-align:right;white-space:nowrap;">${money(unit)}</td>
+      <td style="padding:7px 0;border-bottom:1px solid #0ff1;color:#fff;text-align:right;white-space:nowrap;">${money(unit * qty)}</td>
+    </tr>`;
+  }).join('');
+
+  return `
+  <div style="font-size:12px;color:#5a7080;letter-spacing:1px;margin:18px 0 6px;">ORDER DETAILS</div>
+  <table style="width:100%;font-size:13px;border-collapse:collapse;">
+    <tr>
+      <th style="text-align:left;font-size:11px;color:#5a7080;font-weight:400;padding-bottom:4px;">ITEM</th>
+      <th style="text-align:left;font-size:11px;color:#5a7080;font-weight:400;padding-bottom:4px;">DURATION</th>
+      <th style="text-align:center;font-size:11px;color:#5a7080;font-weight:400;padding-bottom:4px;">QTY</th>
+      <th style="text-align:right;font-size:11px;color:#5a7080;font-weight:400;padding-bottom:4px;">EACH</th>
+      <th style="text-align:right;font-size:11px;color:#5a7080;font-weight:400;padding-bottom:4px;">TOTAL</th>
+    </tr>
+    ${rows}
+  </table>`;
+}
+
+// Written out in full, with the zone named. A receipt dated "31/07/2026" is
+// ambiguous to half the world, and one with no date at all — which is what
+// this was — is useless for a chargeback or a support ticket.
+function orderDate(order) {
+  const raw = (order && (order.paid_at || order.delivered_at || order.created_at)) || null;
+  const d = raw ? new Date(raw) : new Date();
+  if (isNaN(d.getTime())) return '';
+  return d.toLocaleString('en-US', {
+    timeZone: 'UTC', year: 'numeric', month: 'short', day: 'numeric',
+    hour: '2-digit', minute: '2-digit', hour12: true,
+  }) + ' UTC';
 }
 
 function escapeHtml(s) {
@@ -129,7 +195,21 @@ async function sendOrderConfirmation(order, goods) {
 
   const storeName = storeName_();
   const total = (order.total_cents != null ? order.total_cents / 100 : 0);
+  const subtotal = (order.subtotal_cents != null ? order.subtotal_cents / 100 : total);
+  const couponOff = (Number(order.coupon_discount_cents) || 0) / 100;
+  // The gap between subtotal and total is the payment-method fee. Showing the
+  // three numbers separately is the only way a customer can check the figure
+  // they were charged against the one they were quoted.
+  const fee = Math.max(0, Math.round((total - (subtotal - couponOff)) * 100) / 100);
   const goodsHtml = renderGoodsHtml(goods);
+  const itemsHtml = renderItemsHtml(order);
+  const invoice = order.invoice_no || `#${order.id}`;
+  const placed = orderDate(order);
+
+  // Best-effort: a receipt must still send if app_state is unreachable, so the
+  // helper falls back rather than throwing, and this catch is the last resort.
+  let invite = null;
+  try { invite = await discordInvite(); } catch { invite = null; }
 
   const html = `
   <div style="background:#03040a;padding:28px;font-family:Arial,Helvetica,sans-serif;color:#c9d6e5;">
@@ -141,11 +221,22 @@ async function sendOrderConfirmation(order, goods) {
       <div style="padding:22px 24px;">
         <p style="margin:0 0 14px;font-size:14px;">Thank you for your purchase. Your order has been confirmed and delivered.</p>
         <table style="width:100%;font-size:13px;border-collapse:collapse;margin-bottom:8px;">
-          <tr><td style="color:#5a7080;padding:4px 0;">Order ID</td><td style="text-align:right;color:#fff;font-family:monospace;">#${escapeHtml(order.id)}</td></tr>
+          <tr><td style="color:#5a7080;padding:4px 0;">Invoice</td><td style="text-align:right;color:#fff;font-family:monospace;letter-spacing:1px;">${escapeHtml(invoice)}</td></tr>
+          ${placed ? `<tr><td style="color:#5a7080;padding:4px 0;">Date</td><td style="text-align:right;color:#fff;">${escapeHtml(placed)}</td></tr>` : ''}
           <tr><td style="color:#5a7080;padding:4px 0;">Payment</td><td style="text-align:right;color:#fff;">${escapeHtml(String(order.payment_method || '').toUpperCase())}</td></tr>
-          <tr><td style="color:#5a7080;padding:4px 0;">Total</td><td style="text-align:right;color:#0ff;font-weight:700;">${money(total)}</td></tr>
         </table>
-        ${goodsHtml ? `<div style="border-top:1px solid #0ff2;margin-top:12px;padding-top:12px;"><div style="font-size:12px;color:#5a7080;letter-spacing:1px;margin-bottom:6px;">YOUR GOODS</div>${goodsHtml}</div>` : ''}
+        ${itemsHtml}
+        <table style="width:100%;font-size:13px;border-collapse:collapse;margin-top:10px;">
+          <tr><td style="color:#5a7080;padding:3px 0;">Subtotal</td><td style="text-align:right;color:#9fb4c7;">${money(subtotal)}</td></tr>
+          ${couponOff > 0 ? `<tr><td style="color:#5a7080;padding:3px 0;">Coupon${order.coupon_code ? ' ' + escapeHtml(order.coupon_code) : ''}</td><td style="text-align:right;color:#39ff88;">-${money(couponOff)}</td></tr>` : ''}
+          ${fee > 0 ? `<tr><td style="color:#5a7080;padding:3px 0;">${escapeHtml(String(order.payment_method || '').toUpperCase())} fee</td><td style="text-align:right;color:#9fb4c7;">${money(fee)}</td></tr>` : ''}
+          <tr><td style="color:#fff;padding:6px 0 0;font-weight:700;border-top:1px solid #0ff2;">Total</td><td style="text-align:right;color:#0ff;font-weight:700;padding-top:6px;border-top:1px solid #0ff2;">${money(total)}</td></tr>
+        </table>
+        ${goodsHtml ? `<div style="border-top:1px solid #0ff2;margin-top:16px;padding-top:12px;"><div style="font-size:12px;color:#5a7080;letter-spacing:1px;margin-bottom:6px;">YOUR GOODS</div>${goodsHtml}</div>` : ''}
+        ${invite ? `<div style="text-align:center;margin:22px 0 4px;">
+          <a href="${escapeHtml(invite)}" style="display:inline-block;background:#5865F2;color:#fff;text-decoration:none;font-weight:700;font-size:14px;padding:12px 26px;border-radius:6px;">Join our Discord</a>
+          <div style="font-size:11px;color:#5a7080;margin-top:8px;line-height:1.6;">Claim your customer role with invoice <span style="font-family:monospace;color:#0ff;">${escapeHtml(invoice)}</span> and this email address.</div>
+        </div>` : ''}
         <p style="margin:18px 0 0;font-size:12px;color:#5a7080;line-height:1.6;">Keep this email for your records. If you have any issues, open a ticket in our Discord.</p>
       </div>
       <div style="padding:14px 24px;border-top:1px solid #0ff2;font-size:11px;color:#3d5060;text-align:center;">${escapeHtml(storeName)} • Automated confirmation</div>
@@ -156,7 +247,7 @@ async function sendOrderConfirmation(order, goods) {
     await tx.sendMail({
       from: fromHeader(storeName),
       to: order.email,
-      subject: `Order #${order.id} confirmed — ${storeName}`,
+      subject: `Order ${invoice} confirmed — ${storeName}`,
       html,
     });
     console.log(`[Email] Order confirmation sent to ${order.email}`);

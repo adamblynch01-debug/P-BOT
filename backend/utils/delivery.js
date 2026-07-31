@@ -38,6 +38,20 @@ const FAILURE_MARKERS = new Set([
   'CLAIM_ERROR',
 ]);
 
+// What a receipt needs beyond "here is a box of keys": which subscription term
+// was bought, how many, and at what unit price. delivered_goods is the only
+// per-line record the confirmation email, the buyer's DM and the site's order
+// screen all read, and it carried none of that — so a five-line order showed
+// five product names and nothing else. items_snapshot has the numbers; this
+// copies them onto the line they belong to.
+function lineDetail(item) {
+  return {
+    tier_label: (item && item.tier_label) || null,
+    qty: (item && item.qty) || 1,
+    unit_price: item && Number.isFinite(Number(item.price)) ? Number(item.price) : null,
+  };
+}
+
 function collectFailures(deliveredGoods) {
   const failures = [];
   for (const entry of deliveredGoods) {
@@ -91,21 +105,21 @@ async function deliver(order) {
               await raiseAlert('duplicate_topup_credit',
                 `Order ${order.id} tried to credit the wallet twice — blocked`,
                 { severity: 'error', order_id: order.id, context: { credit_cents: credit } });
-              deliveredGoods.push({ product: 'Balance Top-Up', items: ['ALREADY_CREDITED'] });
+              deliveredGoods.push({ product: 'Balance Top-Up', items: ['ALREADY_CREDITED'], ...lineDetail(item) });
               continue;
             }
             if (err && err.noWallet) {
               await raiseAlert('topup_credit_lost',
                 `Order ${order.id} could not be credited $${(credit / 100).toFixed(2)} — no balances row for that user; the credit was rolled back`,
                 { severity: 'error', order_id: order.id, context: { web_user_id: order.web_user_id, credit_cents: credit } });
-              deliveredGoods.push({ product: 'Balance Top-Up', items: ['CREDIT_FAILED'] });
+              deliveredGoods.push({ product: 'Balance Top-Up', items: ['CREDIT_FAILED'], ...lineDetail(item) });
               continue;
             }
             throw err;
           }
-          deliveredGoods.push({ product: 'Balance Top-Up', items: [`+$${(credit / 100).toFixed(2)} credited`] });
+          deliveredGoods.push({ product: 'Balance Top-Up', items: [`+$${(credit / 100).toFixed(2)} credited`], ...lineDetail(item) });
         } else {
-          deliveredGoods.push({ product: 'Balance Top-Up', items: ['NO_ACCOUNT_LINKED'] });
+          deliveredGoods.push({ product: 'Balance Top-Up', items: ['NO_ACCOUNT_LINKED'], ...lineDetail(item) });
         }
         continue;
       }
@@ -118,6 +132,7 @@ async function deliver(order) {
         deliveredGoods.push({
           product: item.name || 'Custom Payment',
           items: [`$${(item.price || 0).toFixed(2)} received — manual fulfillment`],
+          ...lineDetail(item),
         });
         continue;
       }
@@ -126,7 +141,7 @@ async function deliver(order) {
 
       if (!tier) {
         console.error(`[Delivery] Product ${item.id} not found`);
-        deliveredGoods.push({ product: item.name, items: ['PRODUCT_NOT_FOUND'] });
+        deliveredGoods.push({ product: item.name, items: ['PRODUCT_NOT_FOUND'], ...lineDetail(item) });
         continue;
       }
 
@@ -167,9 +182,9 @@ async function deliver(order) {
             claimed.push('CLAIM_ERROR');
           }
         }
-        deliveredGoods.push({ product: tier.product_name, items: claimed });
+        deliveredGoods.push({ product: tier.product_name, items: claimed, ...lineDetail(item), tier_label: item.tier_label || tier.label || null });
       } else {
-        deliveredGoods.push({ product: tier.product_name, items: ['MANUAL_DELIVERY_REQUIRED'] });
+        deliveredGoods.push({ product: tier.product_name, items: ['MANUAL_DELIVERY_REQUIRED'], ...lineDetail(item), tier_label: item.tier_label || tier.label || null });
       }
     }
 
@@ -208,6 +223,10 @@ async function deliver(order) {
     // depends on this resolving. Its result was never inspected either.
     notifyBot('deliver_goods', {
       order_id: order.id,
+      // The reference the buyer is shown everywhere else. Without it the DM
+      // that hands over the keys is the one place quoting an id the customer
+      // cannot use for anything.
+      invoice_no: order.invoice_no || null,
       email: order.email,
       discord_id: order.discord_id,
       goods: deliveredGoods,

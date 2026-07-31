@@ -74,9 +74,13 @@ const exec = async (text, params) => {
     if (r) { r.image_url = params[0]; r.image_data = params[1]; r.image_mime = params[2]; }
     return { rows: [] };
   }
-  if (/SELECT image_data, image_mime, approved FROM reviews/.test(t)) {
+  if (/SELECT image_data, image_mime, approved/.test(t) && /FROM reviews/.test(t)) {
     const r = REVIEWS.find(x => String(x.id) === String(params[0]) && x.image_data != null);
-    return { rows: r ? [{ image_data: r.image_data, image_mime: r.image_mime, approved: r.approved }] : [] };
+    return {
+      rows: r
+        ? [{ image_data: r.image_data, image_mime: r.image_mime, approved: r.approved, web_user_id: r.web_user_id || null }]
+        : [],
+    };
   }
   if (/UPDATE reviews SET approved/.test(t)) {
     const r = REVIEWS.find(x => String(x.id) === String(params[1]));

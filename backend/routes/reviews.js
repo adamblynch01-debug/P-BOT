@@ -4,6 +4,7 @@ const router = express.Router();
 const { query } = require('../db');
 const { requireAuth, requireAdmin, getSessionUser, bearerToken, botAuthorized, botAuthUnavailable, discordLinked } = require('../utils/auth');
 const { notifyBot } = require('../utils/botNotify');
+const { decodeImageDataUrl } = require('../utils/imageUpload');
 
 const GUILD_ID = process.env.GUILD_ID;
 
@@ -14,6 +15,14 @@ const REVIEW_COLS = `id, guild_id, web_user_id, display_name, product_id, rating
                      image_mime, (image_data IS NOT NULL) AS has_image`;
 
 const MAX_IMAGE_BYTES = 8 * 1024 * 1024;
+
+// A customer's own upload is held to a tighter budget than a Discord CDN fetch:
+// the storefront downscales before sending, so anything near this ceiling is
+// either an unresized phone photo or someone probing. It is the decoded size —
+// the base64 body carrying it is a third larger again, which is what BODY_LIMIT
+// below has to allow for.
+const MAX_UPLOAD_BYTES = 4 * 1024 * 1024;
+const BODY_LIMIT = '6mb';
 
 // Pull the picture down once, at sync time, instead of pointing the storefront
 // at Discord's CDN. Those URLs are signed and expire within the day, so a
@@ -107,11 +116,25 @@ router.get('/', async (req, res) => {
 });
 
 // ─── POST /api/reviews ───────────────────────────────────
-router.post('/', requireAuth, async (req, res) => {
+// This route parses its own body: server.js exempts it from the global 100kb
+// express.json() so a screenshot can come with the review in one request.
+// Doing it in one request is the point — a vouch that reaches #vouches without
+// the picture the customer attached, because the image was a second call that
+// arrived late, is worse than no picture at all.
+// requireAuth runs BEFORE the parser on purpose. It reads only the bearer
+// header, so it needs no body — and putting it first means an anonymous caller
+// cannot make the process buffer six megabytes before being told to log in.
+router.post('/', requireAuth, express.json({ limit: BODY_LIMIT }), async (req, res) => {
   try {
-    const { rating, body, product_id } = req.body;
+    const { rating, body, product_id, image } = req.body;
     const r = parseInt(rating, 10);
     if (!r || r < 1 || r > 5) return res.status(400).json({ error: 'rating must be 1-5' });
+
+    // Rejected before anything is written: a review saved without the image the
+    // customer chose, with a warning they never see, reads as the upload having
+    // silently failed — which is exactly what they would then report as a bug.
+    const img = decodeImageDataUrl(image, MAX_UPLOAD_BYTES);
+    if (img.error) return res.status(400).json({ error: img.error });
 
     // A vouch from an account whose Discord is verified goes live immediately
     // and posts itself to #vouches — that account belongs to a real member who
@@ -121,19 +144,24 @@ router.post('/', requireAuth, async (req, res) => {
     const live = discordLinked(req.user);
 
     const { rows } = await query(
-      `INSERT INTO reviews (guild_id, web_user_id, display_name, product_id, rating, body, source, discord_id, approved)
-       VALUES ($1,$2,$3,$4,$5,$6,'website',$7,$8) RETURNING ${REVIEW_COLS}`,
+      `INSERT INTO reviews (guild_id, web_user_id, display_name, product_id, rating, body, source, discord_id, approved,
+                            image_data, image_mime)
+       VALUES ($1,$2,$3,$4,$5,$6,'website',$7,$8,$9,$10) RETURNING ${REVIEW_COLS}`,
       [GUILD_ID, req.user.id, req.user.username, product_id || null, r, body || null,
-       req.user.discord_id || null, live]
+       req.user.discord_id || null, live, img.data || null, img.mime || null]
     );
-    if (live) postVouchToDiscord(rows[0]);
+    // image_url stays null for an upload: there is no upstream link to retry,
+    // our own copy IS the original. imageSrc() falls back to image_url only
+    // when we have no bytes, so it resolves to our endpoint either way.
+    if (live) postVouchToDiscord(rows[0], imageSrc(req, rows[0]));
     res.json({
       success: true,
       approved: live,
       // The storefront says either "thanks, it's live" or "thanks, it's waiting
       // for review" — guessing wrong in either direction reads as a bug.
       pending: !live,
-      review: { ...rows[0], id: String(rows[0].id) },
+      image_stored: !!img.data,
+      review: { ...rows[0], id: String(rows[0].id), image: imageSrc(req, rows[0]) },
     });
   } catch (err) {
     console.error('[Reviews] Create error:', err);
@@ -148,22 +176,34 @@ router.post('/', requireAuth, async (req, res) => {
 router.get('/:id/image', async (req, res) => {
   try {
     const { rows } = await query(
-      `SELECT image_data, image_mime, approved FROM reviews
+      `SELECT image_data, image_mime, approved, web_user_id FROM reviews
        WHERE id = $1 AND guild_id = $2 AND image_data IS NOT NULL`,
       [req.params.id, GUILD_ID]
     );
     if (!rows.length) return res.status(404).end();
     if (!rows[0].approved) {
-      // Staff still need to see the picture they are being asked to publish,
-      // so the moderation queue can load it — nobody else can.
+      // Staff still need to see the picture they are being asked to publish, so
+      // the moderation queue can load it. So does the customer who just
+      // uploaded it — their own submission showing a broken image while it
+      // waits for approval looks like the upload failed. Nobody else can.
       const user = await getSessionUser(bearerToken(req));
-      if (!(botAuthorized(req) || (user && ['admin', 'staff'].includes(user.role)))) {
+      const owner = user && rows[0].web_user_id && String(user.id) === String(rows[0].web_user_id);
+      if (!(botAuthorized(req) || owner || (user && ['admin', 'staff'].includes(user.role)))) {
         return res.status(404).end();
       }
     }
-    // The bytes for a given review id never change, so this can be cached hard.
+    // The bytes for a given review id never change, so an approved one can be
+    // cached hard. An unapproved one must NOT be: this response depends on who
+    // asked, and a shared cache handed the staff-or-owner copy would serve it
+    // to everyone from then on.
     res.set('Content-Type', rows[0].image_mime || 'image/png');
-    res.set('Cache-Control', 'public, max-age=31536000, immutable');
+    res.set('Cache-Control', rows[0].approved
+      ? 'public, max-age=31536000, immutable'
+      : 'private, no-store');
+    // Belt and braces with the signature check in utils/imageUpload.js: the
+    // stored mime is derived from the file's own magic bytes, and this stops a
+    // browser second-guessing it back into something executable.
+    res.set('X-Content-Type-Options', 'nosniff');
     res.send(rows[0].image_data);
   } catch (err) {
     res.status(500).end();

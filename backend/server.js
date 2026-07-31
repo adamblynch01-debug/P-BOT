@@ -83,7 +83,26 @@ app.use(cors({
 }));
 
 app.options('*', cors());
-app.use(express.json());
+
+// Everything is JSON, and everything is small — express.json()'s default 100kb
+// ceiling is deliberate: it is the cheapest brake there is on a request that
+// would otherwise buffer arbitrary megabytes into memory before any auth check
+// runs. Exactly one endpoint has to carry more than that, because a customer's
+// review can have a screenshot attached, so it parses its own body with its own
+// limit (routes/reviews.js) and this parser stands aside for it. Adding a route
+// here is a deliberate act; raising the global limit instead would hand every
+// unauthenticated endpoint on the API the same allowance.
+const BIG_BODY_ROUTES = [{ method: 'POST', path: '/api/reviews' }];
+const jsonParser = express.json();
+app.use((req, res, next) => {
+  // '/api/reviews/' and '/api/reviews' are the same endpoint to the router, so
+  // they have to be the same endpoint to this test — otherwise a trailing slash
+  // silently reinstates the 100kb limit and the upload fails with a 413 that
+  // points at nothing.
+  const path = req.path.length > 1 ? req.path.replace(/\/+$/, '') : req.path;
+  if (BIG_BODY_ROUTES.some(r => r.method === req.method && r.path === path)) return next();
+  return jsonParser(req, res, next);
+});
 
 // ─── Routes ─────────────────────────────────────────────
 app.use('/api/orders',   require('./routes/orders'));
