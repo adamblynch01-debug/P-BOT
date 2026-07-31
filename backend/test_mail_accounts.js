@@ -67,6 +67,9 @@ function check(name, cond) {
 // make a later one pass for the wrong reason.
 const MAIL_VARS = [
   'GMAIL_USER', 'GMAIL_PASSWORD', 'MAIL_PROVIDER',
+  'UHSERVICES_GMAIL_USER', 'UHSERVICES_GMAIL_PASSWORD',
+  'PAYPAL_GMAIL_USER', 'PAYPAL_GMAIL_PASSWORD',
+  'CASHAPP_GMAIL_USER', 'CASHAPP_GMAIL_PASSWORD',
   'SMTP_HOST', 'SMTP_PORT', 'SMTP_SECURE', 'SMTP_USER', 'SMTP_PASSWORD', 'SMTP_FROM',
   'PAYPAL_IMAP_USER', 'PAYPAL_IMAP_PASSWORD', 'PAYPAL_IMAP_PROVIDER', 'PAYPAL_IMAP_HOST', 'PAYPAL_IMAP_PORT', 'PAYPAL_IMAP_AUTHSERV',
   'CASHAPP_IMAP_USER', 'CASHAPP_IMAP_PASSWORD', 'CASHAPP_IMAP_PROVIDER', 'CASHAPP_IMAP_HOST', 'CASHAPP_IMAP_PORT', 'CASHAPP_IMAP_AUTHSERV',
@@ -127,6 +130,48 @@ function run() {
       ca.authservMarker === 'compauth=' && !ca.authservId);
     check('the Outlook inbox dials outlook.office365.com', ca.host === 'outlook.office365.com');
   }
+
+  console.log('\n=== three Gmail logins, the short names ===');
+  setEnv({
+    UHSERVICES_GMAIL_USER: 'store@uhservices.xyz', UHSERVICES_GMAIL_PASSWORD: 'app-pw-1',
+    PAYPAL_GMAIL_USER: 'paypal.uh@gmail.com', PAYPAL_GMAIL_PASSWORD: 'app-pw-2',
+    CASHAPP_GMAIL_USER: 'cashapp.uh@gmail.com', CASHAPP_GMAIL_PASSWORD: 'app-pw-3',
+  });
+  {
+    const out = outboundAccount();
+    check('outbound takes the UHSERVICES pair', out.user === 'store@uhservices.xyz');
+    // The Workspace case: the address ends in a custom domain, so guessing from
+    // it would say "custom" and dial localhost. GMAIL in the variable name is
+    // the only thing that gets this right.
+    check('a Workspace address on a custom domain is still Gmail', out.provider === 'gmail');
+    check('and so uses the gmail service, not a made-up host',
+      out.transport.service === 'gmail' && !out.transport.host);
+
+    const inbound = inboundAccounts();
+    check('three logins mean two watched inboxes', inbound.length === 2);
+    const pp = inbound.find(a => a.methods.includes('paypal'));
+    const ca = inbound.find(a => a.methods.includes('cashapp'));
+    check('PayPal and Cash App are on separate connections',
+      pp.user !== ca.user && pp.methods.length === 1 && ca.methods.length === 1);
+    check('neither inbox is the outbound mailbox',
+      pp.user !== 'store@uhservices.xyz' && ca.user !== 'store@uhservices.xyz');
+    check('both still check Google\'s authserv-id',
+      pp.authservId === 'mx.google.com' && ca.authservId === 'mx.google.com');
+    check('both dial imap.gmail.com:993',
+      pp.host === 'imap.gmail.com' && ca.host === 'imap.gmail.com' && pp.port === 993);
+  }
+
+  // A username with no password (or the reverse) must not silently borrow the
+  // other family's half — that produces an auth failure no log line explains.
+  console.log('\n=== a half-set pair is refused, not mixed ===');
+  setEnv({ PAYPAL_GMAIL_USER: 'paypal.uh@gmail.com', GMAIL_USER: 'old@gmail.com', GMAIL_PASSWORD: 'old-pw' });
+  {
+    const a = imapAccountFor('paypal');
+    check('a user with no password falls through to the complete pair', a.user === 'old@gmail.com');
+  }
+  setEnv({ UHSERVICES_GMAIL_PASSWORD: 'pw', SMTP_USER: 'store@outlook.com', SMTP_PASSWORD: 'pw2' });
+  check('a password with no user does not hijack the next family\'s user',
+    outboundAccount().user === 'store@outlook.com');
 
   console.log('\n=== provider detection ===');
   check('gmail.com', providerFromAddress('a@gmail.com') === 'gmail');

@@ -12,6 +12,20 @@
 // GMAIL_* pair, so a deployment that sets nothing new keeps working exactly as
 // before; set only the ones you want to split off.
 //
+// THREE GMAIL LOGINS — the short way, and the one this store uses:
+//
+//     UHSERVICES_GMAIL_USER / UHSERVICES_GMAIL_PASSWORD   outbound store mail
+//     PAYPAL_GMAIL_USER     / PAYPAL_GMAIL_PASSWORD       PayPal inbox
+//     CASHAPP_GMAIL_USER    / CASHAPP_GMAIL_PASSWORD      Cash App inbox
+//
+// Those six are enough on their own: naming Gmail in the variable pins the
+// provider, so the host, the port and the DMARC verdict to trust are all filled
+// in — including for a Google Workspace address on a custom domain, which the
+// address alone cannot be recognised from.
+//
+// The generic forms below still work and are what to use for anything that is
+// NOT Gmail:
+//
 //   OUTBOUND (order confirmations + 2FA codes)
 //     SMTP_HOST, SMTP_PORT, SMTP_SECURE, SMTP_USER, SMTP_PASSWORD, SMTP_FROM
 //     or MAIL_PROVIDER=gmail|outlook to fill host/port for you
@@ -23,6 +37,9 @@
 //     PAYPAL_IMAP_HOST      CASHAPP_IMAP_HOST       (only for custom)
 //     PAYPAL_IMAP_PORT      CASHAPP_IMAP_PORT       (only for custom)
 //     PAYPAL_IMAP_AUTHSERV  CASHAPP_IMAP_AUTHSERV   (only for custom)
+//
+// Every Gmail login here needs an APP PASSWORD, not the account password —
+// Google rejects the real password on IMAP and SMTP.
 //
 // NOTE on the provider: it is not cosmetic. The watcher decides whether an
 // email is genuinely from PayPal by reading the DMARC verdict the RECEIVING
@@ -57,6 +74,24 @@ function env(name) {
   return v && String(v).trim() ? String(v).trim() : null;
 }
 
+// Credentials are resolved as a PAIR, never variable by variable. Falling back
+// independently would let a half-configured mailbox pick up one family's
+// username and another family's password — a login that fails authentication
+// for a reason no log line explains. `families` is tried in order; the first
+// one whose user AND password are both set wins, and its name comes back so the
+// caller can tell whether Gmail was named explicitly.
+function credentialPair(families) {
+  for (const f of families) {
+    const user = env(f.user);
+    const pass = env(f.pass);
+    if (user && pass) return { user, pass, family: f.name };
+    if (user || pass) {
+      console.warn(`[MailAccounts] ${f.user} and ${f.pass} must BOTH be set — ignoring the half that is`);
+    }
+  }
+  return null;
+}
+
 // Guess from the address so a single-provider setup needs no PROVIDER var.
 function providerFromAddress(address) {
   const dom = String(address || '').split('@')[1] || '';
@@ -70,11 +105,20 @@ function providerFromAddress(address) {
 // Returns a nodemailer transport config plus the From address, or null when
 // nothing is configured (sending is then skipped, as it always was).
 function outboundAccount() {
-  const user = env('SMTP_USER') || env('GMAIL_USER');
-  const pass = env('SMTP_PASSWORD') || env('GMAIL_PASSWORD');
-  if (!user || !pass) return null;
+  const cred = credentialPair([
+    { name: 'gmail', user: 'UHSERVICES_GMAIL_USER', pass: 'UHSERVICES_GMAIL_PASSWORD' },
+    { name: 'smtp', user: 'SMTP_USER', pass: 'SMTP_PASSWORD' },
+    { name: 'gmail', user: 'GMAIL_USER', pass: 'GMAIL_PASSWORD' },
+  ]);
+  if (!cred) return null;
+  const { user, pass } = cred;
 
-  const name = env('MAIL_PROVIDER') || providerFromAddress(user) || 'custom';
+  // A variable with GMAIL in its name settles the provider outright. Guessing
+  // from the address cannot: a Google Workspace mailbox is store@uhservices.xyz,
+  // which looks like a custom host and would otherwise be dialled as one.
+  // MAIL_PROVIDER still wins, so an explicit override is never overruled.
+  const name = env('MAIL_PROVIDER') || (cred.family === 'gmail' ? 'gmail' : null)
+    || providerFromAddress(user) || 'custom';
   const preset = PROVIDERS[name] || {};
   const host = env('SMTP_HOST') || preset.smtpHost || null;
   const port = Number(env('SMTP_PORT') || preset.smtpPort || 587);
@@ -97,13 +141,19 @@ function outboundAccount() {
 // would open two IMAP sessions to one mailbox and fetch every message twice.
 function imapAccountFor(method) {
   const P = method === 'paypal' ? 'PAYPAL' : 'CASHAPP';
-  const user = env(P + '_IMAP_USER') || env('GMAIL_USER');
-  const password = env(P + '_IMAP_PASSWORD') || env('GMAIL_PASSWORD');
-  if (!user || !password) return null;
+  const cred = credentialPair([
+    { name: 'gmail', user: P + '_GMAIL_USER', pass: P + '_GMAIL_PASSWORD' },
+    { name: 'imap', user: P + '_IMAP_USER', pass: P + '_IMAP_PASSWORD' },
+    { name: 'gmail', user: 'GMAIL_USER', pass: 'GMAIL_PASSWORD' },
+  ]);
+  if (!cred) return null;
+  const { user, pass: password } = cred;
 
-  // An explicit provider wins; otherwise guess from the address; otherwise, if
-  // this is the inherited GMAIL_* pair, it is Gmail by definition.
-  const name = env(P + '_IMAP_PROVIDER') || providerFromAddress(user) || 'custom';
+  // An explicit provider wins; then GMAIL in the variable name, which is the
+  // only signal that survives a Workspace address on a custom domain; then the
+  // address itself. Getting this wrong is not cosmetic — see the note above.
+  const name = env(P + '_IMAP_PROVIDER') || (cred.family === 'gmail' ? 'gmail' : null)
+    || providerFromAddress(user) || 'custom';
   const preset = PROVIDERS[name] || {};
 
   return {

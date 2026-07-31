@@ -37,14 +37,14 @@ const app = express();
     const inbound = inboundAccounts();
     if (!inbound.length) {
       console.warn('[Startup] no payment mailbox configured — the email payment watcher cannot start ' +
-        '(set PAYPAL_IMAP_USER/_PASSWORD and CASHAPP_IMAP_USER/_PASSWORD, or the GMAIL_USER/GMAIL_PASSWORD pair)');
+        '(set PAYPAL_GMAIL_USER/_PASSWORD and CASHAPP_GMAIL_USER/_PASSWORD, or the GMAIL_USER/GMAIL_PASSWORD pair)');
     } else {
       // Names and routing only. The addresses themselves are never logged.
       console.log(`[Startup] payment mailboxes: ${inbound.map(a => `${a.methods.join('+')} via ${a.provider}`).join(', ')}`);
     }
     if (!outboundAccount()) {
       console.warn('[Startup] no outbound mail account — order confirmations and email 2FA codes will not send ' +
-        '(set SMTP_USER/SMTP_PASSWORD, or the GMAIL_USER/GMAIL_PASSWORD pair)');
+        '(set UHSERVICES_GMAIL_USER/_PASSWORD, or the GMAIL_USER/GMAIL_PASSWORD pair)');
     }
   } catch (e) {
     console.warn('[Startup] mail account check failed:', e.message);
