@@ -1,7 +1,7 @@
 const express = require('express');
 const router = express.Router();
 const { query } = require('../db');
-const { requireAuth } = require('../utils/auth');
+const { requireAuth, botAuthorized, botAuthUnavailable } = require('../utils/auth');
 
 const GUILD_ID = process.env.GUILD_ID;
 
@@ -122,6 +122,125 @@ router.get('/', requireAuth, async (req, res) => {
     res.json({ downloads: out });
   } catch (err) {
     res.status(500).json({ error: 'Failed to list downloads' });
+  }
+});
+
+// ─── Bot-authenticated link table ───────────────────────
+//
+// The Discord bot kept its OWN copy of the download links: a hardcoded list of
+// 62 products in modules/downloads.js, overridden from download_urls.json next
+// to the code. Two problems, both of which this closes.
+//
+//   1. It was a second source of truth. A link updated in the site's Downloads
+//      Manager did not reach /downloads in Discord, and /setdownload did not
+//      reach the site. Same product, two answers, and no way to tell which was
+//      current.
+//   2. That JSON file sits on the container filesystem, which Railway replaces
+//      on every deploy. Unless DATA_DIR points at a mounted volume, every link
+//      set with /setdownload was lost at the next push — "those links should be
+//      stored aswell".
+//
+// Both sides now read and write the same app_state row the website already
+// used, keyed by the catalog product NAME so the two vocabularies line up.
+//
+// The link table is admin-only over a session (see the note at the top of this
+// file); these routes are the bot's equivalent, gated on API_SECRET rather than
+// on a session it does not have.
+function requireBot(req, res, next) {
+  if (botAuthUnavailable()) {
+    return res.status(503).json({ error: 'API_SECRET is not configured on the backend' });
+  }
+  if (!botAuthorized(req)) return res.status(401).json({ error: 'Unauthorized' });
+  next();
+}
+
+async function writeLinkTable(key, table) {
+  await query(
+    `INSERT INTO app_state (guild_id, scope, owner_id, key, value, updated_at)
+     VALUES ($1,'global','',$2,$3, now())
+     ON CONFLICT (guild_id, scope, owner_id, key)
+     DO UPDATE SET value = $3, updated_at = now()`,
+    [GUILD_ID, key, JSON.stringify(table)]
+  );
+}
+
+// ─── GET /api/downloads/bot/all ─────────────────────────
+// The whole table, links included — this is the bot, which already holds
+// API_SECRET, and it needs the URLs to hand out in #downloads.
+//
+// Two segments, so it cannot collide with GET /:name above no matter which is
+// registered first.
+router.get('/bot/all', requireBot, async (req, res) => {
+  try {
+    const main = await linkTable('ghostDownloads');
+    const vault = await linkTable('ghostVaultDownloads');
+
+    const out = [];
+    const push = (name, entry, isVault) => {
+      if (!entry || typeof entry !== 'object') return;
+      out.push({
+        name,
+        link: entry.link || '',
+        version: entry.version || null,
+        updated: entry.updated || null,
+        instructions: entry.instructions || null,
+        vault: !!isVault,
+      });
+    };
+    for (const [name, entry] of Object.entries(main)) push(name, entry, false);
+    // Vault entries are stored under a 'vault_' prefixed key by the admin
+    // panel. The prefix is a storage detail, not part of the product name, so
+    // it is stripped here rather than leaking into the Discord dropdown.
+    for (const [key, entry] of Object.entries(vault)) {
+      push(key.startsWith('vault_') ? key.slice(6) : key, entry, true);
+    }
+    res.json({ downloads: out });
+  } catch (err) {
+    console.error('[Downloads] bot list error:', err);
+    res.status(500).json({ error: 'Failed to read download table' });
+  }
+});
+
+// ─── POST /api/downloads/bot/set ────────────────────────
+// /setdownload in Discord writes here, so the site sees the new link
+// immediately and it survives the next deploy.
+router.post('/bot/set', requireBot, async (req, res) => {
+  try {
+    const name = String((req.body && req.body.name) || '').trim();
+    if (!name) return res.status(400).json({ error: 'A product name is required' });
+
+    let link = String((req.body && req.body.link) || '').trim();
+    // An empty link is how a link is REMOVED — the entry stays so the product
+    // keeps its version/instructions, but /api/downloads/:name will 404 it,
+    // which is the same thing the admin panel's blank field does.
+    if (link && !/^https?:\/\//i.test(link)) link = 'https://' + link;
+    if (link && link.length > 2000) return res.status(400).json({ error: 'That link is too long' });
+
+    const isVault = !!(req.body && req.body.vault);
+    const key = isVault ? 'ghostVaultDownloads' : 'ghostDownloads';
+    const storeKey = isVault ? `vault_${name}` : name;
+
+    const table = await linkTable(key);
+    const prev = (table[storeKey] && typeof table[storeKey] === 'object') ? table[storeKey] : {};
+
+    table[storeKey] = {
+      ...prev,
+      link,
+      // Only overwrite the fields the caller actually sent. /setdownload sets
+      // the URL and nothing else, and blanking someone's carefully written
+      // install instructions as a side effect is not what they asked for.
+      version: req.body.version != null ? String(req.body.version).slice(0, 100) : (prev.version || 'v1.0.0'),
+      instructions: req.body.instructions != null
+        ? String(req.body.instructions).slice(0, 4000)
+        : (prev.instructions || ''),
+      updated: new Date().toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' }),
+    };
+
+    await writeLinkTable(key, table);
+    res.json({ success: true, name, vault: isVault, entry: table[storeKey] });
+  } catch (err) {
+    console.error('[Downloads] bot set error:', err);
+    res.status(500).json({ error: 'Failed to save download link' });
   }
 });
 
