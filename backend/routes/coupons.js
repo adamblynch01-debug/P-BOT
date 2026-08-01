@@ -7,7 +7,7 @@
 const express = require('express');
 const router = express.Router();
 const { query } = require('../db');
-const { requireAdmin } = require('../utils/auth');
+const { requireAdmin, requireOwnerAdmin } = require('../utils/auth');
 const { CODE_RE } = require('../utils/coupons');
 
 const GUILD_ID = process.env.GUILD_ID;
@@ -176,7 +176,11 @@ router.post('/admin/save', requireAdmin, async (req, res) => {
 // the panel offers "deactivate" as the softer option: an order keeps its own
 // coupon_code snapshot either way, but the audit trail only survives if the
 // coupon does.
-router.post('/admin/delete', requireAdmin, async (req, res) => {
+//
+// requireOwnerAdmin, not requireAdmin — requireAdmin admits role 'staff', and
+// staff are explicitly edit/hide only. Deactivating stays on requireAdmin,
+// because that is the reversible half.
+router.post('/admin/delete', requireOwnerAdmin, async (req, res) => {
   try {
     const id = req.body && req.body.id;
     if (!id) return res.status(400).json({ error: 'id is required' });

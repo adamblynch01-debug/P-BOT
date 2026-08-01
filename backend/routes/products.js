@@ -17,6 +17,23 @@ async function isAuthorizedOrAdmin(req) {
   return !!(user && ['admin', 'staff'].includes(user.role));
 }
 
+// Deletion is the one thing 'staff' must not have.
+//
+// The staff panel is a VIEW of the admin panel with the destructive controls
+// hidden — but a hidden button is not a permission, and the check above admits
+// 'staff' so moderators can edit the catalog. That made DELETE /product/:id and
+// DELETE /:id reachable by any staff account with devtools open, and neither is
+// recoverable from the panel: the first drops a product row, the second drops a
+// price tier along with whatever ordered against it.
+//
+// The bot keeps its API_SECRET path. That is the store's own automation running
+// on a secret no person is handed, not a moderator.
+async function isOwnerAdminOrBot(req) {
+  if (isAuthorized(req)) return true;
+  const user = await getSessionUser(bearerToken(req));
+  return !!(user && user.role === 'admin');
+}
+
 // This API predates the unified schema's products/product_tiers split — the
 // live site's checkout never calls it (it ships its own embedded catalog),
 // so it's kept working but adapted minimally: a "product" here is really a
@@ -225,9 +242,11 @@ router.patch('/product/:id', async (req, res) => {
 });
 
 // ─── DELETE /api/products/product/:id ────────────────────
+// Owner admin (or the bot) only — see isOwnerAdminOrBot. Dropping a product
+// takes its tiers with it.
 router.delete('/product/:id', async (req, res) => {
   try {
-    if (!(await isAuthorizedOrAdmin(req))) return res.status(401).json({ error: 'Unauthorized' });
+    if (!(await isOwnerAdminOrBot(req))) return res.status(403).json({ error: 'Owner admin only' });
     await query('DELETE FROM products WHERE id = $1 AND guild_id = $2', [req.params.id, GUILD_ID]);
     res.json({ success: true });
   } catch (err) {
@@ -286,11 +305,12 @@ router.patch('/:id', async (req, res) => {
 });
 
 // ─── DELETE /api/products/:id ────────────────────────────
-// Deletes a single pricing tier (not the parent product).
+// Deletes a single pricing tier (not the parent product). Owner admin or bot
+// only — a tier is what orders reference.
 router.delete('/:id', async (req, res) => {
   try {
     const { secret } = req.body;
-    if (!(await isAuthorizedOrAdmin(req))) return res.status(401).json({ error: 'Unauthorized' });
+    if (!(await isOwnerAdminOrBot(req))) return res.status(403).json({ error: 'Owner admin only' });
     await query('DELETE FROM product_tiers WHERE id = $1 AND guild_id = $2', [req.params.id, GUILD_ID]);
     res.json({ success: true });
   } catch (err) {

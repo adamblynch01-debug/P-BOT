@@ -69,6 +69,16 @@ async function requireAdminOrBot(req, res, next) {
   return res.status(401).json({ error: 'Unauthorized' });
 }
 
+// Approving and hiding a review are reversible; deleting one is not — the row
+// and its stored image both go. Staff moderate, the owner destroys. The bot
+// keeps its API_SECRET path (store automation, not a moderator).
+async function requireOwnerAdminOrBot(req, res, next) {
+  if (botAuthorized(req)) return next();
+  const user = await getSessionUser(bearerToken(req));
+  if (user && user.role === 'admin') { req.user = user; return next(); }
+  return res.status(403).json({ error: 'Owner admin only' });
+}
+
 // A website vouch is only worth anything to the store if it reaches the
 // #vouches channel, so the post is fired from here rather than left to the
 // admin panel. Sending it is deliberately fire-and-forget: the review is
@@ -254,7 +264,7 @@ router.patch('/:id/approve', requireAdminOrBot, async (req, res) => {
 });
 
 // ─── DELETE /api/reviews/:id ──────────────────────────────
-router.delete('/:id', requireAdminOrBot, async (req, res) => {
+router.delete('/:id', requireOwnerAdminOrBot, async (req, res) => {
   try {
     await query('DELETE FROM reviews WHERE id = $1 AND guild_id = $2', [req.params.id, GUILD_ID]);
     res.json({ success: true });
