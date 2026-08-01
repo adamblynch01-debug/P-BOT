@@ -707,6 +707,20 @@ router.get('/:id', attachUser, async (req, res) => {
   }
 });
 
+// Enough of an address for its owner to recognise it, not enough for anyone
+// else to learn it: first and last character of the local part, full domain.
+// A one-character local part keeps its single character rather than being
+// padded out to look longer than it is.
+function maskEmail(e) {
+  const s = String(e == null ? '' : e).trim();
+  const at = s.lastIndexOf('@');
+  if (at < 1) return null;
+  const local = s.slice(0, at), domain = s.slice(at + 1);
+  const head = local[0];
+  const tail = local.length > 1 ? local[local.length - 1] : '';
+  return `${head}***${tail}@${domain}`;
+}
+
 // ─── POST /api/orders/verify-claim ──────────────────────
 // Secret-gated: SUPERBOT's /claim-customer checks that an order is paid and
 // that the supplied email matches the order on record before granting the
@@ -729,14 +743,49 @@ router.post('/verify-claim', async (req, res) => {
 
     const { rows } = await query(
       invNo
-        ? 'SELECT id, invoice_no, status, email, discord_id FROM orders WHERE invoice_no = $1 AND guild_id = $2'
-        : 'SELECT id, invoice_no, status, email, discord_id FROM orders WHERE id = $1 AND guild_id = $2',
+        ? 'SELECT id, invoice_no, status, email, discord_id, web_user_id FROM orders WHERE invoice_no = $1 AND guild_id = $2'
+        : 'SELECT id, invoice_no, status, email, discord_id, web_user_id FROM orders WHERE id = $1 AND guild_id = $2',
       [invNo || numericId, GUILD_ID]
     );
     const order = rows[0];
     if (!order) return res.status(404).json({ error: 'Order not found' });
 
-    const emailMatch = !!order.email && order.email.toLowerCase() === String(email).toLowerCase();
+    // Every address that belongs to this buyer, not just the one captured at
+    // checkout.
+    //
+    // This used to be a single comparison against orders.email, which is
+    // narrower than the truth. A customer with two addresses — a personal one
+    // used on some orders, the account one on others — types the wrong half of
+    // their own history and gets told their own invoice is not theirs, with no
+    // hint as to which address the order actually carries. It is the same
+    // person either way, so the account behind the order and every other order
+    // that same account (or the same Discord user) has placed all count.
+    //
+    // A guest checkout has neither a web_user_id nor a discord_id, and falls
+    // back to exactly the old behaviour: the order's own address.
+    const norm = s => String(s == null ? '' : s).trim().toLowerCase();
+    const known = new Set();
+    if (order.email) known.add(norm(order.email));
+    if (order.web_user_id) {
+      const { rows: acct } = await query(
+        'SELECT email FROM web_users WHERE id = $1 AND guild_id = $2',
+        [order.web_user_id, GUILD_ID]
+      );
+      if (acct[0] && acct[0].email) known.add(norm(acct[0].email));
+    }
+    if (order.web_user_id || order.discord_id) {
+      // `= NULL` is NULL rather than true, so a null side never widens this.
+      const { rows: siblings } = await query(
+        `SELECT DISTINCT email FROM orders
+          WHERE guild_id = $1 AND email IS NOT NULL
+            AND (web_user_id = $2 OR discord_id = $3)`,
+        [GUILD_ID, order.web_user_id || null, order.discord_id || null]
+      );
+      for (const s of siblings) if (s.email) known.add(norm(s.email));
+    }
+    known.delete('');
+
+    const emailMatch = known.has(norm(email));
     const isPaid = ['paid', 'delivered'].includes(order.status);
     res.json({
       order_id: String(order.id),
@@ -746,6 +795,9 @@ router.post('/verify-claim', async (req, res) => {
       paid: isPaid,
       eligible: emailMatch && isPaid,
       discord_id: order.discord_id || null,
+      // Masked, so a failed attempt can say WHICH address is expected without
+      // handing the address itself to whoever typed the invoice number.
+      email_hint: maskEmail(order.email),
     });
   } catch (err) {
     console.error('[Orders] verify-claim error:', err);
