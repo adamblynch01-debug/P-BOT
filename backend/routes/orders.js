@@ -14,6 +14,23 @@ const {
 
 const GUILD_ID = process.env.GUILD_ID;
 
+// An order has two names and every route that takes an "order id" must accept
+// both. Customers are given an INVOICE NUMBER ("YFTG-25ED"); orders.id is a
+// BIGSERIAL. Feeding the first into `WHERE id = $1` is not a miss — Postgres
+// raises "invalid input syntax for type bigint", the route's catch turns that
+// into a 404, and the reply reads "Order not found" for an order that plainly
+// exists. That is what `/order lookup order_id:YFTG-25ED` was hitting.
+//
+// Returns the column to match on, or null if the string is neither — which is
+// a genuine "no such order" rather than a lookup that was never attempted.
+function orderIdentifier(raw) {
+  const invNo = normalizeInvoiceNo(raw);
+  if (invNo) return { column: 'invoice_no', value: invNo };
+  const s = String(raw == null ? '' : raw).trim();
+  if (/^\d+$/.test(s)) return { column: 'id', value: s };
+  return null;
+}
+
 // Per-line qty ceiling, so a crafted cart can't ask delivery to claim an
 // unbounded number of keys in one order.
 const MAX_ITEM_QTY = 25;
@@ -664,9 +681,12 @@ function formatOrder(data) {
 // status code to confirm that an id exists.
 router.get('/:id', attachUser, async (req, res) => {
   try {
+    const ident = orderIdentifier(req.params.id);
+    if (!ident) return res.status(404).json({ error: 'Order not found' });
+
     const { rows } = await query(
-      'SELECT * FROM orders WHERE id = $1 AND guild_id = $2',
-      [req.params.id, GUILD_ID]
+      `SELECT * FROM orders WHERE ${ident.column} = $1 AND guild_id = $2`,
+      [ident.value, GUILD_ID]
     );
     const data = rows[0];
     if (!data) return res.status(404).json({ error: 'Order not found' });
@@ -675,7 +695,14 @@ router.get('/:id', attachUser, async (req, res) => {
     const refMatches = !!data.public_ref && safeCompare(ref, data.public_ref);
     const isOwner = !!(req.user && data.web_user_id && String(req.user.id) === String(data.web_user_id));
     const isAdmin = !!(req.user && ['admin', 'staff'].includes(req.user.role));
-    if (!refMatches && !isOwner && !isAdmin) {
+    // …and the bot, which holds API_SECRET and has no session to present.
+    // /order lookup is a STAFF command, but it ran as an anonymous request and
+    // so fell through to the same 404 as a stranger enumerating ids — the
+    // command could never have worked once this route was gated. Safe to allow
+    // here because this response never carries the customer's email; that is
+    // why verify-claim exists separately.
+    const isBot = !botAuthUnavailable() && botAuthorized(req);
+    if (!refMatches && !isOwner && !isAdmin && !isBot) {
       return res.status(404).json({ error: 'Order not found' });
     }
 
@@ -842,7 +869,13 @@ router.post('/confirm', async (req, res) => {
       return res.status(401).json({ error: 'Unauthorized' });
     }
 
-    const { rows } = await query('SELECT * FROM orders WHERE id = $1', [order_id]);
+    // Same two names as everywhere else: staff force-confirming from Discord
+    // types whatever they just looked the order up by, and that is now an
+    // invoice number more often than not.
+    const ident = orderIdentifier(order_id);
+    if (!ident) return res.status(404).json({ error: 'Order not found' });
+
+    const { rows } = await query(`SELECT * FROM orders WHERE ${ident.column} = $1`, [ident.value]);
     const order = rows[0];
     if (!order) return res.status(404).json({ error: 'Order not found' });
 
@@ -864,7 +897,9 @@ router.post('/confirm', async (req, res) => {
               provider_txn_id = COALESCE($4, provider_txn_id)
         WHERE id = $5 AND status IN ('waiting', 'underpaid')
         RETURNING *`,
-      [cents, amount_received != null ? amount_received : null, unit, provider_txn_id || null, order_id]
+      // The row is already in hand, so settle on its numeric id — the caller's
+      // spelling of the identifier does not need interpreting twice.
+      [cents, amount_received != null ? amount_received : null, unit, provider_txn_id || null, order.id]
     );
 
     if (!claimed.length) {
