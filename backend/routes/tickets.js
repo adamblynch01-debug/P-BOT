@@ -1,7 +1,7 @@
 const express = require('express');
 const router = express.Router();
 const { query } = require('../db');
-const { requireAuth, requireAdmin, attachUser, botAuthorized, botAuthUnavailable } = require('../utils/auth');
+const { requireAuth, requireAdmin, requireOwnerAdmin, attachUser, botAuthorized, botAuthUnavailable } = require('../utils/auth');
 const { notifyBot } = require('../utils/botNotify');
 
 const GUILD_ID = process.env.GUILD_ID;
@@ -154,6 +154,56 @@ router.get('/', requireAdmin, async (req, res) => {
     });
   } catch (err) {
     res.status(500).json({ error: 'Failed to fetch tickets' });
+  }
+});
+
+// ─── GET /api/tickets/admin/pending-clear ───────────────
+// What CLEAR TICKETS is about to destroy, so the confirmation can name it. An
+// "are you sure?" that cannot say how many OPEN customer tickets are in the
+// pile is not really a question.
+router.get('/admin/pending-clear', requireOwnerAdmin, async (req, res) => {
+  try {
+    const { rows } = await query(
+      `SELECT COUNT(*)::int AS total,
+              COUNT(*) FILTER (WHERE status <> 'closed')::int AS unresolved
+         FROM web_tickets WHERE guild_id = $1`,
+      [GUILD_ID]
+    );
+    res.json({ total: rows[0].total, unresolved: rows[0].unresolved });
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to count tickets' });
+  }
+});
+
+// ─── POST /api/tickets/admin/clear ──────────────────────
+// The admin panel's CLEAR TICKETS button had NO backend at all: it removed a
+// localStorage key called 'ghostTickets' that nothing has read since tickets
+// became real rows, then re-rendered from the API — so the scary confirmation
+// destroyed nothing and the list came back unchanged. Same shape as every
+// other "unconditional success" bug in this codebase: the UI existed, the
+// feature never did.
+//
+// requireOwnerAdmin, not requireAdmin — requireAdmin admits role 'staff', and
+// staff are edit/hide only. web_ticket_messages goes with it by ON DELETE
+// CASCADE (see migrations/tickets.sql).
+//
+// `only_closed` is the default because wiping an OPEN ticket throws away a
+// conversation a paying customer is still waiting on. Passing
+// { only_closed: false } does what the button's warning text says.
+router.post('/admin/clear', requireOwnerAdmin, async (req, res) => {
+  try {
+    const onlyClosed = req.body && req.body.only_closed === false ? false : true;
+    const { rowCount } = await query(
+      onlyClosed
+        ? `DELETE FROM web_tickets WHERE guild_id = $1 AND status = 'closed'`
+        : `DELETE FROM web_tickets WHERE guild_id = $1`,
+      [GUILD_ID]
+    );
+    console.log(`[Tickets] ${req.user.username} cleared ${rowCount} ${onlyClosed ? 'closed ' : ''}ticket(s)`);
+    res.json({ success: true, deleted: rowCount, only_closed: onlyClosed });
+  } catch (err) {
+    console.error('[Tickets] Clear failed:', err.message);
+    res.status(500).json({ error: 'Failed to clear tickets' });
   }
 });
 
