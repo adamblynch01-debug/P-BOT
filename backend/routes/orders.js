@@ -698,13 +698,16 @@ router.get('/:id', attachUser, async (req, res) => {
     // …and the bot, which holds API_SECRET and has no session to present.
     // /order lookup is a STAFF command, but it ran as an anonymous request and
     // so fell through to the same 404 as a stranger enumerating ids — the
-    // command could never have worked once this route was gated. Safe to allow
-    // here because this response never carries the customer's email; that is
-    // why verify-claim exists separately.
+    // command could never have worked once this route was gated.
     const isBot = !botAuthUnavailable() && botAuthorized(req);
     if (!refMatches && !isOwner && !isAdmin && !isBot) {
       return res.status(404).json({ error: 'Order not found' });
     }
+    // Whoever is asking, is it someone acting on the shop's behalf? A customer
+    // holding the ref gets the receipt; staff and the bot get the operational
+    // detail underneath it — who placed it, what was actually received, and
+    // which payment it was matched to.
+    const privileged = isAdmin || isBot;
 
     // The confirmation overlay polls this and then renders the receipt from
     // it. It used to get four scalars, so the "ORDER CONFIRMED" screen could
@@ -712,7 +715,7 @@ router.get('/:id', attachUser, async (req, res) => {
     // no duration, no quantity, no unit price, no date. Everything below is
     // already the caller's own order: this route is gated on the ref, the
     // owning session, or staff.
-    res.json({
+    const payload = {
       order_id: String(data.id),
       invoice_no: data.invoice_no || null,
       status: data.status,
@@ -728,7 +731,35 @@ router.get('/:id', attachUser, async (req, res) => {
       delivered_at: data.delivered_at,
       expires_at: data.expires_at,
       delivered: data.status === 'delivered',
-    });
+    };
+
+    // Staff answering "what happened with my order" need the half of the row
+    // the receipt deliberately leaves out: which account placed it, what was
+    // actually received against what was owed, and which payment it was
+    // matched to. Withheld from a ref-only caller, who is the customer and
+    // already knows who they are.
+    //
+    // NOTE: this is where the email now lives. verify-claim still exists as a
+    // separate secret-gated route because it answers a different question
+    // (does THIS address match) without the caller having to be shown the
+    // address at all.
+    if (privileged) {
+      payload.email = data.email || null;
+      payload.discord_id = data.discord_id || null;
+      payload.web_user_id = data.web_user_id != null ? String(data.web_user_id) : null;
+      payload.fee = (Number(data.fee_cents) || 0) / 100;
+      payload.paid_from_balance = !!data.paid_from_balance;
+      payload.amount_received = data.amount_received_cents != null ? Number(data.amount_received_cents) / 100 : null;
+      payload.amount_received_native = data.amount_received_native != null ? String(data.amount_received_native) : null;
+      payload.amount_received_unit = data.amount_received_unit || null;
+      payload.payment_note = data.payment_note || null;
+      payload.crypto_address = data.crypto_address || null;
+      payload.provider_txn_id = data.provider_txn_id || null;
+      payload.external_ref = data.external_ref || null;
+      payload.payment_info = data.payment_info || null;
+    }
+
+    res.json(payload);
   } catch (err) {
     res.status(404).json({ error: 'Order not found' });
   }
@@ -751,8 +782,10 @@ function maskEmail(e) {
 // ─── POST /api/orders/verify-claim ──────────────────────
 // Secret-gated: SUPERBOT's /claim-customer checks that an order is paid and
 // that the supplied email matches the order on record before granting the
-// Customer role. Kept separate from the public GET /:id (which never exposes
-// the email) so the address is only ever revealed to the trusted bot.
+// Customer role. Kept separate from GET /:id — which does hand the address to
+// staff and to the bot, but never to a caller holding only the public ref —
+// because this route answers "does THIS address match" without the caller
+// needing to be shown the address at all.
 router.post('/verify-claim', async (req, res) => {
   try {
     const { order_id, email } = req.body;
