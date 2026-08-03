@@ -2,6 +2,7 @@ const express = require('express');
 const router = express.Router();
 const { query, withTransaction } = require('../db');
 const { getSessionUser, bearerToken, botAuthorized, botAuthUnavailable } = require('../utils/auth');
+const { queueRestock } = require('../utils/restockNotify');
 const GUILD_ID = process.env.GUILD_ID;
 
 // Bot (secret) and admin panel (logged-in admin/staff session) both manage
@@ -139,14 +140,20 @@ const MAX_STOCK_VALUE_LEN = 512;
 
 // Shared cleaner. Dedupes, because two identical rows for one tier means the
 // same credential can be claimed and sold twice.
-function cleanStockItems(items) {
+//
+// `allowDuplicates` opts OUT of that, and is ONLY correct when the value is not
+// a credential — a placeholder like OPEN-TICKET-IN-DISCORD that tells the buyer
+// to open a ticket carries no secret, so handing the identical string to a
+// hundred buyers is the intended behaviour rather than a double-sale. Under
+// dedupe a hundred identical lines silently became one row, which is what made
+// every manually-fulfilled product read LOW STOCK. Callers must ask for it
+// explicitly; the default stays safe.
+function cleanStockItems(items, allowDuplicates) {
   if (!Array.isArray(items)) return { error: 'items[] must be an array' };
   if (items.length > MAX_STOCK_ITEMS) return { error: `Too many items (max ${MAX_STOCK_ITEMS})` };
-  const clean = Array.from(new Set(
-    items.map(v => String(v == null ? '' : v).trim())
-         .filter(v => v !== '' && v.length <= MAX_STOCK_VALUE_LEN)
-  ));
-  return { clean };
+  const trimmed = items.map(v => String(v == null ? '' : v).trim())
+                       .filter(v => v !== '' && v.length <= MAX_STOCK_VALUE_LEN);
+  return { clean: allowDuplicates ? trimmed : Array.from(new Set(trimmed)) };
 }
 
 // Values already SOLD for this tier. Re-inserting one of these as unused is how
@@ -164,13 +171,16 @@ async function soldValues(tierId) {
 router.post('/add', async (req, res) => {
   try {
     if (!(await isAuthorizedOrAdmin(req))) return res.status(401).json({ error: 'Unauthorized' });
-    const { product_id, items, source } = req.body;
+    const { product_id, items, source, allow_duplicates, announce } = req.body;
     if (!product_id) return res.status(400).json({ error: 'product_id is required' });
 
-    const { clean, error } = cleanStockItems(items);
+    const { clean, error } = cleanStockItems(items, allow_duplicates);
     if (error) return res.status(400).json({ error });
 
-    const sold = await soldValues(product_id);
+    // Same reasoning as the dedupe opt-out: a non-credential placeholder must
+    // stay re-addable after the first one sells, or the tier can never be
+    // restocked with it again.
+    const sold = allow_duplicates ? new Set() : await soldValues(product_id);
     const toInsert = clean.filter(v => !sold.has(v));
     const skipped = clean.length - toInsert.length;
 
@@ -186,6 +196,9 @@ router.post('/add', async (req, res) => {
       tierId: product_id, action: 'add', before, after: before + toInsert.length,
       source, actor: await stockActor(req),
     });
+    // Not awaited — the announcement batches on a timer and must never delay
+    // or fail the restock it is reporting.
+    queueRestock({ tierId: product_id, added: toInsert.length, announce: announce !== false });
     res.json({ success: true, added: toInsert.length, skipped_already_sold: skipped });
   } catch (err) {
     console.error('[Stock] add error:', err);
@@ -200,17 +213,18 @@ router.post('/add', async (req, res) => {
 router.post('/set', async (req, res) => {
   try {
     if (!(await isAuthorizedOrAdmin(req))) return res.status(401).json({ error: 'Unauthorized' });
-    const { product_id, items, source } = req.body;
+    const { product_id, items, source, allow_duplicates, announce } = req.body;
     if (!product_id) return res.status(400).json({ error: 'product_id is required' });
 
-    const { clean, error } = cleanStockItems(items);
+    const { clean, error } = cleanStockItems(items, allow_duplicates);
     if (error) return res.status(400).json({ error });
 
     // Anti-resurrection. The vault admin panel posts the browser's whole mirror
     // of a tier, which still contains every key it ever held — including the
     // ones sold since. Without this filter a routine SAVE re-listed delivered
     // credentials as available, and the stock_log just read like a restock.
-    const sold = await soldValues(product_id);
+    // Bypassed only for explicit non-credential placeholders (see cleanStockItems).
+    const sold = allow_duplicates ? new Set() : await soldValues(product_id);
     const toInsert = clean.filter(v => !sold.has(v));
     const skipped = clean.length - toInsert.length;
     if (skipped) {
@@ -241,6 +255,14 @@ router.post('/set', async (req, res) => {
         before, after: toInsert.length, source, actor: await stockActor(req),
       });
     }
+    // A 'set' is only a restock when it leaves MORE stock than it found. The
+    // panel re-posts a tier's whole key list on every save, so announcing an
+    // unchanged (or reduced) save would advertise a restock that never
+    // happened — and 'clear' would advertise a wipe as good news.
+    queueRestock({
+      tierId: product_id, added: toInsert.length - before,
+      announce: announce !== false,
+    });
     res.json({ success: true, count: toInsert.length, skipped_already_sold: skipped });
   } catch (err) {
     console.error('[Stock] set error:', err);
