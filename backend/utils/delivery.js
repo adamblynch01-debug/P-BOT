@@ -231,6 +231,11 @@ async function deliver(order) {
       discord_id: order.discord_id,
       goods: deliveredGoods,
       needs_attention: failures.length > 0,
+      // So #order-log can say SOURCE: WEBSITE the way the vouch embed already
+      // does. Defaulted here rather than trusted blank: every row that reaches
+      // deliver() came through checkout, and a row written before the column
+      // existed reads NULL.
+      source: order.source || 'website',
     }).catch(() => {});
 
     if (failures.length) {

@@ -679,6 +679,59 @@ function formatOrder(data) {
 //   an admin/staff session
 // Anything else gets 404 — deliberately not 403, so a probe cannot use the
 // status code to confirm that an id exists.
+// ─── GET /api/orders/pending ────────────────────────────
+// Every order still waiting on money, newest first. `/order forceconfirm`
+// needs an id to confirm, and staff answering "I paid, where is my stuff?" in
+// a ticket have no way to find one — the site shows a customer only their OWN
+// orders, and the order-log channel is a firehose. This is the list.
+//
+// It MUST be declared above GET /:id. Express matches in registration order,
+// so below it "pending" would be read as an order identifier, fail to parse as
+// either an invoice number or a BIGSERIAL, and 404 — a route that exists,
+// answering as though it does not.
+router.get('/pending', async (req, res) => {
+  try {
+    if (botAuthUnavailable()) return res.status(503).json({ error: 'Server not configured' });
+    if (!botAuthorized(req)) return res.status(401).json({ error: 'Unauthorized' });
+
+    const limit = Math.max(1, Math.min(25, parseInt(req.query.limit, 10) || 15));
+    const { rows } = await query(
+      `SELECT id, invoice_no, email, discord_id, total_cents, payment_method, payment_note,
+              status, source, created_at, expires_at, items_snapshot
+         FROM orders
+        WHERE guild_id = $1 AND status IN ('waiting','underpaid','needs_attention')
+        ORDER BY created_at DESC
+        LIMIT $2`,
+      [GUILD_ID, limit]
+    );
+    res.json({
+      orders: rows.map(o => {
+        let items = o.items_snapshot;
+        if (typeof items === 'string') { try { items = JSON.parse(items); } catch { items = []; } }
+        return {
+          order_id: String(o.id),
+          invoice_no: o.invoice_no,
+          email: o.email,
+          discord_id: o.discord_id,
+          total: (o.total_cents || 0) / 100,
+          payment_method: o.payment_method,
+          payment_note: o.payment_note,
+          status: o.status,
+          source: o.source || 'website',
+          created_at: o.created_at,
+          expires_at: o.expires_at,
+          summary: (Array.isArray(items) ? items : [])
+            .map(i => `${i.qty || 1}× ${i.product_name || i.name || 'Item'}${i.tier_label ? ` (${i.tier_label})` : ''}`)
+            .join(', ') || '—',
+        };
+      }),
+    });
+  } catch (err) {
+    console.error('[Orders] pending error:', err);
+    res.status(500).json({ error: 'Failed to list pending orders' });
+  }
+});
+
 router.get('/:id', attachUser, async (req, res) => {
   try {
     const ident = orderIdentifier(req.params.id);
@@ -955,6 +1008,238 @@ router.post('/confirm', async (req, res) => {
     }
     console.error('[Orders] Confirm error:', err);
     res.status(500).json({ error: 'Failed to confirm order' });
+  }
+});
+
+// ─── POST /api/orders/manual ────────────────────────────
+// An order that never went through checkout: a key handed over in a ticket, an
+// off-platform payment settled by hand, a replacement for a burned account.
+//
+// Until now those left NO record at all. Staff DM'd the key and that was the
+// end of it — so `/order lookup` could not find it, `/claim-customer` had no
+// invoice to verify against (the buyer could not get the customer role for
+// something they had genuinely paid for), and the order log showed a quiet day.
+// The bot's own /genkey path has the same shape and the same gap.
+//
+// This route writes the same row the storefront writes, differing only in
+// `source = 'manual'`, so every reader downstream — lookup, claim, the site's
+// order list, the receipt email — works on it without knowing it was manual.
+//
+// Two ways to source what is delivered, and NEITHER is optional-by-omission:
+//   • `keys[]`     — staff typed the values. Nothing is taken from inventory.
+//   • `from_stock` — claim `qty` values from product_stock for this tier, with
+//                    the same FOR UPDATE SKIP LOCKED claim the paid path uses,
+//                    so a manual delivery and a real checkout cannot hand out
+//                    the same key.
+// A "delivered" order with nothing in it is a lie the rest of the system would
+// then repeat, so one of the two is required.
+router.post('/manual', async (req, res) => {
+  try {
+    if (botAuthUnavailable()) return res.status(503).json({ error: 'Server not configured' });
+    if (!botAuthorized(req)) return res.status(401).json({ error: 'Unauthorized' });
+
+    const {
+      tier_id, product_name, tier_label, unit_cents,
+      qty, keys, from_stock, discord_id, email, staff_id, note, notify,
+    } = req.body || {};
+
+    const count = Math.max(1, Math.min(MAX_ITEM_QTY, parseInt(qty, 10) || 1));
+    const typed = Array.isArray(keys)
+      ? keys.map(k => String(k == null ? '' : k).trim()).filter(Boolean)
+      : String(keys || '').split(/\r?\n/).map(s => s.trim()).filter(Boolean);
+
+    if (!typed.length && !from_stock) {
+      return res.status(400).json({ error: 'Nothing to deliver — send keys[] or set from_stock' });
+    }
+
+    // The tier is what gives the order a real product name, a price and a
+    // link back into the catalog. It is optional so a one-off ("custom build",
+    // "replacement") can still be recorded, but then the caller must name it.
+    let tier = null;
+    if (tier_id != null && /^\d+$/.test(String(tier_id))) {
+      const { rows } = await query(
+        `SELECT t.*, p.name AS product_name
+           FROM product_tiers t JOIN products p ON p.id = t.product_id
+          WHERE t.id = $1 AND t.guild_id = $2`,
+        [String(tier_id), GUILD_ID]
+      );
+      tier = rows[0] || null;
+      if (!tier) return res.status(404).json({ error: `No product tier ${tier_id}` });
+    }
+
+    const pName = String(product_name || (tier && tier.product_name) || '').trim();
+    if (!pName) return res.status(400).json({ error: 'product_name is required when no tier_id is given' });
+    const label = String(tier_label || (tier && tier.label) || '').trim() || null;
+
+    // Price: what staff said, else the tier's list price, else free. A manual
+    // delivery is often a comp or a replacement, so 0 is a legitimate answer
+    // and is recorded as 0 rather than silently borrowing the list price.
+    const unit = unit_cents != null && Number.isFinite(Number(unit_cents))
+      ? Math.max(0, Math.round(Number(unit_cents)))
+      : (tier ? Math.round(Number(tier.price_cents ?? (Number(tier.price) || 0) * 100) || 0) : 0);
+    const totalCents = unit * count;
+
+    // Claim real inventory only when asked. Done BEFORE the order row exists,
+    // so `order_id` is stamped in a second pass — the alternative (insert the
+    // order, then claim) leaves a delivered order holding OUT_OF_STOCK, which
+    // is the exact failure delivery.js has to raise alerts about.
+    let values = typed;
+    if (from_stock) {
+      if (!tier) return res.status(400).json({ error: 'from_stock needs a tier_id' });
+      const claimed = [];
+      for (let i = 0; i < count; i++) {
+        const { rows } = await query(
+          `UPDATE product_stock SET used = true, used_at = now()
+            WHERE id = (
+              SELECT id FROM product_stock
+               WHERE guild_id = $1 AND tier_id = $2 AND used = false
+               ORDER BY id ASC LIMIT 1 FOR UPDATE SKIP LOCKED
+            )
+            RETURNING id, value`,
+          [GUILD_ID, tier.id]
+        );
+        if (!rows.length) break;
+        claimed.push(rows[0]);
+      }
+      if (claimed.length < count) {
+        // Put back what we took. Half a delivery is worse than none: the
+        // customer gets fewer keys than the embed promises and the stock is
+        // gone either way.
+        for (const c of claimed) {
+          await query(`UPDATE product_stock SET used = false, used_at = NULL WHERE id = $1`, [c.id]).catch(() => {});
+        }
+        return res.status(409).json({ error: `Only ${claimed.length} of ${count} in stock for ${pName}${label ? ` (${label})` : ''}` });
+      }
+      values = claimed.map(c => c.value);
+      req._claimedStockIds = claimed.map(c => c.id);
+    }
+
+    // Tie the order to the website account behind this Discord user when there
+    // is one, so it appears in their ORDERS list on the site rather than only
+    // in a DM they may lose. Unverified links are ignored — a verified link is
+    // the only one that proves the account and the snowflake are the same
+    // person.
+    let webUserId = null;
+    let acctEmail = null;
+    if (discord_id) {
+      const { rows } = await query(
+        `SELECT id, email FROM web_users WHERE guild_id = $1 AND discord_id = $2 AND discord_verified = true LIMIT 1`,
+        [GUILD_ID, String(discord_id)]
+      );
+      if (rows[0]) { webUserId = rows[0].id; acctEmail = rows[0].email || null; }
+    }
+    // /claim-customer verifies an invoice against the buyer's email, so an
+    // order with no address on it can never be claimed. Falling back to the
+    // linked account's address makes the claim work without staff having to
+    // know it.
+    const buyerEmail = String(email || '').trim() || acctEmail || null;
+
+    const itemsSnapshot = [{
+      id: tier ? String(tier.id) : 'manual',
+      name: pName, product_name: pName, tier_label: label,
+      price: unit / 100, qty: count,
+    }];
+    const deliveredGoods = [{
+      product: pName, items: values,
+      tier_label: label, qty: count, unit_price: unit / 100,
+    }];
+
+    // Same 5-attempt retry as checkout: invoice_no carries a UNIQUE index and
+    // the whole point of this order is that the number can be looked up later.
+    let order = null;
+    let lastErr = null;
+    for (let attempt = 0; attempt < 5; attempt++) {
+      const invNo = invoiceNo();
+      try {
+        const { rows } = await query(
+          `INSERT INTO orders
+             (guild_id, web_user_id, email, discord_id, items_snapshot, subtotal_cents, total_cents,
+              payment_method, public_ref, invoice_no, source, status, external_ref,
+              created_at, paid_at, delivered_at, delivered_goods,
+              amount_received_cents, amount_received_unit)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,'manual',$8,$9,'manual','delivered',$10,
+                   now(), now(), now(), $11, $6, 'usd')
+           RETURNING *`,
+          [
+            GUILD_ID, webUserId, buyerEmail, discord_id ? String(discord_id) : null,
+            JSON.stringify(itemsSnapshot), totalCents, totalCents,
+            crypto.randomBytes(16).toString('hex'), invNo,
+            // external_ref is the row's only free-text field and nothing else
+            // writes it. It is returned by GET /:id to staff and the bot only,
+            // never to a customer holding the public ref — which is the right
+            // audience for "who did this and why".
+            [staff_id ? `staff:${staff_id}` : null, note ? String(note) : null]
+              .filter(Boolean).join(' — ').slice(0, 500) || null,
+            JSON.stringify(deliveredGoods),
+          ]
+        );
+        order = rows[0];
+        break;
+      } catch (err) {
+        if (err && err.code === '23505') { lastErr = err; continue; }
+        throw err;
+      }
+    }
+    if (!order) {
+      // The keys are already claimed at this point — hand them back rather
+      // than burning stock on an order that does not exist.
+      for (const id of req._claimedStockIds || []) {
+        await query(`UPDATE product_stock SET used = false, used_at = NULL WHERE id = $1`, [id]).catch(() => {});
+      }
+      console.error('[Orders] manual: exhausted invoice retries:', lastErr && lastErr.message);
+      return res.status(500).json({ error: 'Could not allocate an invoice number' });
+    }
+
+    for (const id of req._claimedStockIds || []) {
+      await query(`UPDATE product_stock SET order_id = $1 WHERE id = $2`, [order.id, id]).catch(() => {});
+    }
+
+    // One line, qty N — the same shape checkout writes.
+    //
+    // NOT one row per value with the value in `delivered_key`: that column is a
+    // FOREIGN KEY to keys(key), the licence-key table, so it can only ever hold
+    // a key the bot itself minted. A value typed by staff or drawn from
+    // product_stock is not in `keys` and the insert is rejected outright. The
+    // delivered values live in orders.delivered_goods, which is what the DM,
+    // the receipt email and the site's order screen all read anyway.
+    await query(
+      `INSERT INTO order_items (order_id, guild_id, tier_id, product_name, tier_label, unit_cents, qty)
+       VALUES ($1,$2,$3,$4,$5,$6,$7)`,
+      [order.id, GUILD_ID, tier ? tier.id : null, pName, label, unit, count]
+    ).catch((e) => console.warn('[Orders] manual: order_items line not written:', e.message));
+
+    console.log(`[Orders] MANUAL order ${order.id} (${order.invoice_no}) — ${pName}${label ? ` / ${label}` : ''} ×${count} by staff ${staff_id || 'unknown'}`);
+
+    // The bot owns the DM and the channel posts. `notify: false` lets the
+    // caller send its own (the /manual-order-delivery command builds a richer
+    // embed and would otherwise deliver twice).
+    if (notify !== false) {
+      notifyBot('deliver_goods', {
+        order_id: order.id,
+        invoice_no: order.invoice_no,
+        email: order.email,
+        discord_id: order.discord_id,
+        goods: deliveredGoods,
+        source: 'manual',
+      }).catch(() => {});
+    }
+
+    res.json({
+      success: true,
+      order_id: String(order.id),
+      invoice_no: order.invoice_no,
+      product_name: pName,
+      tier_label: label,
+      qty: count,
+      values,
+      total_cents: totalCents,
+      email: order.email,
+      web_user_id: webUserId,
+      claimed_from_stock: !!from_stock,
+    });
+  } catch (err) {
+    console.error('[Orders] manual error:', err);
+    res.status(500).json({ error: err.message || 'Failed to record the manual order' });
   }
 });
 
