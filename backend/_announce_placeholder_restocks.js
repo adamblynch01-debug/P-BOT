@@ -101,8 +101,12 @@ const sleep = (ms) => new Promise(r => setTimeout(r, ms));
   console.log(`keys reported        : ${products.reduce((s, p) => s + p.total, 0)}`);
   console.log(`hidden, skipped      : ${skippedHidden}`);
   console.log(`batches of ${CHUNK}         : ${chunks.length}  → ~${Math.round(chunks.length * PAUSE_MS / 1000)}s of pacing`);
-  console.log(`storefront → RESTOCK_CHANNEL_ID       ${process.env.RESTOCK_CHANNEL_ID || '(unset, bot falls back)'}`);
-  console.log(`vault      → VAULT_RESTOCK_CHANNEL_ID ${process.env.VAULT_RESTOCK_CHANNEL_ID || '(unset, bot falls back)'}`);
+  // Routing is the BOT's decision, made from RESTOCK_CHANNEL_ID and
+  // VAULT_RESTOCK_CHANNEL_ID in SUPERBOT's environment — not this one. Printing
+  // the backend's copy of those names would report "(unset)" for variables that
+  // are set perfectly well on the service that reads them.
+  console.log('routing              : the bot picks the channel per product from the `vault` flag;');
+  console.log('                       each batch below prints which channel it actually reached.');
 
   if (!APPLY) {
     console.log('\nfirst 10 products:');
@@ -132,8 +136,8 @@ const sleep = (ms) => new Promise(r => setTimeout(r, ms));
     if (posted) {
       ok += batch.length;
       const bits = [];
-      if (lastReply.store) bits.push(`store ${lastReply.store.embeds || 0}`);
-      if (lastReply.vault) bits.push(`vault ${lastReply.vault.embeds || 0}`);
+      if (lastReply.store) bits.push(`store ${lastReply.store.embeds || 0}→#${lastReply.store.channel || '?'}`);
+      if (lastReply.vault) bits.push(`vault ${lastReply.vault.embeds || 0}→#${lastReply.vault.channel || '?'}`);
       // Older bot builds answer {posted, embeds} with no per-catalogue split.
       if (!bits.length && lastReply.embeds != null) bits.push(`${lastReply.embeds} embed(s)`);
       console.log(`${tag} ✓ ${bits.join(', ')}  ${names}`);
