@@ -101,7 +101,7 @@ async function flush() {
     // shows every variant and its price, not just the restocked one), and the
     // live unused count per tier.
     const { rows } = await query(
-      `SELECT p.id AS product_id, p.name AS product_name, p.game_name, p.media, p.hidden,
+      `SELECT p.id AS product_id, p.name AS product_name, p.game_name, p.media, p.hidden, p.vault,
               t.id AS tier_id, t.label, t.price_cents, t.sort_order,
               (SELECT COUNT(*)::int FROM product_stock ps
                 WHERE ps.guild_id = t.guild_id AND ps.tier_id = t.id AND ps.used = false) AS available
@@ -126,6 +126,11 @@ async function flush() {
           // A hidden product is not on the storefront, so announcing it would
           // point customers at something they cannot buy.
           hidden: !!r.hidden,
+          // Which catalogue sells it. The vault is a separate storefront in a
+          // separate part of the Discord, so the bot routes on this rather than
+          // announcing every restock to one channel and pointing half of them
+          // at a page that does not carry the product.
+          vault: !!r.vault,
           image_url: imageFrom(r.media),
           variants: [],
           restocked: [],
