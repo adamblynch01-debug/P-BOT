@@ -13,6 +13,7 @@ const {
   generateSecret, verifyTOTP, generateBackupCodes, hashBackupCode, otpauthUrl,
 } = require('../utils/totp');
 const { sendLoginCode } = require('../utils/email');
+const { decodeImageDataUrl } = require('../utils/imageUpload');
 
 const GUILD_ID = process.env.GUILD_ID;
 
@@ -930,6 +931,110 @@ router.patch('/profile', requireAuth, async (req, res) => {
   } catch (err) {
     console.error('[Auth] profile update error:', err);
     res.status(500).json({ error: 'Failed to update profile' });
+  }
+});
+
+// ─── Custom profile pictures ─────────────────────────────
+// web_users.avatar stays what it always was: one emoji, capped at 8 chars by
+// the handler above because it is rendered straight into the page. An uploaded
+// picture is a different thing in a different table (web_user_avatars), and
+// the two coexist — the emoji is the fallback for every account that has not
+// uploaded one, and for the instant an upload is deleted.
+//
+// Same decoder the review screenshots use, so the same rule applies: the
+// declared type has to match the file's magic bytes, and SVG is refused. That
+// matters more here than it does on a review, because this URL is public and
+// its Content-Type is replayed from what was stored.
+const MAX_AVATAR_BYTES = 1024 * 1024;   // must match GX_AVATAR_MAX_BYTES on the storefront
+const AVATAR_BODY_LIMIT = '2mb';        // base64 is ~4/3 of the bytes, plus JSON overhead
+
+// POST /api/auth/avatar  { image: "data:image/png;base64,..." }
+// Parses its own body: the global parser is capped at 100kb and stands aside
+// for this path (see BIG_BODY_ROUTES in server.js). requireAuth runs FIRST so
+// an anonymous caller cannot make us buffer 2MB before being told no.
+router.post('/avatar', requireAuth, express.json({ limit: AVATAR_BODY_LIMIT }), async (req, res) => {
+  try {
+    const img = decodeImageDataUrl(req.body && req.body.image, MAX_AVATAR_BYTES);
+    if (img.error) return res.status(400).json({ error: img.error });
+    if (!img.data) return res.status(400).json({ error: 'No image supplied' });
+
+    // One row per user, replaced in place. The version bump is what makes the
+    // year-long cache header on the GET safe: the URL changes with the bytes.
+    // abs() because a delete parks the counter on the negative side (see
+    // below) — counting up from the magnitude means no ?v= is ever reissued.
+    const { rows } = await withTransaction(async (exec) => {
+      await exec(
+        `INSERT INTO web_user_avatars (web_user_id, data, mime, updated_at)
+         VALUES ($1, $2, $3, now())
+         ON CONFLICT (web_user_id) DO UPDATE SET data = EXCLUDED.data, mime = EXCLUDED.mime, updated_at = now()`,
+        [req.user.id, img.data, img.mime]
+      );
+      return exec(
+        `UPDATE web_users SET avatar_version = abs(avatar_version) + 1
+          WHERE id = $1 AND guild_id = $2 RETURNING *`,
+        [req.user.id, GUILD_ID]
+      );
+    });
+    if (!rows.length) return res.status(404).json({ error: 'Account not found' });
+
+    res.json({ success: true, user: publicUser({ ...rows[0], balance_cents: req.user.balance_cents }) });
+  } catch (err) {
+    console.error('[Auth] avatar upload error:', err);
+    res.status(500).json({ error: 'Failed to save that picture' });
+  }
+});
+
+// DELETE /api/auth/avatar — back to the emoji.
+// The counter goes NEGATIVE rather than to zero. Zero would mean "no picture"
+// correctly, but it would also restart the numbering, and a browser still
+// holding ?v=1 from the deleted picture would keep serving it once the next
+// upload claimed v=1 again — the immutable header means it would never ask.
+// Negating keeps the high-water mark while making avatar_version > 0 false,
+// which is the single test publicUser() uses to decide there is a picture.
+router.delete('/avatar', requireAuth, async (req, res) => {
+  try {
+    const { rows } = await withTransaction(async (exec) => {
+      await exec('DELETE FROM web_user_avatars WHERE web_user_id = $1', [req.user.id]);
+      return exec(
+        `UPDATE web_users SET avatar_version = -abs(avatar_version)
+          WHERE id = $1 AND guild_id = $2 RETURNING *`,
+        [req.user.id, GUILD_ID]
+      );
+    });
+    if (!rows.length) return res.status(404).json({ error: 'Account not found' });
+    res.json({ success: true, user: publicUser({ ...rows[0], balance_cents: req.user.balance_cents }) });
+  } catch (err) {
+    console.error('[Auth] avatar delete error:', err);
+    res.status(500).json({ error: 'Failed to remove that picture' });
+  }
+});
+
+// GET /api/auth/avatar/:userId — public, because an avatar shows up next to a
+// name in places a logged-out visitor can see. Nothing private is exposed: it
+// is a picture the account chose to publish, addressed by an id that is
+// already in every public payload.
+router.get('/avatar/:userId', async (req, res) => {
+  try {
+    if (!/^\d+$/.test(String(req.params.userId))) return res.status(404).end();
+    const { rows } = await query(
+      `SELECT a.data, a.mime, u.avatar_version
+         FROM web_user_avatars a
+         JOIN web_users u ON u.id = a.web_user_id
+        WHERE a.web_user_id = $1 AND u.guild_id = $2`,
+      [req.params.userId, GUILD_ID]
+    );
+    if (!rows.length) return res.status(404).end();
+
+    res.set('Content-Type', rows[0].mime || 'image/png');
+    res.set('X-Content-Type-Options', 'nosniff');
+    // Immutable is only correct because publicUser() puts ?v=<avatar_version>
+    // in the URL and that number changes on every upload and every delete. A
+    // caller that drops the query string gets a stale picture and has earned it.
+    res.set('Cache-Control', req.query.v ? 'public, max-age=31536000, immutable' : 'public, max-age=60');
+    res.send(rows[0].data);
+  } catch (err) {
+    console.error('[Auth] avatar fetch error:', err);
+    res.status(500).end();
   }
 });
 

@@ -92,7 +92,12 @@ app.options('*', cors());
 // limit (routes/reviews.js) and this parser stands aside for it. Adding a route
 // here is a deliberate act; raising the global limit instead would hand every
 // unauthenticated endpoint on the API the same allowance.
-const BIG_BODY_ROUTES = [{ method: 'POST', path: '/api/reviews' }];
+const BIG_BODY_ROUTES = [
+  { method: 'POST', path: '/api/reviews' },
+  // Profile picture upload. Same shape as the review screenshot: a data URL in
+  // JSON, decoded and signature-checked by the route, which sets its own limit.
+  { method: 'POST', path: '/api/auth/avatar' },
+];
 const jsonParser = express.json();
 app.use((req, res, next) => {
   // '/api/reviews/' and '/api/reviews' are the same endpoint to the router, so
@@ -155,6 +160,13 @@ process.on('uncaughtException', (err) => {
 });
 
 // ─── Start ──────────────────────────────────────────────
+// Guarded so a test can `require('./server')` and drive the REAL app — with
+// the real body-parser exemptions and the real route mounting — without
+// starting the email and crypto watchers against production alongside it.
+// Railway runs `node server.js`, so this is always true there.
+module.exports = app;
+if (require.main !== module) return;
+
 const PORT = process.env.PORT || 3000;
 require('./routes/config').loadConfigFromDB().finally(() => {
   const server = app.listen(PORT, () => {

@@ -181,6 +181,20 @@ function publicUser(row) {
     // storefront kept the chosen avatar in localStorage and lost it on any
     // other device.
     avatar: row.avatar || null,
+    // Null unless the account uploaded a picture, so every consumer keeps the
+    // emoji above as its fallback and nothing had to change to stay correct.
+    // The ?v= is not decoration: GET /api/auth/avatar/:id is served
+    // immutable-for-a-year, and this counter is the only reason that is safe.
+    //
+    // `> 0`, not `!= 0`: a deleted picture parks the counter on the negative
+    // side to keep the high-water mark without claiming a picture still exists
+    // (see migrations/user_avatars.sql). This is derived from the row rather
+    // than from a lookup because publicUser() is handed rows by a dozen
+    // different `SELECT u.*` and `RETURNING *` queries — anything it needs has
+    // to already be on the row, or it goes null everywhere except one route.
+    avatar_url: Number(row.avatar_version) > 0
+      ? `/api/auth/avatar/${row.id}?v=${row.avatar_version}`
+      : null,
     role: row.role,
     discord_id: row.discord_id,
     discord_verified: row.discord_verified,
