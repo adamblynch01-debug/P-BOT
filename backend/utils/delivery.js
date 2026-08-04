@@ -13,11 +13,25 @@ const GUILD_ID = process.env.GUILD_ID;
 // lookup must swallow that error itself rather than letting it bubble up to
 // deliver()'s outer catch, or a single bad id would abort the whole order
 // and it would never reach 'delivered'.
+// game_name is joined in for the delivery DM, which used to read
+// "PRODUCT — DURATION" with no indication of which game it was for. A buyer
+// with three orders open could not tell them apart, and neither could staff
+// reading the same line in the audit copy.
+//
+// COALESCE onto game_tiles.display_name, not products.game_name alone: round 28
+// split the tile's LOOKUP KEY from what it PAINTS, and the customer picked the
+// product off a tile showing display_name. Naming it anything else in the DM
+// hands them a game they never saw. LEFT JOIN — most games have no tile row at
+// all, and that is the normal case, not a missing one.
 async function lookupTier(tierId) {
   try {
     const { rows } = await query(
-      `SELECT t.*, p.name AS product_name
-       FROM product_tiers t JOIN products p ON p.id = t.product_id
+      `SELECT t.*, p.name AS product_name,
+              COALESCE(NULLIF(gt.display_name, ''), p.game_name) AS game_name
+       FROM product_tiers t
+       JOIN products p ON p.id = t.product_id
+       LEFT JOIN game_tiles gt
+              ON gt.game_name = p.game_name AND gt.guild_id = t.guild_id
        WHERE t.id = $1 AND t.guild_id = $2`,
       [tierId, GUILD_ID]
     );
@@ -182,9 +196,9 @@ async function deliver(order) {
             claimed.push('CLAIM_ERROR');
           }
         }
-        deliveredGoods.push({ product: tier.product_name, items: claimed, ...lineDetail(item), tier_label: item.tier_label || tier.label || null });
+        deliveredGoods.push({ product: tier.product_name, game: tier.game_name || null, items: claimed, ...lineDetail(item), tier_label: item.tier_label || tier.label || null });
       } else {
-        deliveredGoods.push({ product: tier.product_name, items: ['MANUAL_DELIVERY_REQUIRED'], ...lineDetail(item), tier_label: item.tier_label || tier.label || null });
+        deliveredGoods.push({ product: tier.product_name, game: tier.game_name || null, items: ['MANUAL_DELIVERY_REQUIRED'], ...lineDetail(item), tier_label: item.tier_label || tier.label || null });
       }
     }
 

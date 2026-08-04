@@ -111,7 +111,17 @@ function storeName_() {
 // used to be the bare product name, so a receipt for four months of one thing
 // and one month of another was indistinguishable from two single purchases.
 function goodsHeading(g) {
-  const bits = [escapeHtml(g.product || 'Item')];
+  // GAME — PRODUCT — DURATION, matching the buyer's Discord DM exactly. The
+  // receipt and the DM are two views of the same delivered_goods row and a
+  // buyer comparing them should not have to work out that they agree.
+  // Dropped when the game name is already inside the product name, and absent
+  // entirely for balance top-ups and donations, which have no game.
+  const game = String(g.game || '').trim();
+  const bits = [];
+  if (game && !new RegExp(`(^|\\s)${game.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}(\\s|$)`, 'i').test(String(g.product || ''))) {
+    bits.push(`<span style="color:#5a7080;font-weight:400;">${escapeHtml(game)} — </span>`);
+  }
+  bits.push(escapeHtml(g.product || 'Item'));
   if (g.tier_label) bits.push(`<span style="color:#0ff;font-weight:400;"> — ${escapeHtml(g.tier_label)}</span>`);
   if ((g.qty || 1) > 1) bits.push(`<span style="color:#5a7080;font-weight:400;"> ×${escapeHtml(g.qty)}</span>`);
   return bits.join('');

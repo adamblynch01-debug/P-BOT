@@ -1039,7 +1039,7 @@ router.post('/manual', async (req, res) => {
     if (!botAuthorized(req)) return res.status(401).json({ error: 'Unauthorized' });
 
     const {
-      tier_id, product_name, tier_label, unit_cents,
+      tier_id, product_name, game_name, tier_label, unit_cents,
       qty, keys, from_stock, discord_id, email, staff_id, note, notify,
     } = req.body || {};
 
@@ -1057,9 +1057,18 @@ router.post('/manual', async (req, res) => {
     // "replacement") can still be recorded, but then the caller must name it.
     let tier = null;
     if (tier_id != null && /^\d+$/.test(String(tier_id))) {
+      // game_name resolves the same way as the paid path in utils/delivery.js:
+      // the tile's display_name if the game has one, else the raw grouping key.
+      // Both DMs come out of the same lineLabel() in the bot, so if these two
+      // queries disagree the buyer sees a different game depending on whether
+      // staff or the checkout delivered the order.
       const { rows } = await query(
-        `SELECT t.*, p.name AS product_name
-           FROM product_tiers t JOIN products p ON p.id = t.product_id
+        `SELECT t.*, p.name AS product_name,
+                COALESCE(NULLIF(gt.display_name, ''), p.game_name) AS game_name
+           FROM product_tiers t
+           JOIN products p ON p.id = t.product_id
+           LEFT JOIN game_tiles gt
+                  ON gt.game_name = p.game_name AND gt.guild_id = t.guild_id
           WHERE t.id = $1 AND t.guild_id = $2`,
         [String(tier_id), GUILD_ID]
       );
@@ -1070,6 +1079,9 @@ router.post('/manual', async (req, res) => {
     const pName = String(product_name || (tier && tier.product_name) || '').trim();
     if (!pName) return res.status(400).json({ error: 'product_name is required when no tier_id is given' });
     const label = String(tier_label || (tier && tier.label) || '').trim() || null;
+    // A one-off with no tier has no game, and inventing one would be worse
+    // than the line simply reading "PRODUCT — DURATION" the way it always did.
+    const gName = String(game_name || (tier && tier.game_name) || '').trim() || null;
 
     // Price: what staff said, else the tier's list price, else free. A manual
     // delivery is often a comp or a replacement, so 0 is a legitimate answer
@@ -1140,7 +1152,7 @@ router.post('/manual', async (req, res) => {
       price: unit / 100, qty: count,
     }];
     const deliveredGoods = [{
-      product: pName, items: values,
+      product: pName, game: gName, items: values,
       tier_label: label, qty: count, unit_price: unit / 100,
     }];
 
@@ -1229,6 +1241,11 @@ router.post('/manual', async (req, res) => {
       order_id: String(order.id),
       invoice_no: order.invoice_no,
       product_name: pName,
+      // The caller (/manual-order-delivery, which passes notify:false and
+      // builds its own embed) has to be able to title the DM the same way
+      // lineLabel() does, or a hand-delivered order reads differently from
+      // one bought on the site.
+      game_name: gName,
       tier_label: label,
       qty: count,
       values,
