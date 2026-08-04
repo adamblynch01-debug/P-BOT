@@ -97,6 +97,12 @@ const BIG_BODY_ROUTES = [
   // Profile picture upload. Same shape as the review screenshot: a data URL in
   // JSON, decoded and signature-checked by the route, which sets its own limit.
   { method: 'POST', path: '/api/auth/avatar' },
+  // Game tile banner. `path` is a RegExp here because the game name sits in the
+  // middle of the route. Anchored at both ends and with the name segment
+  // spelled out as "anything but a slash", so it can only ever match the one
+  // endpoint — a loose pattern here would quietly hand the 4MB allowance to
+  // whatever else lives under /api/game-tiles later.
+  { method: 'POST', path: /^\/api\/game-tiles\/[^/]+\/banner$/ },
 ];
 const jsonParser = express.json();
 app.use((req, res, next) => {
@@ -105,7 +111,8 @@ app.use((req, res, next) => {
   // silently reinstates the 100kb limit and the upload fails with a 413 that
   // points at nothing.
   const path = req.path.length > 1 ? req.path.replace(/\/+$/, '') : req.path;
-  if (BIG_BODY_ROUTES.some(r => r.method === req.method && r.path === path)) return next();
+  const match = (r) => (r.path instanceof RegExp ? r.path.test(path) : r.path === path);
+  if (BIG_BODY_ROUTES.some(r => r.method === req.method && match(r))) return next();
   return jsonParser(req, res, next);
 });
 
@@ -125,6 +132,7 @@ app.use('/api/tickets',  require('./routes/tickets'));
 app.use('/api/alerts',   require('./routes/alerts'));
 app.use('/api/downloads', require('./routes/downloads'));
 app.use('/api/coupons', require('./routes/coupons'));
+app.use('/api/game-tiles', require('./routes/gameTiles'));
 
 // ─── Health ─────────────────────────────────────────────
 app.get('/health', (req, res) => res.json({ status: 'ok', store: process.env.STORE_NAME || 'H8ED Shop' }));
