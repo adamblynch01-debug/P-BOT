@@ -71,15 +71,46 @@ function cacheSet(key, value) {
 // find that out — which would be the last one.
 let quota = { remaining: null, limit: null, resetAt: null };
 
+// Our own tally of upstream calls in the current clock hour. `quota.remaining`
+// is authoritative once Unsplash has answered once — but it is null before the
+// first call and after every restart, and by the time it reads 0 the request
+// that discovered it has already been spent.
+//
+// This is the only thing standing between the hour's allowance and one
+// customer paging through results. The per-IP limiter cannot do it: that sits
+// above the cache, so it counts the hits too, and tightening it enough to
+// bound upstream spend would start refusing requests that cost nothing.
+let spend = { hour: -1, count: 0 };
+const SPEND_CAP = 45;   // of 50 — the margin is for the /used download pings,
+                        // which are an API-terms obligation and must not be
+                        // the thing that gets squeezed out.
+
+function canSpend() {
+  const h = new Date().getHours();
+  if (spend.hour !== h) spend = { hour: h, count: 0 };
+  if (quota.remaining != null && quota.remaining <= 0) return false;
+  return spend.count < SPEND_CAP;
+}
+
+function noteSpend() {
+  const h = new Date().getHours();
+  if (spend.hour !== h) spend = { hour: h, count: 0 };
+  spend.count++;
+}
+
+// Unsplash's window is the clock hour; they send no reset header, so the top
+// of the next hour is the honest estimate rather than a made-up countdown.
+function topOfNextHour() {
+  const now = new Date();
+  return new Date(now.getFullYear(), now.getMonth(), now.getDate(), now.getHours() + 1, 0, 0).toISOString();
+}
+
 function noteQuota(headers) {
   const rem = headers && headers['x-ratelimit-remaining'];
   const lim = headers && headers['x-ratelimit-limit'];
   if (rem != null && rem !== '') quota.remaining = Number(rem);
   if (lim != null && lim !== '') quota.limit = Number(lim);
-  // Unsplash's window is the clock hour; they send no reset header, so the top
-  // of the next hour is the honest estimate rather than a made-up countdown.
-  const now = new Date();
-  quota.resetAt = new Date(now.getFullYear(), now.getMonth(), now.getDate(), now.getHours() + 1, 0, 0).toISOString();
+  quota.resetAt = topOfNextHour();
 }
 
 // Only the fields the picker renders. Unsplash's photo object is ~40 keys deep
@@ -140,7 +171,19 @@ router.get('/search', requireAuth, searchLimiter, async (req, res) => {
   const cached = cacheGet(key);
   if (cached) return res.json({ ...cached, cached: true });
 
+  // Checked after the cache, never before: a query we already hold is free,
+  // and refusing it because the hour is spent would take the feature away at
+  // exactly the moment the cache is the only thing keeping it alive.
+  if (!canSpend()) {
+    return res.status(429).json({
+      error: 'Photo search has used up its hourly allowance.',
+      resetAt: quota.resetAt || topOfNextHour(),
+      quota,
+    });
+  }
+
   try {
+    noteSpend();
     const r = await axios.get(`${UNSPLASH_API}/search/photos`, {
       params: {
         query: q, page, per_page: PER_PAGE,
@@ -222,4 +265,9 @@ router.get('/status', (req, res) => {
 });
 
 module.exports = router;
-module.exports._internals = { slimPhoto, cacheGet, cacheSet, cache, noteQuota, quota };
+module.exports._internals = {
+  slimPhoto, cacheGet, cacheSet, cache, noteQuota, quota,
+  canSpend, noteSpend, SPEND_CAP,
+  _spend: () => spend,
+  _resetSpend: () => { spend = { hour: -1, count: 0 }; },
+};

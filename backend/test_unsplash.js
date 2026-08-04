@@ -30,7 +30,8 @@ let passed = 0;
 const check = (name, fn) => { fn(); console.log(`  ok  ${name}`); passed++; };
 
 const { _internals } = require(routeFile);
-const { slimPhoto, cacheGet, cacheSet, cache, noteQuota, quota } = _internals;
+const { slimPhoto, cacheGet, cacheSet, cache, noteQuota, quota,
+        canSpend, noteSpend, SPEND_CAP, _spend, _resetSpend } = _internals;
 
 // A photo as Unsplash actually returns it, trimmed to the shape that matters
 // plus the fields we must NOT pass on.
@@ -134,6 +135,43 @@ check('missing headers leave the last known figure alone', () => {
   noteQuota({ 'x-ratelimit-remaining': '3' });
   noteQuota({});
   assert.strictEqual(quota.remaining, 3, 'a header-less response should not erase what we knew');
+});
+
+// ─── The upstream spend guard ────────────────────────────────────────────────
+// The per-IP limiter cannot protect the hourly allowance: it sits above the
+// cache and so counts the free hits too. This is the thing that stops one
+// customer paging through results from taking the hour off everyone else.
+check('upstream calls stop at the cap, leaving a margin for the download pings', () => {
+  _resetSpend(); quota.remaining = null;
+  for (let i = 0; i < SPEND_CAP; i++) {
+    assert.ok(canSpend(), `refused at ${i}, before the cap`);
+    noteSpend();
+  }
+  assert.ok(!canSpend(), 'spent past the cap');
+  assert.ok(SPEND_CAP < 50, 'no margin left for the /used pings the terms require');
+});
+
+check('a known-exhausted allowance is not re-discovered by spending a request', () => {
+  _resetSpend();
+  quota.remaining = 0;
+  assert.ok(!canSpend(), 'would have spent a request to be told there are none');
+  quota.remaining = 1;
+  assert.ok(canSpend());
+  quota.remaining = null;   // unknown — before the first call, or after a restart
+  assert.ok(canSpend(), 'an unknown allowance must not read as an empty one');
+});
+
+check('the tally resets with the clock hour, not on a rolling window', () => {
+  // Unsplash's window IS the clock hour, so ours has to be too. A rolling
+  // hour would still be refusing at 14:05 over requests spent at 13:10 that
+  // upstream has already forgotten about.
+  _resetSpend(); quota.remaining = null;
+  for (let i = 0; i < SPEND_CAP; i++) noteSpend();
+  assert.ok(!canSpend());
+  const s = _spend();
+  s.hour = (s.hour + 23) % 24;      // pretend the tally belongs to another hour
+  assert.ok(canSpend(), 'the tally survived the hour it was counted in');
+  assert.strictEqual(_spend().count, 0);
 });
 
 // ─── The key ─────────────────────────────────────────────────────────────────
