@@ -237,6 +237,12 @@ router.get('/discord-oauth/callback', async (req, res) => {
     });
     const discordId = me.data && me.data.id;
     if (!discordId) return fail('Could not read your Discord account.');
+    // The avatar HASH, not a url. Discord hands it over on every /users/@me
+    // and it was thrown away here, which is why review cards had no picture to
+    // draw. Null when the member has never set one — they are on a default
+    // avatar, and there is nothing to store. See migrations/review_avatars.sql
+    // for why the hash is kept rather than a copy of the image.
+    const discordAvatar = (me.data && me.data.avatar) || null;
 
     if (linkUserId) {
       // Consent on Discord's own domain IS the proof of ownership — stronger
@@ -251,14 +257,29 @@ router.get('/discord-oauth/callback', async (req, res) => {
         return bounce({ discord_link_error: 'That Discord account is already linked to another site account.' });
       }
       await query(
-        `UPDATE web_users SET discord_id = $1, discord_verified = true WHERE id = $2 AND guild_id = $3`,
-        [discordId, linkUserId, GUILD_ID]
+        `UPDATE web_users SET discord_id = $1, discord_verified = true, discord_avatar = $4
+          WHERE id = $2 AND guild_id = $3`,
+        [discordId, linkUserId, GUILD_ID, discordAvatar]
       );
       // The id itself is not echoed back in the URL — the page re-reads it from
       // /2fa/status with its own session, which is also the only way it can
       // report the truth if the browser changed accounts mid-flow.
       return bounce({ discord_link: 'ok' });
     }
+
+    // Keep the stored hash current on the way past. A member who changes their
+    // Discord picture invalidates the hash, and without this refresh their
+    // review card would keep pointing at a cdn path that 404s until they
+    // happened to re-link. Restricted to a VERIFIED link — the consent we just
+    // completed proves ownership of the Discord account, not of the site
+    // account, so an unverified row must not be written to on that basis.
+    // Best-effort: a failure here must not cost the customer their login.
+    await query(
+      `UPDATE web_users SET discord_avatar = $1
+        WHERE guild_id = $2 AND discord_id = $3 AND discord_verified = true
+          AND discord_avatar IS DISTINCT FROM $1`,
+      [discordAvatar, GUILD_ID, discordId]
+    ).catch((e) => console.warn('[Auth] discord avatar refresh failed:', e.message));
 
     const { pending_id, decoy } = await beginDiscordLogin(discordId);
     // A verified linked account gets the DM; a decoy (no linked account) still
@@ -468,6 +489,17 @@ router.get('/google-oauth/callback', async (req, res) => {
     // Google sends this as a real boolean; some proxies and older responses
     // stringify it. A missing flag is NOT a pass.
     const emailVerified = me.data && (me.data.email_verified === true || me.data.email_verified === 'true');
+    // The `picture` claim: a full https URL Google serves itself. Kept as
+    // given rather than downloaded, for the same reason as the Discord hash —
+    // it tracks the account, so a copy would go stale silently. Absent for an
+    // account with no picture set, which is a legitimate answer and falls
+    // through to the next source. See migrations/review_avatars.sql.
+    const googlePicture = (() => {
+      const p = String((me.data && me.data.picture) || '').trim();
+      // This lands in an <img src> on a public page. Anything that is not a
+      // plain https URL has no business being echoed back there.
+      return /^https:\/\//i.test(p) ? p : null;
+    })();
 
     if (!sub) return fail('Could not read your Google account.');
     if (!email) return fail('That Google account has no email address on it.');
@@ -487,8 +519,8 @@ router.get('/google-oauth/callback', async (req, res) => {
         return bounce({ google_link_error: 'That Google account is already linked to another site account.' });
       }
       await query(
-        'UPDATE web_users SET google_id = $1, google_email = $2 WHERE id = $3 AND guild_id = $4',
-        [sub, email, linkUserId, GUILD_ID]
+        'UPDATE web_users SET google_id = $1, google_email = $2, google_avatar = $5 WHERE id = $3 AND guild_id = $4',
+        [sub, email, linkUserId, GUILD_ID, googlePicture]
       );
       // No id echoed back in the URL — the panel re-reads it from /2fa/status
       // with its own session, which is also the only way it can report the
@@ -569,6 +601,16 @@ router.get('/google-oauth/callback', async (req, res) => {
         if (!user) return fail('Could not create your account. Please try again.');
       }
     }
+
+    // Keep the stored picture current on the way past, whichever of the three
+    // resolution branches above produced the row. Guarded so a login by an
+    // account whose picture has not changed costs nothing, and best-effort so
+    // a write failure never turns a good login into an error.
+    await query(
+      `UPDATE web_users SET google_avatar = $1
+        WHERE id = $2 AND google_avatar IS DISTINCT FROM $1`,
+      [googlePicture, user.id]
+    ).catch((e) => console.warn('[Auth] google avatar refresh failed:', e.message));
 
     if (user.banned) return fail('This account has been banned.');
 

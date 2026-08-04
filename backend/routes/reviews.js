@@ -12,7 +12,7 @@ const GUILD_ID = process.env.GUILD_ID;
 // response would carry every screenshot as a base64 blob on a list endpoint.
 const REVIEW_COLS = `id, guild_id, web_user_id, display_name, product_id, rating, body,
                      source, external_id, discord_id, approved, created_at, image_url,
-                     image_mime, (image_data IS NOT NULL) AS has_image`;
+                     image_mime, avatar_hash, (image_data IS NOT NULL) AS has_image`;
 
 const MAX_IMAGE_BYTES = 8 * 1024 * 1024;
 
@@ -60,6 +60,44 @@ function imageSrc(req, row) {
   return row.image_url || null;
 }
 
+// The reviewer's face, in the order the store would rather show it:
+//
+//   1. the picture they uploaded here   — they chose it FOR this site
+//   2. their Discord picture            — the store lives in Discord; most
+//                                         vouches are left there and this is
+//                                         the face the rest of the community
+//                                         already associates with the name
+//   3. their Google picture             — only ever present on a Google signup
+//   4. nothing                          — the storefront draws the emoji, or
+//                                         an initial if there is not even that
+//
+// Two of these are hotlinked rather than copied, which is the opposite of what
+// this file does with vouch SCREENSHOTS a few lines up, and deliberately so:
+// an attachment url is signed and dies within a day, while an avatar url is
+// unsigned, stable, and tracks the account. Copying an avatar would freeze it
+// at whatever the member looked like the day they first posted, with nothing
+// to invalidate it — and would put a BYTEA read behind a 200-row public list.
+//
+// `size=64` because the card renders it at 32-40px; asking Discord for the
+// full-size original would pull ~40x the bytes for no visible gain.
+function reviewAvatar(row) {
+  if (Number(row.avatar_version) > 0 && row.web_user_id) {
+    return `/api/auth/avatar/${row.web_user_id}?v=${row.avatar_version}`;
+  }
+  // The hash on the review itself is the fallback for a reviewer with no site
+  // account at all — most of the #vouches channel. It is only usable together
+  // with the id the picture belongs to.
+  const hash = row.u_discord_avatar || row.avatar_hash;
+  const did = row.u_discord_id || row.discord_id;
+  if (hash && did) {
+    // Animated avatars are the only ones whose hash starts a_; asking for .png
+    // on one of those still returns a still frame, so this is safe for both.
+    return `https://cdn.discordapp.com/avatars/${encodeURIComponent(did)}/${encodeURIComponent(hash)}.png?size=64`;
+  }
+  if (row.google_avatar && /^https:\/\//i.test(row.google_avatar)) return row.google_avatar;
+  return null;
+}
+
 // Bot (secret) and admin panel (logged-in admin/staff session) both moderate
 // reviews — same dual-gate pattern as routes/status.js and routes/products.js.
 async function requireAdminOrBot(req, res, next) {
@@ -102,10 +140,31 @@ function postVouchToDiscord(review, imageUrl) {
 // ─── GET /api/reviews ────────────────────────────────────
 router.get('/', async (req, res) => {
   try {
+    // LEFT JOIN LATERAL … LIMIT 1, not a plain LEFT JOIN: the author is
+    // resolved by web_user_id when there is one and by discord_id otherwise,
+    // and a plain join on that OR would duplicate a review row for every
+    // account sharing the discord id. There should never be two, but a list
+    // endpoint that silently doubles a vouch when there are is not a bug
+    // anyone would think to look for. The ORDER BY makes the account match win
+    // over the discord-id match when both are possible.
     const { rows } = await query(
-      `SELECT id, display_name, rating, body, source, product_id, created_at,
-              image_url, (image_data IS NOT NULL) AS has_image
-       FROM reviews WHERE guild_id = $1 AND approved = true ORDER BY created_at DESC LIMIT 200`,
+      `SELECT r.id, r.display_name, r.rating, r.body, r.source, r.product_id, r.created_at,
+              r.image_url, (r.image_data IS NOT NULL) AS has_image,
+              r.discord_id, r.avatar_hash,
+              u.id AS web_user_id, u.avatar, u.avatar_version,
+              u.discord_avatar AS u_discord_avatar, u.discord_id AS u_discord_id,
+              u.google_avatar
+       FROM reviews r
+       LEFT JOIN LATERAL (
+         SELECT w.* FROM web_users w
+          WHERE w.guild_id = r.guild_id
+            AND (w.id = r.web_user_id
+                 OR (r.web_user_id IS NULL AND r.discord_id IS NOT NULL AND w.discord_id = r.discord_id))
+          ORDER BY (w.id = r.web_user_id) DESC NULLS LAST
+          LIMIT 1
+       ) u ON true
+       WHERE r.guild_id = $1 AND r.approved = true
+       ORDER BY r.created_at DESC LIMIT 200`,
       [GUILD_ID]
     );
     res.json({
@@ -118,6 +177,12 @@ router.get('/', async (req, res) => {
         product_id: r.product_id ? String(r.product_id) : null,
         created_at: r.created_at,
         image: imageSrc(req, r),
+        // The picture, and the emoji behind it. Both are sent because they
+        // fail differently: an avatar url can 404 in the browser (a member
+        // changed their Discord picture since the last time we saw them) and
+        // the card needs something to fall back to without a round trip.
+        avatar: reviewAvatar(r),
+        avatar_emoji: r.avatar || null,
       })),
     });
   } catch (err) {
@@ -280,7 +345,7 @@ router.delete('/:id', requireOwnerAdminOrBot, async (req, res) => {
 // (guild_id, source, external_id) when the bot supplies a message id.
 router.post('/bot', async (req, res) => {
   try {
-    const { display_name, rating, body, product_id, external_id, discord_id, image_url } = req.body;
+    const { display_name, rating, body, product_id, external_id, discord_id, image_url, avatar_hash } = req.body;
     if (botAuthUnavailable()) return res.status(503).json({ error: 'Server not configured' });
     if (!botAuthorized(req)) return res.status(401).json({ error: 'Unauthorized' });
     const r = parseInt(rating, 10) || 5;
@@ -289,11 +354,19 @@ router.post('/bot', async (req, res) => {
 
     if (external_id) {
       const { rows: dup } = await query(
-        `SELECT id, image_url, (image_data IS NOT NULL) AS has_image FROM reviews
+        `SELECT id, image_url, avatar_hash, (image_data IS NOT NULL) AS has_image FROM reviews
          WHERE guild_id = $1 AND source = 'discord' AND external_id = $2`,
         [GUILD_ID, String(external_id)]
       );
       if (dup.length) {
+        // The follow-up call that carries the late screenshot also carries the
+        // avatar hash, so an older row that predates this column gets one the
+        // next time the bot touches it. Cheap, and it is the only backfill
+        // path that exists — nothing walks the table.
+        if (avatar_hash && dup[0].avatar_hash !== String(avatar_hash)) {
+          await query(`UPDATE reviews SET avatar_hash = $1 WHERE id = $2`,
+            [String(avatar_hash), dup[0].id]).catch(() => {});
+        }
         // The screenshot usually arrives AFTER the vouch. The bot posts the
         // vouch, then waits up to a minute for the customer to drop an image
         // in the channel, then calls back here with the same external_id. So a
@@ -314,11 +387,12 @@ router.post('/bot', async (req, res) => {
     const img = image_url ? await fetchImage(image_url) : null;
     const { rows } = await query(
       `INSERT INTO reviews (guild_id, display_name, product_id, rating, body, source, external_id, discord_id, approved,
-                            image_url, image_data, image_mime)
-       VALUES ($1,$2,$3,$4,$5,'discord',$6,$7,true,$8,$9,$10) RETURNING ${REVIEW_COLS}`,
+                            image_url, image_data, image_mime, avatar_hash)
+       VALUES ($1,$2,$3,$4,$5,'discord',$6,$7,true,$8,$9,$10,$11) RETURNING ${REVIEW_COLS}`,
       [GUILD_ID, display_name, product_id || null, r, body || null,
        external_id ? String(external_id) : null, discord_id || null,
-       image_url ? String(image_url) : null, img ? img.data : null, img ? img.mime : null]
+       image_url ? String(image_url) : null, img ? img.data : null, img ? img.mime : null,
+       avatar_hash ? String(avatar_hash) : null]
     );
     res.json({
       success: true,
