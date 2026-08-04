@@ -271,6 +271,376 @@ router.get('/discord-oauth/callback', async (req, res) => {
   }
 });
 
+// ─── GET /api/auth/oauth-config ─────────────────────────
+// Which sign-in buttons the storefront should draw. Public and deliberately
+// boolean-only — it names no client id, no redirect URI and no secret.
+//
+// It exists because the storefront is a static file the owner uploads by hand.
+// Without this it would have to hard-code whether Google is switched on, and
+// the day the credentials are added the button would still be missing until the
+// next manual upload. Asking the server instead means the feature turns itself
+// on when GOOGLE_CLIENT_ID / GOOGLE_CLIENT_SECRET appear in the environment,
+// and a button that cannot work is never shown.
+router.get('/oauth-config', (req, res) => {
+  res.json({
+    discord: !!(OAUTH_CLIENT_ID && OAUTH_CLIENT_SECRET),
+    google: googleConfigured(),
+  });
+});
+
+// ─── Google OAuth: sign IN and sign UP ───────────────────
+// The same round trip does both, because from the browser's side they are the
+// same gesture — the customer presses one button and expects to end up in their
+// account, and whether that account already existed is our problem, not theirs.
+// The callback resolves it in this order:
+//
+//   1. a row already carrying this Google `sub`      → that account, always.
+//   2. a row whose email matches the Google address  → LINK the sub to it and
+//      sign in. This is what stops a customer who has been buying here for
+//      months from pressing the button and landing in an empty duplicate.
+//   3. nothing                                        → create the account.
+//
+// Step 2 is a takeover primitive if it is done carelessly, so `email_verified`
+// is mandatory: without it, anyone who can put an arbitrary address on a Google
+// account walks into the matching account here. Google only sets that flag for
+// an address it has proved control of.
+//
+// Step 1 matches on `sub`, never on the address, because the address is not
+// stable — a customer can change the email on their Google account, and after
+// that the only thing still identifying them is the sub.
+//
+// WHAT THIS DOES NOT DO: it does not skip a second factor. Google proves who
+// owns the mailbox; it says nothing about the authenticator app the customer
+// enrolled here. An account with 2FA is handed the ordinary challenge and
+// finishes through /login/verify like any other login, so turning on Google
+// sign-in cannot weaken an account that was already protected.
+const GOOGLE_CLIENT_ID = process.env.GOOGLE_CLIENT_ID;
+const GOOGLE_CLIENT_SECRET = process.env.GOOGLE_CLIENT_SECRET;
+const GOOGLE_REDIRECT_URI = `${BACKEND_PUBLIC_URL}/api/auth/google-oauth/callback`;
+function googleConfigured() { return !!(GOOGLE_CLIENT_ID && GOOGLE_CLIENT_SECRET); }
+
+// Separate from oauthStates rather than sharing it with a `provider` field: one
+// map means a state minted for one provider is a valid state for the other's
+// callback, and the only thing standing between that and a mixed-up identity is
+// remembering to check a discriminator in two places forever.
+const googleStates = new Map(); // state → { returnTo, linkUserId?, expiresAt }
+function reapGoogleStates() {
+  const now = Date.now();
+  for (const [s, v] of googleStates) if (v.expiresAt < now) googleStates.delete(s);
+}
+
+// The callback is a browser REDIRECT, so anything it hands back travels in a
+// URL — and a URL is the one place a 30-day session token must never go. It
+// lands in browser history, in every proxy access log on the way, and in the
+// Referer header sent to any third-party asset the page loads. (utils/auth.js
+// removed a `?token=` fallback for exactly this reason.)
+//
+// So the redirect carries a claim instead: single-use, two minutes, and worth
+// nothing except to the page that immediately POSTs it back for the real token
+// over a response body. Two minutes because the only thing that has to happen
+// in that window is one fetch by a page that is already open.
+const googleClaims = new Map(); // claim → { webUserId, expiresAt }
+function reapGoogleClaims() {
+  const now = Date.now();
+  for (const [k, v] of googleClaims) if (v.expiresAt < now) googleClaims.delete(k);
+}
+
+function googleAuthorizeUrl(state) {
+  return 'https://accounts.google.com/o/oauth2/v2/auth?' + new URLSearchParams({
+    client_id: GOOGLE_CLIENT_ID,
+    redirect_uri: GOOGLE_REDIRECT_URI,
+    response_type: 'code',
+    // openid+email is all this needs. `profile` is asked for only so a new
+    // account can be given the customer's name instead of a mangled email
+    // prefix; nothing else is read and no refresh token is requested, so the
+    // grant expires with the round trip.
+    scope: 'openid email profile',
+    state,
+    // Not 'consent': re-consenting on every sign-in is friction for no gain
+    // when we keep nothing. select_account is the one that matters — people
+    // have several Google accounts and the wrong one silently signs them into
+    // the wrong store account.
+    prompt: 'select_account',
+  }).toString();
+}
+
+// A username for an account that never chose one. The email prefix is the
+// closest thing to a name the customer has given us, but it goes straight into
+// the page and into a UNIQUE check, so it is stripped to a conservative
+// character set first and a collision is resolved rather than raised.
+function googleUsernameSeed(email, name) {
+  const fromName = String(name || '').trim().replace(/[^a-zA-Z0-9 _.-]/g, '').replace(/\s+/g, '_');
+  const fromEmail = String(email || '').split('@')[0].replace(/[^a-zA-Z0-9_.-]/g, '');
+  const seed = (fromName || fromEmail || 'user').slice(0, 24);
+  // Not '' and not a lone '.', either of which reads as a blank name once the
+  // strip above has done its work on an all-emoji display name.
+  return /[a-zA-Z0-9]/.test(seed) ? seed : 'user';
+}
+
+async function freeUsername(seed) {
+  for (let i = 0; i < 25; i++) {
+    // First try is the bare seed; after that, a suffix. The last few attempts
+    // use randomness rather than a counter, because a counter walks straight
+    // into whatever another request is claiming at the same moment.
+    const candidate = i === 0 ? seed
+      : i < 20 ? `${seed}${i + 1}`
+      : `${seed}_${crypto.randomBytes(3).toString('hex')}`;
+    const { rows } = await query(
+      'SELECT 1 FROM web_users WHERE guild_id = $1 AND lower(username) = lower($2)',
+      [GUILD_ID, candidate]
+    );
+    if (!rows.length) return candidate;
+  }
+  return `user_${crypto.randomBytes(6).toString('hex')}`;
+}
+
+router.get('/google-oauth/start', (req, res) => {
+  reapGoogleStates();
+  if (!googleConfigured()) return res.status(500).send('Google sign-in is not configured on the server.');
+  const state = crypto.randomBytes(16).toString('hex');
+  googleStates.set(state, { returnTo: pickReturnTo(req.query.return_to), expiresAt: Date.now() + 10 * 60 * 1000 });
+  res.redirect(googleAuthorizeUrl(state));
+});
+
+// ─── POST /api/auth/google-oauth/link-start ─────────────
+// Attach Google to an account that already exists, so a customer who signed up
+// with a password can stop typing it. A POST for the same reason the Discord
+// one is: the account this will write to has to be the SESSION's, a session
+// lives in an Authorization header, and a browser navigation cannot carry one.
+// Binding the pending link to req.user.id under a one-time state is what makes
+// that safe without parking a bearer token in browser history.
+router.post('/google-oauth/link-start', requireAuth, (req, res) => {
+  reapGoogleStates();
+  if (!googleConfigured()) return res.status(503).json({ error: 'Google sign-in is not configured on the server.' });
+  const state = crypto.randomBytes(16).toString('hex');
+  googleStates.set(state, {
+    returnTo: pickReturnTo(req.body && req.body.return_to),
+    linkUserId: req.user.id,
+    expiresAt: Date.now() + 10 * 60 * 1000,
+  });
+  res.json({ success: true, url: googleAuthorizeUrl(state) });
+});
+
+router.get('/google-oauth/callback', async (req, res) => {
+  reapGoogleStates();
+  reapGoogleClaims();
+  const { code, state } = req.query;
+  const entry = state && googleStates.get(state);
+  const returnTo = entry ? entry.returnTo : STOREFRONT_ORIGINS[0];
+  if (state) googleStates.delete(state);
+
+  const bounce = (params) => res.redirect(`${returnTo}/?${new URLSearchParams(params).toString()}`);
+  // Which errand this is was decided when the state was minted — by an
+  // authenticated POST for a link, by an anonymous GET for a sign-in — so a
+  // linking round trip cannot be turned into a login for somebody else's
+  // account by editing the URL on the way back.
+  const linkUserId = entry && entry.linkUserId;
+  const fail = (msg) => bounce(linkUserId ? { google_link_error: msg } : { google_login_error: msg });
+
+  if (!googleConfigured()) return fail('Google sign-in is not configured on the server.');
+  if (!code || !entry) return fail('The request was cancelled or expired. Please try again.');
+
+  try {
+    const tokenRes = await axios.post('https://oauth2.googleapis.com/token',
+      new URLSearchParams({
+        client_id: GOOGLE_CLIENT_ID,
+        client_secret: GOOGLE_CLIENT_SECRET,
+        grant_type: 'authorization_code',
+        code: String(code),
+        redirect_uri: GOOGLE_REDIRECT_URI,
+      }).toString(),
+      { headers: { 'Content-Type': 'application/x-www-form-urlencoded' } }
+    );
+    const accessToken = tokenRes.data && tokenRes.data.access_token;
+    if (!accessToken) return fail('Google did not return an access token.');
+
+    // The userinfo endpoint rather than decoding the id_token ourselves. The
+    // same facts are in that JWT, but reading them requires either verifying a
+    // signature against Google's rotating JWKS or trusting an unverified
+    // payload — and the second one is a forgery away from a full takeover the
+    // day this code gets copied somewhere the token did not come straight from
+    // Google. One extra round trip buys the guarantee outright.
+    const me = await axios.get('https://www.googleapis.com/oauth2/v3/userinfo', {
+      headers: { Authorization: `Bearer ${accessToken}` },
+    });
+    const sub = me.data && me.data.sub;
+    const email = String((me.data && me.data.email) || '').trim();
+    // Google sends this as a real boolean; some proxies and older responses
+    // stringify it. A missing flag is NOT a pass.
+    const emailVerified = me.data && (me.data.email_verified === true || me.data.email_verified === 'true');
+
+    if (!sub) return fail('Could not read your Google account.');
+    if (!email) return fail('That Google account has no email address on it.');
+    if (!emailVerified) {
+      // The one refusal worth spelling out: it is the difference between a
+      // customer with an odd Google account and an attacker holding somebody
+      // else's address, and only the customer can fix it.
+      return fail('That Google account\'s email address is not verified with Google, so it cannot be used to sign in.');
+    }
+
+    if (linkUserId) {
+      const { rows: taken } = await query(
+        'SELECT id FROM web_users WHERE guild_id = $1 AND google_id = $2 AND id <> $3',
+        [GUILD_ID, sub, linkUserId]
+      );
+      if (taken.length) {
+        return bounce({ google_link_error: 'That Google account is already linked to another site account.' });
+      }
+      await query(
+        'UPDATE web_users SET google_id = $1, google_email = $2 WHERE id = $3 AND guild_id = $4',
+        [sub, email, linkUserId, GUILD_ID]
+      );
+      // No id echoed back in the URL — the panel re-reads it from /2fa/status
+      // with its own session, which is also the only way it can report the
+      // truth if the browser changed accounts mid-flow.
+      return bounce({ google_link: 'ok' });
+    }
+
+    // ── resolve the account ──
+    let user = null;
+    let created = false;
+
+    const { rows: bySub } = await query(
+      `SELECT u.*, b.balance_cents FROM web_users u
+       LEFT JOIN balances b ON b.web_user_id = u.id
+       WHERE u.guild_id = $1 AND u.google_id = $2`,
+      [GUILD_ID, sub]
+    );
+    user = bySub[0] || null;
+
+    if (!user) {
+      const { rows: byEmail } = await query(
+        `SELECT u.*, b.balance_cents FROM web_users u
+         LEFT JOIN balances b ON b.web_user_id = u.id
+         WHERE u.guild_id = $1 AND lower(u.email) = lower($2)`,
+        [GUILD_ID, email]
+      );
+      if (byEmail.length) {
+        user = byEmail[0];
+        // Adopting an existing account. Safe only because email_verified was
+        // required above; the address alone proves nothing.
+        //
+        // The guard matters: this account may already carry a DIFFERENT Google
+        // identity, and quietly overwriting it would let a second Google
+        // account inherit the first one's site account for good. Refusing is
+        // the conservative half — the customer signs in the way they already
+        // could and links the new Google account deliberately.
+        if (user.google_id && user.google_id !== sub) {
+          return fail('This account is already linked to a different Google account. Sign in the usual way, then re-link it from Security.');
+        }
+        await query('UPDATE web_users SET google_id = $1, google_email = $2 WHERE id = $3',
+          [sub, email, user.id]);
+        user.google_id = sub;
+      }
+    }
+
+    if (!user) {
+      // ── sign UP with Google ──
+      // No password_hash: this account has never had one and must not be given
+      // a fake. Setting one later is the ordinary profile edit, which only
+      // demands a current password when there IS one.
+      const username = await freeUsername(googleUsernameSeed(email, me.data.name));
+      try {
+        user = await withTransaction(async (exec) => {
+          const { rows } = await exec(
+            `INSERT INTO web_users (guild_id, username, email, google_id, google_email, last_login_at)
+             VALUES ($1,$2,$3,$4,$5, now()) RETURNING *`,
+            [GUILD_ID, username, email, sub, email]
+          );
+          // Every other account gets a wallet row at signup; one created here
+          // without it would fault the first time it was credited.
+          await exec('INSERT INTO balances (web_user_id, guild_id, balance_cents) VALUES ($1,$2,0)',
+            [rows[0].id, GUILD_ID]);
+          return { ...rows[0], balance_cents: 0 };
+        });
+        created = true;
+      } catch (err) {
+        // 23505 = someone signed up with this address (or this sub) in the
+        // milliseconds since the lookups above. Whoever won, the row they made
+        // is the right one to sign into.
+        if (err.code !== '23505') throw err;
+        const { rows: again } = await query(
+          `SELECT u.*, b.balance_cents FROM web_users u
+           LEFT JOIN balances b ON b.web_user_id = u.id
+           WHERE u.guild_id = $1 AND (u.google_id = $2 OR lower(u.email) = lower($3))`,
+          [GUILD_ID, sub, email]
+        );
+        user = again[0];
+        if (!user) return fail('Could not create your account. Please try again.');
+      }
+    }
+
+    if (user.banned) return fail('This account has been banned.');
+
+    // ── second factor, if the account has one ──
+    // Google settles who owns the mailbox. It cannot settle an authenticator
+    // app, so an account that enrolled one is asked for it here exactly as a
+    // password login would be. A brand new account has no factors and skips
+    // this by construction.
+    const methods = [];
+    if (user.totp_enabled && user.totp_secret) methods.push('totp');
+    if (user.discord_id && user.discord_verified) methods.push('discord');
+    if (user.email_2fa_enabled && user.email) methods.push('email');
+
+    if (methods.length) {
+      const challengeId = crypto.randomBytes(24).toString('hex');
+      await query(
+        `INSERT INTO web_login_challenges (id, web_user_id, guild_id, kind, expires_at)
+         VALUES ($1,$2,$3,$4, now() + interval '10 minutes')`,
+        [challengeId, user.id, GUILD_ID, methods[0]]
+      );
+      // The challenge id is not a session: it is worthless without the second
+      // factor, and /login/verify consumes it. The method list rides along so
+      // the page can open the right prompt without a second round trip.
+      return bounce({ google_2fa: challengeId, google_2fa_methods: methods.join(',') });
+    }
+
+    await query('UPDATE web_users SET last_login_at = now() WHERE id = $1', [user.id]);
+    const claim = crypto.randomBytes(32).toString('hex');
+    googleClaims.set(claim, { webUserId: user.id, expiresAt: Date.now() + 2 * 60 * 1000 });
+    return bounce({ google_login: claim, ...(created ? { google_new: '1' } : {}) });
+  } catch (err) {
+    console.error('[Auth] google-oauth callback error:', err.response?.data || err.message);
+    return fail(linkUserId ? 'Google linking failed. Please try again.' : 'Google sign-in failed. Please try again.');
+  }
+});
+
+// ─── POST /api/auth/google-oauth/claim ──────────────────
+// Trades the one-time claim from the redirect for the actual session token,
+// over a response body instead of a URL. Deleted on the first read, so a claim
+// left in browser history by a customer who pressed Back is already spent.
+router.post('/google-oauth/claim', async (req, res) => {
+  try {
+    reapGoogleClaims();
+    const claim = String((req.body && req.body.claim) || '').trim();
+    const entry = claim && googleClaims.get(claim);
+    // Deleted before the row is read, not after: two tabs racing the same claim
+    // must not both come away with a session.
+    if (entry) googleClaims.delete(claim);
+    if (!entry || entry.expiresAt < Date.now()) {
+      return res.status(401).json({ error: 'That sign-in link has expired. Please try again.' });
+    }
+
+    const { rows } = await query(
+      `SELECT u.*, b.balance_cents FROM web_users u
+       LEFT JOIN balances b ON b.web_user_id = u.id
+       WHERE u.id = $1 AND u.guild_id = $2`,
+      [entry.webUserId, GUILD_ID]
+    );
+    const user = rows[0];
+    if (!user) return res.status(401).json({ error: 'Account not found' });
+    // Re-checked here rather than trusted from the callback: a ban applied in
+    // the seconds between the two would otherwise still hand out a session.
+    if (user.banned) return res.status(403).json({ error: 'This account has been banned' });
+
+    const token = await createSession(user.id, GUILD_ID);
+    res.json({ success: true, token, user: publicUser(user) });
+  } catch (err) {
+    console.error('[Auth] google claim error:', err);
+    res.status(500).json({ error: 'Failed to complete Google sign-in' });
+  }
+});
+
 // ─── POST /api/auth/signup ──────────────────────────────
 router.post('/signup', signupLimiter, async (req, res) => {
   try {
@@ -336,6 +706,21 @@ router.post('/login', async (req, res) => {
     // password gets in even if someone has been guessing against their account
     // from the same address. Only wrong guesses are counted.
     const user = rows[0];
+    // An account created with SIGN UP WITH GOOGLE has no password, so no answer
+    // typed here can ever be right. Saying so is worth the small amount it
+    // gives away — signup already answers "that email is in use" to anyone who
+    // asks, so the existence of the account is not a secret this protects, and
+    // without the hint a returning customer sits on "invalid password" retrying
+    // a password that does not exist. Still counted as a failed attempt, so it
+    // is not a free unmetered oracle.
+    if (user && !user.password_hash && !user.banned) {
+      if (loginLimiter.blocked(req, res)) return;
+      loginLimiter.fail(req);
+      return res.status(401).json({
+        error: 'This account signs in with Google. Use the Google button below.',
+        code: 'use_google',
+      });
+    }
     if (!user || !verifyPassword(password, user.password_hash)) {
       if (loginLimiter.blocked(req, res)) return;
       loginLimiter.fail(req);
@@ -604,6 +989,17 @@ router.get('/2fa/status', requireAuth, async (req, res) => {
       email_2fa_enabled: !!req.user.email_2fa_enabled,
       email: req.user.email || null,
       discord_id: (req.user.discord_id && req.user.discord_verified) ? req.user.discord_id : null,
+      // Google, for the same card. The address is the one Google gave us, which
+      // is not necessarily the account's own email — showing the account email
+      // back would tell the customer nothing about WHICH Google account is
+      // attached, which is the only question this row answers.
+      google_email: req.user.google_id ? (req.user.google_email || null) : null,
+      google_linked: !!req.user.google_id,
+      // Drives the wording on the password field: an account that has never had
+      // a password is SETTING one, not changing one, and must not be asked for
+      // a current password it does not have.
+      has_password: !!req.user.password_hash,
+      google_available: googleConfigured(),
     });
   } catch (err) {
     res.status(500).json({ error: 'Failed to read 2FA status' });
@@ -658,18 +1054,95 @@ router.post('/2fa/confirm', requireAuth, async (req, res) => {
   }
 });
 
+// ─── Proving you are the owner, not just a session ──────
+// /2fa/disable, /2fa/email/disable and /2fa/discord/unlink all take a factor
+// OFF the account, so all three need more than the bearer token already in the
+// request: a stolen session must not be able to undress the account it walked
+// into.
+//
+// That used to mean "the current password", full stop. It became a one-way door
+// the moment an account could exist without one — sign up with Google, enable
+// the authenticator, and there is no password to type, so the factor can never
+// come back off. Exactly the shape of the hide button that could not unhide.
+//
+// So the question is not "what is your password" but "prove it is you", and the
+// account answers with whatever it actually holds:
+//   * the password, when it has one;
+//   * a live code from the enrolled authenticator — possession, which is what
+//     the password was standing in for;
+//   * an unused backup code, consumed on use;
+//   * a code just mailed to the address on the account, which is the only proof
+//     left for the one shape that holds none of the above (no password, email
+//     verification its only factor). That one has to be asked for deliberately
+//     via /2fa/email/start {reauth:true}, so a password attempt never burns a
+//     guess against it.
+//
+// Every branch is at least as strong as the password it replaces, and none of
+// them is something a session thief has by virtue of holding the session.
+// Returns { ok, usedBackupCode }.
+async function verifyReauth(user, given) {
+  const proof = String(given == null ? '' : given).trim();
+  if (!proof) return { ok: false };
+
+  if (user.password_hash && verifyPassword(proof, user.password_hash)) return { ok: true };
+  if (user.totp_enabled && user.totp_secret && verifyTOTP(user.totp_secret, proof)) return { ok: true };
+
+  reapEmailEnrollments();
+  const pending = pendingEmailEnrollments.get(String(user.id));
+  if (pending && pending.purpose === 'reauth') {
+    if (pending.attempts >= 8) {
+      pendingEmailEnrollments.delete(String(user.id));
+    } else if (safeCompare(hashLoginCode(proof), pending.hash)) {
+      pendingEmailEnrollments.delete(String(user.id));
+      return { ok: true };
+    } else {
+      pending.attempts++;
+    }
+  }
+
+  // Last, because it consumes: a backup code spent against a wrong guess on one
+  // of the branches above would be gone for nothing.
+  const { rows } = await query(
+    `UPDATE web_user_backup_codes SET used_at = now()
+      WHERE id = (SELECT id FROM web_user_backup_codes
+                   WHERE web_user_id = $1 AND used_at IS NULL AND code_hash = $2
+                   LIMIT 1)
+      RETURNING id`,
+    [user.id, hashBackupCode(proof)]
+  );
+  if (rows.length) return { ok: true, usedBackupCode: true };
+
+  return { ok: false };
+}
+
+// What the browser should ask this account for. An account with no password
+// must not be shown a "current password" box it can never fill.
+function reauthPrompt(user) {
+  if (user.password_hash) return 'password';
+  if (user.totp_enabled) return 'totp';
+  if (user.email_2fa_enabled) return 'email_code';
+  return 'password';
+}
+
 // ─── POST /api/auth/2fa/disable ─────────────────────────
-// Requires the current password: a hijacked session must not be able to strip
-// the second factor off the account it just walked into.
+// Requires proof of ownership: a hijacked session must not be able to strip the
+// second factor off the account it just walked into.
 router.post('/2fa/disable', requireAuth, async (req, res) => {
   try {
+    // `password` is still the field name because that is what every existing
+    // caller sends; it now carries whichever proof the account has.
     const { password } = req.body;
-    if (!password) return res.status(400).json({ error: 'Your password is required to disable 2FA' });
-    const { rows } = await query('SELECT password_hash FROM web_users WHERE id = $1', [req.user.id]);
-    if (!rows.length || !verifyPassword(password, rows[0].password_hash)) {
+    if (!password) {
+      return res.status(400).json({
+        error: 'Confirm it is you before disabling 2FA', needs: reauthPrompt(req.user),
+      });
+    }
+    const { rows } = await query('SELECT * FROM web_users WHERE id = $1', [req.user.id]);
+    const proof = rows.length ? await verifyReauth(rows[0], password) : { ok: false };
+    if (!proof.ok) {
       if (loginLimiter.blocked(req, res)) return;
       loginLimiter.fail(req);
-      return res.status(401).json({ error: 'Incorrect password' });
+      return res.status(401).json({ error: 'That did not match.', needs: reauthPrompt(req.user) });
     }
     await withTransaction(async (exec) => {
       await exec('UPDATE web_users SET totp_secret = NULL, totp_enabled = false WHERE id = $1', [req.user.id]);
@@ -699,16 +1172,24 @@ function reapEmailEnrollments() {
 router.post('/2fa/email/start', requireAuth, emailCodeLimiter, async (req, res) => {
   try {
     reapEmailEnrollments();
+    // Two errands, one mailing. `reauth` asks for a code to PROVE ownership
+    // (see verifyReauth) rather than to switch the factor on, and it is the
+    // only proof an account with no password and no authenticator has left.
+    // The two are told apart by `purpose` on the pending record, so a code sent
+    // for one can never be redeemed for the other.
+    const forReauth = !!(req.body && req.body.reauth);
     if (!req.user.email) return res.status(400).json({ error: 'This account has no email address on file.' });
-    if (req.user.email_2fa_enabled) return res.status(400).json({ error: 'Email verification is already enabled.' });
+    if (!forReauth && req.user.email_2fa_enabled) return res.status(400).json({ error: 'Email verification is already enabled.' });
+    if (forReauth && !req.user.email_2fa_enabled) return res.status(400).json({ error: 'Email verification is not enabled on this account.' });
 
     const code = generateEmailCode();
-    const sent = await sendLoginCode(req.user.email, code, 'setup');
+    const sent = await sendLoginCode(req.user.email, code, forReauth ? 'login' : 'setup');
     if (!sent) return res.status(502).json({ error: 'Could not send the confirmation email. Try again shortly.' });
 
     pendingEmailEnrollments.set(String(req.user.id), {
       hash: hashLoginCode(code),
       attempts: 0,
+      purpose: forReauth ? 'reauth' : 'enroll',
       expiresAt: Date.now() + 10 * 60 * 1000,
     });
     res.json({ success: true, sent: true, email: maskEmail(req.user.email) });
@@ -724,6 +1205,10 @@ router.post('/2fa/email/confirm', requireAuth, async (req, res) => {
     reapEmailEnrollments();
     const pending = pendingEmailEnrollments.get(String(req.user.id));
     if (!pending) return res.status(400).json({ error: 'That code expired. Send a new one.' });
+    // A code mailed to prove ownership must not be redeemable to switch the
+    // factor ON — otherwise the two purposes collapse into one and a reauth
+    // code becomes an enrolment.
+    if (pending.purpose !== 'enroll') return res.status(400).json({ error: 'That code expired. Send a new one.' });
     // Same eight-guess ceiling the login challenge uses; without it this is an
     // unlimited oracle on a six-digit code.
     if (pending.attempts >= 8) {
@@ -751,12 +1236,17 @@ router.post('/2fa/email/confirm', requireAuth, async (req, res) => {
 router.post('/2fa/email/disable', requireAuth, async (req, res) => {
   try {
     const { password } = req.body;
-    if (!password) return res.status(400).json({ error: 'Your password is required to disable email verification' });
-    const { rows } = await query('SELECT password_hash FROM web_users WHERE id = $1', [req.user.id]);
-    if (!rows.length || !verifyPassword(password, rows[0].password_hash)) {
+    if (!password) {
+      return res.status(400).json({
+        error: 'Confirm it is you before disabling email verification', needs: reauthPrompt(req.user),
+      });
+    }
+    const { rows } = await query('SELECT * FROM web_users WHERE id = $1', [req.user.id]);
+    const proof = rows.length ? await verifyReauth(rows[0], password) : { ok: false };
+    if (!proof.ok) {
       if (loginLimiter.blocked(req, res)) return;
       loginLimiter.fail(req);
-      return res.status(401).json({ error: 'Incorrect password' });
+      return res.status(401).json({ error: 'That did not match.', needs: reauthPrompt(req.user) });
     }
     await query('UPDATE web_users SET email_2fa_enabled = false WHERE id = $1 AND guild_id = $2',
       [req.user.id, GUILD_ID]);
@@ -1537,10 +2027,13 @@ router.post('/admin/unlink-discord', requireAdmin, async (req, res) => {
 router.post('/2fa/discord/unlink', requireAuth, async (req, res) => {
   try {
     const { password } = req.body || {};
-    if (!password) return res.status(400).json({ error: 'Password is required' });
-    const { rows } = await query('SELECT password_hash FROM web_users WHERE id = $1', [req.user.id]);
-    if (!rows.length || !verifyPassword(password, rows[0].password_hash)) {
-      return res.status(401).json({ error: 'Incorrect password' });
+    if (!password) {
+      return res.status(400).json({ error: 'Confirm it is you first', needs: reauthPrompt(req.user) });
+    }
+    const { rows } = await query('SELECT * FROM web_users WHERE id = $1', [req.user.id]);
+    const proof = rows.length ? await verifyReauth(rows[0], password) : { ok: false };
+    if (!proof.ok) {
+      return res.status(401).json({ error: 'That did not match.', needs: reauthPrompt(req.user) });
     }
     if (req.user.discord_verified && !req.user.totp_enabled && !req.user.email_2fa_enabled) {
       return res.status(400).json({

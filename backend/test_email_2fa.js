@@ -154,6 +154,14 @@ const exec = async (text, params) => {
     const u = userById(p[0]);
     return { rows: u ? [{ password_hash: u.password_hash }] : [] };
   }
+  // The disable routes re-read the WHOLE row now, not just the hash: proving
+  // ownership can be done with the password, a live TOTP code, a backup code or
+  // a mailed code, and choosing between those needs to see which the account
+  // actually has (verifyReauth in routes/auth.js).
+  if (/SELECT \* FROM web_users WHERE id/.test(t)) {
+    const u = userById(p[0]);
+    return { rows: u ? [u] : [] };
+  }
   if (/SELECT \(SELECT COUNT/.test(t)) return { rows: [{ codes_left: 0 }] };
   return { rows: [] };
 };
