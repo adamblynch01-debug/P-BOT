@@ -14,6 +14,10 @@ const {
 } = require('../utils/totp');
 const { sendLoginCode } = require('../utils/email');
 const { decodeImageDataUrl } = require('../utils/imageUpload');
+// Shared with routes/orders.js, which creates the same kind of row when a
+// claim is proven by the Discord account named on the order. Two writers of
+// one account shape is how you end up with two half-accounts.
+const { ensureDiscordAccount, freeUsername } = require('../utils/discordAccount');
 
 const GUILD_ID = process.env.GUILD_ID;
 
@@ -105,10 +109,33 @@ async function beginDiscordLogin(discordId) {
   if (!user || user.banned) {
     return { pending_id: require('crypto').randomUUID(), decoy: true };
   }
-  const sb = await axios.post(`${SUPERBOT_URL}/api/auth/initiate-2fa`, {
-    email: user.email,
-    discordId: id,
-  });
+  let sb;
+  try {
+    sb = await axios.post(`${SUPERBOT_URL}/api/auth/initiate-2fa`, {
+      // An account created from a Discord identity has no address at all (see
+      // migrations/discord_signup.sql), so the DM is labelled with whatever
+      // names this account to its owner. The bot takes account_label ahead of
+      // email; `email` is still sent so an older bot build keeps working.
+      email: user.email,
+      account_label: user.email || `@${user.username}`,
+      discordId: id,
+    });
+  } catch (err) {
+    // The DM is the one step of this flow that fails for a reason the customer
+    // can act on — closed DMs — and it used to surface as a 500 with the
+    // reason only in the logs.
+    //
+    // Returned rather than thrown, and returned as a DECOY, because the caller
+    // decides whether it is safe to repeat: the OAuth path may (the consent
+    // already proved who is asking, so it is their own DM setting being
+    // described), the typed-id path may not (an error there would tell an
+    // anonymous caller that the id they typed HAS an account, which is the one
+    // thing the decoy exists to hide).
+    const msg = (err.response && err.response.data && err.response.data.message)
+      || 'Could not send the Discord DM. Please try again.';
+    console.warn('[Auth] discord login DM failed:', msg);
+    return { pending_id: require('crypto').randomUUID(), decoy: true, dmError: msg };
+  }
   const sbSessionId = sb.data && sb.data.userId;
   if (!sbSessionId) throw new Error('Verification service did not start a session.');
   discordLoginPending.set(sbSessionId, { webUserId: user.id, expiresAt: Date.now() + 10 * 60 * 1000 });
@@ -281,11 +308,44 @@ router.get('/discord-oauth/callback', async (req, res) => {
       [discordAvatar, GUILD_ID, discordId]
     ).catch((e) => console.warn('[Auth] discord avatar refresh failed:', e.message));
 
-    const { pending_id, decoy } = await beginDiscordLogin(discordId);
-    // A verified linked account gets the DM; a decoy (no linked account) still
-    // returns a pending_id that will simply never verify. Either way the page
-    // shows "check your DMs", so this can't be used to probe who has an account.
-    return bounce({ discord_login: pending_id, ...(decoy ? { discord_login_hint: 'no_account' } : {}) });
+    // SIGN UP with Discord, for a snowflake we have never seen.
+    //
+    // This used to fall through to a decoy pending_id that never verifies, so
+    // a customer with no account pressed the button, was told to check their
+    // DMs, and waited for a DM nobody was going to send. Round 29 item 6.
+    //
+    // The consent we just completed is proof of this Discord account and of
+    // nothing else — which is exactly, and only, what the created row claims:
+    // discord_id verified, no email, no password (see
+    // migrations/discord_signup.sql). It cannot take over anything, because a
+    // snowflake already linked to a site account is found by the lookup rather
+    // than created.
+    //
+    // The decoy is not lost by this. It existed so the button could not be used
+    // to probe who has an account, and it still cannot: whoever completes the
+    // consent learns about their own account and no one else's.
+    let created = false;
+    try {
+      const r = await ensureDiscordAccount({
+        discordId,
+        username: (me.data && (me.data.global_name || me.data.username)) || null,
+        avatarHash: discordAvatar,
+      });
+      created = r.created;
+      if (created) console.log(`[Auth] Discord signup: created account ${r.user.username} for ${discordId}`);
+    } catch (e) {
+      console.error('[Auth] discord signup failed:', e.message);
+      return fail('Could not create your account. Please try again.');
+    }
+
+    // A new account still goes through the DM click, same as a returning one.
+    // Not ceremony: every delivery this store makes is a DM, so an account
+    // that cannot receive one cannot receive a purchase either. Finding that
+    // out at sign-up, where the message names the privacy setting to change,
+    // is better than finding it out when an order is waiting.
+    const { pending_id, dmError } = await beginDiscordLogin(discordId);
+    if (dmError) return fail(dmError);
+    return bounce({ discord_login: pending_id, ...(created ? { discord_new: '1' } : {}) });
   } catch (err) {
     console.error('[Auth] discord-oauth callback error:', err.response?.data || err.message);
     return fail(linkUserId ? 'Discord linking failed. Please try again.' : 'Discord login failed. Please try again.');
@@ -398,22 +458,8 @@ function googleUsernameSeed(email, name) {
   return /[a-zA-Z0-9]/.test(seed) ? seed : 'user';
 }
 
-async function freeUsername(seed) {
-  for (let i = 0; i < 25; i++) {
-    // First try is the bare seed; after that, a suffix. The last few attempts
-    // use randomness rather than a counter, because a counter walks straight
-    // into whatever another request is claiming at the same moment.
-    const candidate = i === 0 ? seed
-      : i < 20 ? `${seed}${i + 1}`
-      : `${seed}_${crypto.randomBytes(3).toString('hex')}`;
-    const { rows } = await query(
-      'SELECT 1 FROM web_users WHERE guild_id = $1 AND lower(username) = lower($2)',
-      [GUILD_ID, candidate]
-    );
-    if (!rows.length) return candidate;
-  }
-  return `user_${crypto.randomBytes(6).toString('hex')}`;
-}
+// freeUsername() moved to utils/discordAccount.js when a second signup path
+// needed it. Same function, one copy.
 
 router.get('/google-oauth/start', (req, res) => {
   reapGoogleStates();
@@ -819,7 +865,7 @@ router.post('/login/discord-challenge', async (req, res) => {
     if (!challenge_id) return res.status(400).json({ error: 'challenge_id is required' });
 
     const { rows } = await query(
-      `SELECT c.*, u.email, u.discord_id, u.discord_verified, u.banned
+      `SELECT c.*, u.email, u.username, u.discord_id, u.discord_verified, u.banned
          FROM web_login_challenges c JOIN web_users u ON u.id = c.web_user_id
         WHERE c.id = $1 AND c.guild_id = $2 AND c.consumed_at IS NULL AND c.expires_at > now()`,
       [challenge_id, GUILD_ID]
@@ -835,6 +881,9 @@ router.post('/login/discord-challenge', async (req, res) => {
     try {
       const sb = await axios.post(`${SUPERBOT_URL}/api/auth/initiate-2fa`, {
         email: row.email,
+        // An account created through SIGN IN WITH DISCORD has no address, and
+        // the DM has to call it something. See utils/discordAccount.js.
+        account_label: row.email || `@${row.username}`,
         discordId: row.discord_id,
       });
       sbSessionId = sb.data && sb.data.userId;
@@ -1338,13 +1387,28 @@ router.patch('/profile', requireAuth, async (req, res) => {
     const { username, email, avatar, new_password, current_password } = req.body;
 
     const nextUsername = username != null ? String(username).trim() : req.user.username;
-    const nextEmail = email != null ? String(email).trim() : req.user.email;
+    // Null rather than '' when there is no address, because that is what the
+    // column holds and '' would be an address as far as UNIQUE (guild_id,
+    // email) is concerned — the second addressless account to save its profile
+    // would collide with the first.
+    const nextEmail = email != null ? (String(email).trim() || null) : (req.user.email || null);
     const nextAvatar = avatar != null ? String(avatar).trim() : undefined;
 
     if (!nextUsername) return res.status(400).json({ error: 'Username cannot be empty' });
     if (nextUsername.length > 32) return res.status(400).json({ error: 'Username must be 32 characters or fewer' });
-    if (!nextEmail) return res.status(400).json({ error: 'Email cannot be empty' });
-    if (!EMAIL_RE.test(nextEmail)) return res.status(400).json({ error: 'That does not look like an email address' });
+    // An account signed up through Discord has no address and the form posts
+    // an empty box; rejecting that made the WHOLE page unsaveable for them —
+    // avatar, username, password, all of it — over a field they were never
+    // given. Blank is only accepted while the account genuinely has none:
+    // an address already on file cannot be blanked, because it is the
+    // account-recovery pivot and losing it silently is how someone gets locked
+    // out. Round 29 item 6.
+    if (!nextEmail && req.user.email) {
+      return res.status(400).json({ error: 'Email cannot be empty' });
+    }
+    if (nextEmail && !EMAIL_RE.test(nextEmail)) {
+      return res.status(400).json({ error: 'That does not look like an email address' });
+    }
     // The avatar is a single emoji; anything longer is not one, and this
     // column is rendered straight into the page.
     if (nextAvatar !== undefined && nextAvatar.length > 8) {
@@ -1357,7 +1421,7 @@ router.patch('/profile', requireAuth, async (req, res) => {
     // Case-insensitively, because the unique index is case-insensitive and
     // "changing" GHOST.EXE@gmail.com to ghost.exe@gmail.com should not be
     // treated as moving to a new mailbox.
-    const emailChanged = nextEmail.toLowerCase() !== String(req.user.email || '').toLowerCase();
+    const emailChanged = String(nextEmail || '').toLowerCase() !== String(req.user.email || '').toLowerCase();
     const usernameChanged = nextUsername.toLowerCase() !== String(req.user.username || '').toLowerCase();
     const passwordChanged = !!(new_password != null && String(new_password).length);
 
@@ -1634,6 +1698,7 @@ router.post('/link-discord/start', requireAuth, discordLoginLimiter, async (req,
     try {
       const sb = await axios.post(`${SUPERBOT_URL}/api/auth/initiate-2fa`, {
         email: req.user.email,
+        account_label: req.user.email || `@${req.user.username}`,
         discordId,
       });
       sbRef = sb.data && sb.data.userId;

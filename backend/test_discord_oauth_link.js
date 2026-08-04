@@ -34,6 +34,7 @@ const store = {
     { id: 2, guild_id: 'test-guild', username: 'other', email: 'other@example.com', role: 'member', banned: false, discord_id: '999999999999999999', discord_verified: true, balance_cents: 0 },
   ],
   sessions: [{ token: 'sess-buyer', userId: 1 }],
+  balances: [],
 };
 const userById = (id) => store.users.find(u => String(u.id) === String(id));
 
@@ -56,6 +57,34 @@ const exec = async (text, params) => {
   if (/SELECT id, email, username, banned FROM web_users/.test(t)) {
     const rows = store.users.filter(u => u.discord_id === p[1] && u.discord_verified);
     return { rows: rows.map(u => ({ id: u.id, email: u.email, username: u.username, banned: u.banned })) };
+  }
+  // ─── ensureDiscordAccount (round 29 item 6) ───
+  // The login branch of the callback now SIGNS UP an unknown snowflake instead
+  // of handing back a decoy that never verifies, so this stub has to answer the
+  // three queries that does. Without them the callback catches and reports
+  // "Could not create your account", which looks exactly like a link bug.
+  if (/SELECT u\.\*, b\.balance_cents FROM web_users u/.test(t)) {
+    const u = store.users.find(x => x.discord_id === p[1] && x.discord_verified);
+    return { rows: u ? [Object.assign({}, u)] : [] };
+  }
+  if (/SELECT 1 FROM web_users WHERE guild_id = \$1 AND lower\(username\) = lower\(\$2\)/.test(t)) {
+    const taken = store.users.some(u => String(u.username).toLowerCase() === String(p[1]).toLowerCase());
+    return { rows: taken ? [{ '?column?': 1 }] : [] };
+  }
+  if (/INSERT INTO web_users \(guild_id, username, discord_id, discord_verified/.test(t)) {
+    const row = {
+      id: store.users.length + 1, guild_id: p[0], username: p[1],
+      // The whole point of the row: no address, no password. A stub that
+      // invented either would let a regression on that pass unnoticed.
+      email: null, password_hash: null, role: 'member', banned: false,
+      discord_id: p[2], discord_verified: true, discord_avatar: p[3], balance_cents: 0,
+    };
+    store.users.push(row);
+    return { rows: [Object.assign({}, row)] };
+  }
+  if (/INSERT INTO balances/.test(t)) {
+    store.balances.push({ web_user_id: p[0], guild_id: p[1] });
+    return { rows: [] };
   }
   return { rows: [] };
 };
@@ -207,6 +236,39 @@ async function check(name, fn) {
     assert.ok(/discord_login=/.test(back.location), 'got ' + back.location);
     assert.ok(!/discord_link=/.test(back.location), 'a login was reported as a link');
     assert.strictEqual(userById(1).discord_id, null, 'the login path wrote a link');
+  });
+
+  await check('an unknown snowflake signs up instead of getting a dead decoy', async () => {
+    // Round 29 item 6. Before this, a consent from someone with no account came
+    // back with a pending_id that nothing was ever going to verify: the button
+    // said "check your DMs" and no DM was coming.
+    discordIdentity = '222222222222222222';
+    const before = store.users.length;
+    const start = await call('GET', '/api/auth/discord-oauth/start?return_to=https://uhservices.xyz');
+    const back = await call('GET', '/api/auth/discord-oauth/callback?code=abc&state=' + stateOf(start.location));
+    discordIdentity = '111111111111111111';
+    assert.ok(/discord_login=/.test(back.location), 'got ' + back.location);
+    assert.ok(/discord_new=1/.test(back.location), 'the storefront was not told this is a new account');
+    assert.strictEqual(store.users.length, before + 1, 'no account was created');
+    const made = store.users[store.users.length - 1];
+    assert.strictEqual(made.discord_id, '222222222222222222');
+    assert.strictEqual(made.discord_verified, true);
+    // Discord IS the credential here; a placeholder in either column would be
+    // a login that something other than Discord can satisfy.
+    assert.strictEqual(made.email, null, 'a signup by Discord invented an email');
+    assert.strictEqual(made.password_hash, null, 'a signup by Discord invented a password');
+    assert.ok(store.balances.some(b => String(b.web_user_id) === String(made.id)), 'no wallet row');
+  });
+
+  await check('a returning snowflake is found, not signed up again', async () => {
+    discordIdentity = '999999999999999999'; // user 2, already linked + verified
+    const before = store.users.length;
+    const start = await call('GET', '/api/auth/discord-oauth/start?return_to=https://uhservices.xyz');
+    const back = await call('GET', '/api/auth/discord-oauth/callback?code=abc&state=' + stateOf(start.location));
+    discordIdentity = '111111111111111111';
+    assert.ok(/discord_login=/.test(back.location), 'got ' + back.location);
+    assert.ok(!/discord_new=/.test(back.location), 'an existing account was announced as new');
+    assert.strictEqual(store.users.length, before, 'a second account was created for one snowflake');
   });
 
   await check('a failed token exchange reports a LINK error, not a login error', async () => {

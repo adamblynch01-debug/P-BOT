@@ -8,6 +8,10 @@ const { notifyBot } = require('../utils/botNotify');
 const { invoiceNo, normalizeInvoiceNo } = require('../utils/invoiceNo');
 const { attachUser, requireAuth, requireAdmin, requireDiscordLinked, botAuthorized, botAuthUnavailable } = require('../utils/auth');
 const { safeCompare } = require('../utils/rateLimit');
+// Shared with routes/auth.js, which creates the same kind of row when an OAuth
+// consent names a snowflake we have never seen. Two writers of one account
+// shape is how a customer ends up with two half-accounts.
+const { ensureDiscordAccount } = require('../utils/discordAccount');
 const {
   normalizeCode, previewCoupon, reserveCoupon, attachRedemptionOrder, releaseCoupon, publicView,
 } = require('../utils/coupons');
@@ -598,11 +602,30 @@ router.post('/create', requireAuth, requireDiscordLinked, async (req, res) => {
 });
 
 // ─── GET /api/orders/mine ───────────────────────────────
+// Keyed on web_user_id ALONE this missed every order the customer did not
+// place while signed in — a staff hand-delivery through
+// /manual-order-delivery writes a discord_id and can leave web_user_id null,
+// and the buyer then had a delivered order that appeared in no list they could
+// reach. Round 29 item 6: "So order can be looked up by user also".
+//
+// The second leg is safe because `discord_verified` is what it reads: that
+// flag is only ever set by an OAuth consent on Discord's own domain or by a
+// DM the member clicked, so an order carrying that snowflake is the same
+// person by the same standard the claim uses. An UNVERIFIED discord_id is a
+// number someone typed into a profile field, and would let anyone type their
+// way into someone else's order history.
+//
+// guild_id is in the WHERE for the first time here. It is one store today, so
+// this changes nothing now and is wrong to leave out the moment it is not.
 router.get('/mine', requireAuth, async (req, res) => {
   try {
+    const linked = (req.user.discord_id && req.user.discord_verified) ? String(req.user.discord_id) : null;
     const { rows } = await query(
-      `SELECT * FROM orders WHERE web_user_id = $1 ORDER BY created_at DESC`,
-      [req.user.id]
+      `SELECT * FROM orders
+        WHERE guild_id = $1
+          AND (web_user_id = $2 OR ($3::text IS NOT NULL AND discord_id = $3))
+        ORDER BY created_at DESC`,
+      [GUILD_ID, req.user.id, linked]
     );
     res.json({ orders: rows.map(formatOrder) });
   } catch (err) {
@@ -832,89 +855,261 @@ function maskEmail(e) {
   return `${head}***${tail}@${domain}`;
 }
 
+// ─── Who is allowed to claim an order ───────────────────
+// One function, because two routes now ask: /verify-claim, which only answers,
+// and /claim, which answers and then WRITES. A second copy of this rule would
+// mean the thing that grants the role and the thing that hands over the order
+// history could drift apart, and the one that drifted would be the one nobody
+// tested.
+//
+// Three independent proofs, any one of which is enough:
+//
+//   discord   the order names this exact Discord account. The strongest of the
+//             three — checkout writes it from a verified link and staff write
+//             it when hand-delivering — and the ONLY one available for an order
+//             with no address on it at all.
+//   email     the claimer typed an address belonging to this buyer.
+//   account   the order already belongs to the site account this Discord user
+//             signs into.
+//
+// An order with no email, no discord_id and no web_user_id is claimable by
+// NOBODY, deliberately. The invoice number alone must never be sufficient:
+// invoice numbers get screenshotted into tickets and pasted into chats, and
+// treating one as a credential would hand the order to whoever saw it.
+async function resolveClaim({ order_id, email, discord_id }) {
+  // Customers are given an invoice number, not the internal id, so that is
+  // what they will type. The numeric id still works: every order placed before
+  // invoice numbers existed was confirmed with one, and those receipts are
+  // already in people's inboxes.
+  const ident = orderIdentifier(order_id);
+  if (!ident) return { notFound: true };
+
+  const { rows } = await query(
+    `SELECT id, invoice_no, status, email, discord_id, web_user_id
+       FROM orders WHERE ${ident.column} = $1 AND guild_id = $2`,
+    [ident.value, GUILD_ID]
+  );
+  const order = rows[0];
+  if (!order) return { notFound: true };
+
+  // Every address that belongs to this buyer, not just the one captured at
+  // checkout.
+  //
+  // This used to be a single comparison against orders.email, which is
+  // narrower than the truth. A customer with two addresses — a personal one
+  // used on some orders, the account one on others — types the wrong half of
+  // their own history and gets told their own invoice is not theirs, with no
+  // hint as to which address the order actually carries. It is the same
+  // person either way, so the account behind the order and every other order
+  // that same account (or the same Discord user) has placed all count.
+  //
+  // A guest checkout has neither a web_user_id nor a discord_id, and falls
+  // back to exactly the old behaviour: the order's own address.
+  const norm = s => String(s == null ? '' : s).trim().toLowerCase();
+  const known = new Set();
+  if (order.email) known.add(norm(order.email));
+  if (order.web_user_id) {
+    const { rows: acct } = await query(
+      'SELECT email FROM web_users WHERE id = $1 AND guild_id = $2',
+      [order.web_user_id, GUILD_ID]
+    );
+    if (acct[0] && acct[0].email) known.add(norm(acct[0].email));
+  }
+  if (order.web_user_id || order.discord_id) {
+    // `= NULL` is NULL rather than true, so a null side never widens this.
+    const { rows: siblings } = await query(
+      `SELECT DISTINCT email FROM orders
+        WHERE guild_id = $1 AND email IS NOT NULL
+          AND (web_user_id = $2 OR discord_id = $3)`,
+      [GUILD_ID, order.web_user_id || null, order.discord_id || null]
+    );
+    for (const s of siblings) if (s.email) known.add(norm(s.email));
+  }
+  known.delete('');
+
+  const claimer = String(discord_id || '').trim() || null;
+  const emailMatch = !!email && known.has(norm(email));
+  const ownsByDiscord = !!claimer && !!order.discord_id && String(order.discord_id) === claimer;
+
+  // The third proof needs a lookup of its own: the claimer may already hold a
+  // site account, and the order may already be attached to it, without either
+  // carrying the other's identifier directly.
+  let ownsByAccount = false;
+  if (claimer && order.web_user_id) {
+    const { rows: mine } = await query(
+      `SELECT id FROM web_users
+        WHERE guild_id = $1 AND discord_id = $2 AND discord_verified = true`,
+      [GUILD_ID, claimer]
+    );
+    ownsByAccount = !!mine[0] && String(mine[0].id) === String(order.web_user_id);
+  }
+
+  return {
+    order,
+    emailMatch,
+    ownsByDiscord,
+    ownsByAccount,
+    proven: emailMatch || ownsByDiscord || ownsByAccount,
+    paid: ['paid', 'delivered'].includes(order.status),
+    // Which proof carried it, for the reply the customer reads. Ordered
+    // strongest first so "Discord account on the order" wins the label when
+    // both happen to hold.
+    via: ownsByDiscord ? 'discord' : ownsByAccount ? 'account' : emailMatch ? 'email' : null,
+    // Whether this order carries an address at all decides what the failure
+    // message should say — "that email does not match" is nonsense advice for
+    // an order that has no email to match against.
+    hasEmail: !!order.email,
+  };
+}
+
 // ─── POST /api/orders/verify-claim ──────────────────────
-// Secret-gated: SUPERBOT's /claim-customer checks that an order is paid and
-// that the supplied email matches the order on record before granting the
-// Customer role. Kept separate from GET /:id — which does hand the address to
-// staff and to the bot, but never to a caller holding only the public ref —
-// because this route answers "does THIS address match" without the caller
-// needing to be shown the address at all.
+// Secret-gated: the read-only half. Answers "does this prove ownership" without
+// the caller needing to be shown the address at all — which is why it is kept
+// separate from GET /:id, which does hand the address to staff and to the bot.
+//
+// `email` is no longer required. An order hand-delivered through
+// /manual-order-delivery can have no address on it, and demanding one meant the
+// buyer had nothing to type and their own paid order was unclaimable — the
+// Discord proof below was already accepted, the form just never let anyone
+// reach it. Round 29 item 6.
 router.post('/verify-claim', async (req, res) => {
   try {
-    const { order_id, email } = req.body;
+    const { order_id, email, discord_id } = req.body;
     if (botAuthUnavailable()) return res.status(503).json({ error: 'Server not configured' });
     if (!botAuthorized(req)) return res.status(401).json({ error: 'Unauthorized' });
-    if (!order_id || !email) return res.status(400).json({ error: 'order_id and email are required' });
-
-    // Customers are now given an invoice number, not the internal id, so that
-    // is what they will type into /claim-customer. The numeric id still works:
-    // every order placed before this existed was confirmed with one, and those
-    // receipts are already in people's inboxes.
-    const invNo = normalizeInvoiceNo(order_id);
-    const numericId = /^\d+$/.test(String(order_id).trim()) ? String(order_id).trim() : null;
-    if (!invNo && !numericId) return res.status(404).json({ error: 'Order not found' });
-
-    const { rows } = await query(
-      invNo
-        ? 'SELECT id, invoice_no, status, email, discord_id, web_user_id FROM orders WHERE invoice_no = $1 AND guild_id = $2'
-        : 'SELECT id, invoice_no, status, email, discord_id, web_user_id FROM orders WHERE id = $1 AND guild_id = $2',
-      [invNo || numericId, GUILD_ID]
-    );
-    const order = rows[0];
-    if (!order) return res.status(404).json({ error: 'Order not found' });
-
-    // Every address that belongs to this buyer, not just the one captured at
-    // checkout.
-    //
-    // This used to be a single comparison against orders.email, which is
-    // narrower than the truth. A customer with two addresses — a personal one
-    // used on some orders, the account one on others — types the wrong half of
-    // their own history and gets told their own invoice is not theirs, with no
-    // hint as to which address the order actually carries. It is the same
-    // person either way, so the account behind the order and every other order
-    // that same account (or the same Discord user) has placed all count.
-    //
-    // A guest checkout has neither a web_user_id nor a discord_id, and falls
-    // back to exactly the old behaviour: the order's own address.
-    const norm = s => String(s == null ? '' : s).trim().toLowerCase();
-    const known = new Set();
-    if (order.email) known.add(norm(order.email));
-    if (order.web_user_id) {
-      const { rows: acct } = await query(
-        'SELECT email FROM web_users WHERE id = $1 AND guild_id = $2',
-        [order.web_user_id, GUILD_ID]
-      );
-      if (acct[0] && acct[0].email) known.add(norm(acct[0].email));
+    if (!order_id) return res.status(400).json({ error: 'order_id is required' });
+    if (!email && !discord_id) {
+      return res.status(400).json({ error: 'order_id needs an email or a discord_id to check against' });
     }
-    if (order.web_user_id || order.discord_id) {
-      // `= NULL` is NULL rather than true, so a null side never widens this.
-      const { rows: siblings } = await query(
-        `SELECT DISTINCT email FROM orders
-          WHERE guild_id = $1 AND email IS NOT NULL
-            AND (web_user_id = $2 OR discord_id = $3)`,
-        [GUILD_ID, order.web_user_id || null, order.discord_id || null]
-      );
-      for (const s of siblings) if (s.email) known.add(norm(s.email));
-    }
-    known.delete('');
 
-    const emailMatch = known.has(norm(email));
-    const isPaid = ['paid', 'delivered'].includes(order.status);
+    const c = await resolveClaim({ order_id, email, discord_id });
+    if (c.notFound) return res.status(404).json({ error: 'Order not found' });
+
     res.json({
-      order_id: String(order.id),
-      invoice_no: order.invoice_no || null,
-      status: order.status,
-      email_match: emailMatch,
-      paid: isPaid,
-      eligible: emailMatch && isPaid,
-      discord_id: order.discord_id || null,
+      order_id: String(c.order.id),
+      invoice_no: c.order.invoice_no || null,
+      status: c.order.status,
+      email_match: c.emailMatch,
+      owns_by_discord: c.ownsByDiscord,
+      owns_by_account: c.ownsByAccount,
+      eligible: c.proven && c.paid,
+      proven: c.proven,
+      via: c.via,
+      paid: c.paid,
+      has_email: c.hasEmail,
+      discord_id: c.order.discord_id || null,
       // Masked, so a failed attempt can say WHICH address is expected without
       // handing the address itself to whoever typed the invoice number.
-      email_hint: maskEmail(order.email),
+      email_hint: maskEmail(c.order.email),
     });
   } catch (err) {
     console.error('[Orders] verify-claim error:', err);
     res.status(500).json({ error: 'Failed to verify claim' });
+  }
+});
+
+// ─── POST /api/orders/claim ─────────────────────────────
+// Secret-gated. Verify-claim's writing counterpart, and the whole of round 29
+// item 6: "If user has not made an account and no email found. Have it register
+// with their discord account then. So they can redeem. So order can be looked up
+// by user also!!"
+//
+// Granting the Customer role was all a claim ever did. The order stayed exactly
+// as it was — web_user_id null — so it appeared in no list the buyer could
+// reach, and a buyer with no site account had nothing for it to appear in. This
+// route closes both:
+//
+//   1. proves ownership (resolveClaim, above — unchanged rules)
+//   2. finds or CREATES the claimer's site account from their Discord identity
+//   3. attaches the order, and the rest of their unowned history with it
+//
+// The role itself is still the bot's to grant; this route touches no Discord
+// state and the bot calls it before adding the role, so a failure here never
+// leaves a member holding a role for an order that was not attached.
+router.post('/claim', async (req, res) => {
+  try {
+    const { order_id, email, discord_id, discord_username, discord_avatar } = req.body;
+    if (botAuthUnavailable()) return res.status(503).json({ error: 'Server not configured' });
+    if (!botAuthorized(req)) return res.status(401).json({ error: 'Unauthorized' });
+    if (!order_id) return res.status(400).json({ error: 'order_id is required' });
+    // Unlike verify-claim, this one cannot run without knowing WHO is claiming:
+    // there is no account to attach anything to otherwise.
+    if (!discord_id) return res.status(400).json({ error: 'discord_id is required' });
+
+    const c = await resolveClaim({ order_id, email, discord_id });
+    if (c.notFound) return res.status(404).json({ error: 'Order not found' });
+
+    // Refused before anything is created. An account conjured for a claim that
+    // then fails is an orphan the customer never asked for.
+    if (!c.proven || !c.paid) {
+      return res.json({
+        success: false,
+        proven: c.proven,
+        paid: c.paid,
+        status: c.order.status,
+        has_email: c.hasEmail,
+        invoice_no: c.order.invoice_no || null,
+        email_hint: maskEmail(c.order.email),
+      });
+    }
+
+    const { user, created } = await ensureDiscordAccount({
+      discordId: discord_id,
+      username: discord_username,
+      avatarHash: discord_avatar,
+    });
+
+    // `web_user_id IS NULL` on every attach: an order that already belongs to
+    // an account is not moved. Two people who can both prove a claim — a
+    // shared address, a resold invoice — must not be able to take an order off
+    // each other, and staff reassigning an owner must not be silently undone
+    // by the next claim.
+    const { rows: mine } = await query(
+      `UPDATE orders SET web_user_id = $1, discord_id = COALESCE(discord_id, $2)
+        WHERE id = $3 AND guild_id = $4 AND web_user_id IS NULL
+        RETURNING id`,
+      [user.id, String(discord_id), c.order.id, GUILD_ID]
+    );
+
+    // The sweep, and the reason a claim is worth making once rather than once
+    // per invoice: everything else this Discord account bought and never had
+    // attached comes across too.
+    //
+    // Keyed on discord_id ONLY, never on the typed address. The bot checked
+    // that this snowflake is the member standing in front of it, so it is
+    // proof of an account the claimer controls; a typed address is proof of a
+    // string they know, and sweeping on it would let anyone holding one
+    // invoice-and-email pair collect a stranger's whole history.
+    const { rows: swept } = await query(
+      `UPDATE orders SET web_user_id = $1
+        WHERE guild_id = $2 AND web_user_id IS NULL AND discord_id = $3
+        RETURNING id`,
+      [user.id, GUILD_ID, String(discord_id)]
+    );
+
+    const attached = new Set([...mine, ...swept].map(r => String(r.id)));
+    console.log(`[Orders] claim ${c.order.invoice_no || c.order.id} by ${discord_id} via ${c.via}`
+      + ` → account ${user.username}${created ? ' (created)' : ''}, ${attached.size} order(s) attached`);
+
+    res.json({
+      success: true,
+      proven: true,
+      paid: true,
+      via: c.via,
+      invoice_no: c.order.invoice_no || null,
+      status: c.order.status,
+      account_created: created,
+      username: user.username,
+      has_email: !!user.email,
+      orders_attached: attached.size,
+      // False when the order already belonged to someone — the role is still
+      // owed (ownership was proven), but nothing moved, and a reply that
+      // claimed otherwise would be a lie the customer could check.
+      order_attached: mine.length > 0,
+    });
+  } catch (err) {
+    console.error('[Orders] claim error:', err);
+    res.status(500).json({ error: 'Failed to claim order' });
   }
 });
 
