@@ -50,6 +50,23 @@ if (!OFF) {
   delete process.env.GOOGLE_CLIENT_SECRET;
 }
 
+// A second child run, for round 29 item 5: Google's consent screen reads "to
+// continue to <host of redirect_uri>", so the only way it says uhservices.xyz
+// is for the callback itself to live there. This leg proves the override moves
+// GOOGLE's callback and leaves DISCORD's where it was — a single shared
+// variable would move both, and Discord rejects any redirect_uri its developer
+// portal has not been told about.
+const DOMAIN = process.env.GX_GOOGLE_DOMAIN === '1';
+const CUSTOM_CB = 'https://api.uhservices.xyz/api/auth/google-oauth/callback';
+if (DOMAIN) {
+  process.env.GOOGLE_REDIRECT_URI = CUSTOM_CB;
+  // Only here: the other legs assert on a Discord-less config.
+  process.env.DISCORD_CLIENT_ID = 'discord-client-id-123';
+  process.env.DISCORD_CLIENT_SECRET = 'discord-client-secret-456';
+} else {
+  delete process.env.GOOGLE_REDIRECT_URI;
+}
+
 const totp = require('./utils/totp');
 const TOTP_SECRET = totp.generateSecret();
 const liveTotpCode = () => {
@@ -137,8 +154,13 @@ const exec = async (text, params) => {
   if (/SELECT id FROM web_users WHERE guild_id = \$1 AND google_id = \$2 AND id <> \$3/.test(t)) {
     return { rows: store.users.filter(u => u.google_id === p[1] && String(u.id) !== String(p[2])).map(u => ({ id: u.id })) };
   }
-  if (/UPDATE web_users SET google_id = \$1, google_email = \$2 WHERE id = \$3 AND guild_id = \$4/.test(t)) {
-    const u = userById(p[2]); if (u) { u.google_id = p[0]; u.google_email = p[1]; }
+  // Loose about the columns BETWEEN google_email and the WHERE: round 29 item 4
+  // added google_avatar here, and the stub's exact-match regex stopped matching,
+  // so the link silently never landed and two cases failed as if the product had
+  // broken. A stub that pins the whole statement fails on every future column.
+  if (/UPDATE web_users SET google_id = \$1, google_email = \$2.* WHERE id = \$3 AND guild_id = \$4/.test(t)) {
+    const u = userById(p[2]);
+    if (u) { u.google_id = p[0]; u.google_email = p[1]; if (p[4] !== undefined) u.google_avatar = p[4]; }
     return { rows: [] };
   }
   // ── resolution ──
@@ -220,12 +242,17 @@ require.cache[dbPath] = {
 let identity = { sub: 'sub-new', email: 'newcomer@gmail.com', email_verified: true, name: 'New Comer' };
 let tokenExchangeWorks = true;
 let tokenResponse = { access_token: 'tok' };
+let lastTokenBody = null;
 const axiosPath = require.resolve('axios');
 require.cache[axiosPath] = {
   id: axiosPath, filename: axiosPath, loaded: true,
   exports: {
-    post: async (url) => {
+    post: async (url, body) => {
       if (/oauth2\.googleapis\.com\/token/.test(url)) {
+        // Kept so the redirect_uri sent here can be compared with the one sent
+        // to the consent screen. Google compares them too, and answers a
+        // mismatch with invalid_grant — which reads like a broken code.
+        lastTokenBody = body;
         if (!tokenExchangeWorks) throw new Error('invalid_grant');
         return { data: tokenResponse };
       }
@@ -285,6 +312,51 @@ async function check(name, fn) {
 
 (async () => {
   await new Promise(r => server.listen(0, '127.0.0.1', r));
+
+  // ── the custom-domain half, run as a child process ─────────────────────────
+  if (DOMAIN) {
+    console.log('\ngoogle sign-in, callback moved to a uhservices.xyz host');
+
+    await check('the consent screen is sent the custom callback', async () => {
+      const r = await call('GET', '/api/auth/google-oauth/start');
+      assert.strictEqual(r.status, 302, JSON.stringify(r.body));
+      const sent = new URL(r.location).searchParams.get('redirect_uri');
+      assert.strictEqual(sent, CUSTOM_CB);
+      // The screenshot in round 29: "to continue to captivating-happiness-
+      // production-c944.up.railway.app". This host is what the customer reads.
+      assert.strictEqual(new URL(sent).hostname, 'api.uhservices.xyz');
+    });
+
+    await check('the token exchange sends the SAME callback, byte for byte', async () => {
+      // Google compares the two and answers a mismatch with invalid_grant,
+      // which surfaces as "Google sign-in failed" with the reason nowhere.
+      const start = await call('GET', '/api/auth/google-oauth/start');
+      lastTokenBody = null;
+      await call('GET', '/api/auth/google-oauth/callback?code=abc&state=' + stateOf(start.location));
+      assert.ok(lastTokenBody, 'the token exchange never happened');
+      assert.strictEqual(new URLSearchParams(lastTokenBody).get('redirect_uri'), CUSTOM_CB);
+    });
+
+    await check('moving Google does NOT move Discord', async () => {
+      // The reason these are two variables. Discord refuses any redirect_uri
+      // not listed in its developer portal, so dragging it along with a Google
+      // branding change would break Discord login on deploy.
+      const r = await call('GET', '/api/auth/discord-oauth/start');
+      assert.strictEqual(r.status, 302, JSON.stringify(r.body));
+      const sent = new URL(r.location).searchParams.get('redirect_uri');
+      assert.strictEqual(sent, 'https://backend.example/api/auth/discord-oauth/callback');
+    });
+
+    await check('the storefront still learns nothing but booleans', async () => {
+      const r = await call('GET', '/api/auth/oauth-config');
+      assert.deepStrictEqual(Object.keys(r.body).sort(), ['discord', 'google'],
+        'a callback URL is not a secret, but this route is the wrong place to grow one');
+    });
+
+    server.close();
+    console.log(`\n  ${passed} passed, ${failed} failed\n`);
+    process.exit(failed ? 1 : 0);
+  }
 
   // ── the unconfigured half, run as a child process ──────────────────────────
   if (OFF) {
@@ -689,6 +761,14 @@ async function check(name, fn) {
       { env: Object.assign({}, process.env, {
           GX_GOOGLE_OFF: '1', GOOGLE_CLIENT_ID: '', GOOGLE_CLIENT_SECRET: '' }),
         stdio: 'inherit' });
+    child.on('exit', (code) => { if (code) failed++; resolve(); });
+  });
+
+  // ── and again with the callback on a uhservices.xyz host ───────────────────
+  await new Promise((resolve) => {
+    const child = require('child_process').spawn(
+      process.execPath, [__filename],
+      { env: Object.assign({}, process.env, { GX_GOOGLE_DOMAIN: '1' }), stdio: 'inherit' });
     child.on('exit', (code) => { if (code) failed++; resolve(); });
   });
 

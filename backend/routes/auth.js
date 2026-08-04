@@ -156,7 +156,29 @@ async function beginDiscordLogin(discordId) {
 const OAUTH_CLIENT_ID = process.env.DISCORD_CLIENT_ID || process.env.CLIENT_ID;
 const OAUTH_CLIENT_SECRET = process.env.DISCORD_CLIENT_SECRET;
 const BACKEND_PUBLIC_URL = (process.env.BACKEND_PUBLIC_URL || 'https://captivating-happiness-production-c944.up.railway.app').replace(/\/$/, '');
-const OAUTH_REDIRECT_URI = `${BACKEND_PUBLIC_URL}/api/auth/discord-oauth/callback`;
+
+// The callback URL each provider sends the browser back to.
+//
+// Overridable PER PROVIDER, and that is the whole point (round 29 item 5).
+// Google's consent screen reads "to continue to <host of redirect_uri>" — not
+// the app name — so today it says captivating-happiness-production-c944.up.
+// railway.app to every customer signing in. Fixing that means moving the
+// callback onto a custom domain (api.uhservices.xyz), and moving it by editing
+// BACKEND_PUBLIC_URL would move DISCORD's callback in the same breath. Discord
+// refuses any redirect_uri not listed in its developer portal, so one variable
+// for both makes a branding change into an all-providers-at-once cutover with
+// Discord login broken in the window between the deploy and the portal edit.
+//
+// Separate variables let the move happen one provider at a time, with the old
+// URL still registered alongside the new one so nothing is down mid-flight.
+// The value must be byte-identical to the one registered with the provider AND
+// to the one sent in the token exchange, which is why it is read once here
+// rather than rebuilt at each call site.
+function redirectUri(envValue, path) {
+  const raw = String(envValue || '').trim();
+  return raw ? raw.replace(/\/$/, '') : `${BACKEND_PUBLIC_URL}${path}`;
+}
+const OAUTH_REDIRECT_URI = redirectUri(process.env.DISCORD_REDIRECT_URI, '/api/auth/discord-oauth/callback');
 // Origins the callback is allowed to redirect the browser back to. Prevents an
 // attacker from using our OAuth start as an open redirect. First entry is the
 // default when no valid return_to is supplied.
@@ -397,8 +419,21 @@ router.get('/oauth-config', (req, res) => {
 // sign-in cannot weaken an account that was already protected.
 const GOOGLE_CLIENT_ID = process.env.GOOGLE_CLIENT_ID;
 const GOOGLE_CLIENT_SECRET = process.env.GOOGLE_CLIENT_SECRET;
-const GOOGLE_REDIRECT_URI = `${BACKEND_PUBLIC_URL}/api/auth/google-oauth/callback`;
+const GOOGLE_REDIRECT_URI = redirectUri(process.env.GOOGLE_REDIRECT_URI, '/api/auth/google-oauth/callback');
 function googleConfigured() { return !!(GOOGLE_CLIENT_ID && GOOGLE_CLIENT_SECRET); }
+
+// Named at boot because both failures this variable can cause are silent from
+// the server's side: a redirect_uri the provider does not know produces an
+// error page on THEIR domain, and a redirect_uri that works but points at the
+// railway host produces a consent screen that quietly reads like a phishing
+// page to the customer. Neither leaves a line in these logs on its own.
+console.log(`[Auth] OAuth callbacks — discord: ${OAUTH_REDIRECT_URI}`);
+console.log(`[Auth] OAuth callbacks — google:  ${googleConfigured() ? GOOGLE_REDIRECT_URI : '(not configured)'}`);
+if (googleConfigured() && /\.up\.railway\.app$/i.test(new URL(GOOGLE_REDIRECT_URI).hostname)) {
+  console.warn('[Auth] Google consent will read "to continue to '
+    + new URL(GOOGLE_REDIRECT_URI).hostname + '" — that host is what Google shows, not the app name.'
+    + ' Point GOOGLE_REDIRECT_URI at a uhservices.xyz custom domain to change it.');
+}
 
 // Separate from oauthStates rather than sharing it with a `provider` field: one
 // map means a state minted for one provider is a valid state for the other's
