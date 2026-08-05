@@ -39,6 +39,18 @@ function orderIdentifier(raw) {
 // unbounded number of keys in one order.
 const MAX_ITEM_QTY = 25;
 
+// How long an unpaid order stays live. This was a hardcoded 24 hours, and
+// nothing ever swept the deadline — both watchers refuse to settle a payment
+// past `expires_at`, so an order simply sat at 'waiting' forever, looking
+// actionable in `/manual-order-delivery pending` while being unconfirmable by
+// either watcher. One from July was still listed a fortnight later.
+//
+// An env var rather than a constant because this number is a judgement call
+// that differs by payment method: a Cash App transfer is instant, but a BTC
+// send has to be composed, broadcast and mined. Raising it here does not need
+// a code change — see watchers/orderExpiry.js, which does the cancelling.
+const ORDER_EXPIRY_MINUTES = Math.max(5, parseInt(process.env.ORDER_EXPIRY_MINUTES, 10) || 60);
+
 // Re-price a cart against product_tiers. The browser sends a price so it can
 // render a total, but that number is worthless as an authority: this is the
 // public checkout route, and `price` flows straight into the wallet debit.
@@ -254,7 +266,8 @@ async function createOrderPriced({ items, email, discord_id, payment_method, web
            (guild_id, web_user_id, email, discord_id, items_snapshot, subtotal_cents, total_cents,
             payment_method, payment_note, public_ref, invoice_no, coupon_code, coupon_discount_cents,
             status, created_at, expires_at)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,'waiting', now(), now() + interval '24 hours')
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,'waiting', now(),
+                 now() + ($14::int * interval '1 minute'))
          RETURNING *`,
         [
           GUILD_ID, web_user_id || null, email, discord_id || null, JSON.stringify(items),
@@ -264,6 +277,7 @@ async function createOrderPriced({ items, email, discord_id, payment_method, web
           subtotalCents, totalCents,
           payment_method, note, publicRef, invNo,
           coupon ? coupon.code : null, discountCents,
+          ORDER_EXPIRY_MINUTES,
         ]
       );
       order = rows[0];
@@ -1188,14 +1202,29 @@ router.post('/confirm', async (req, res) => {
     // wallet twice. Gating the UPDATE on the status it expects to replace makes
     // exactly one caller win, no matter how many arrive together.
     //
-    // Only 'waiting' and 'underpaid' are confirmable. Previously anything that
-    // wasn't already paid qualified, which included 'cancelled' and 'expired'.
+    // 'paid' and 'delivered' are the two that must never be re-settled — that
+    // is the double-delivery this gate exists for, and they stay excluded.
+    //
+    // 'expired' IS confirmable, and has to be. Unpaid orders are now closed an
+    // hour after they are placed (watchers/orderExpiry.js), and the customer
+    // who pays at minute seventy is a real person whose money has arrived.
+    // Refusing here would answer them with "Not confirmable" and leave staff
+    // nothing to do about it. Neither watcher can reach this branch — both scan
+    // `status = 'waiting'` — so in practice it is staff, holding the shared
+    // secret, deciding a late payment is good.
+    //
+    // 'cancelled' stays out, and the distinction is the point. The sweeper
+    // writes 'expired'; the only thing that writes 'cancelled' is a balance
+    // checkout that FAILED and had its debit rolled back (see the catch in
+    // createOrder). Confirming one of those would deliver the goods against a
+    // wallet that was never charged. Two different closed states because they
+    // mean two different things.
     const { rows: claimed } = await query(
       `UPDATE orders
           SET status = 'paid', paid_at = now(),
               amount_received_cents = $1, amount_received_native = $2, amount_received_unit = $3,
               provider_txn_id = COALESCE($4, provider_txn_id)
-        WHERE id = $5 AND status IN ('waiting', 'underpaid')
+        WHERE id = $5 AND status IN ('waiting', 'underpaid', 'expired')
         RETURNING *`,
       // The row is already in hand, so settle on its numeric id — the caller's
       // spelling of the identifier does not need interpreting twice.

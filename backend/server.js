@@ -182,6 +182,10 @@ require('./routes/config').loadConfigFromDB().finally(() => {
     console.log(`[H8ED] Backend running on port ${PORT}`);
     require('./watchers/emailWatcher').start();
     require('./watchers/cryptoWatcher').start();
+    // Closes orders nobody paid for. Both watchers above already refuse to
+    // settle anything past its deadline, so without this an expired order is
+    // dead but still reads as 'waiting' everywhere staff look.
+    require('./watchers/orderExpiry').start();
   });
 
   // Railway sends SIGTERM on every deploy. Without this the process is killed
