@@ -652,11 +652,30 @@ router.get('/admin/list', requireAdmin, async (req, res) => {
 // One user's order history for the admin panel's per-user detail view.
 // The admin Users tab reads real accounts from web_users, which carry no
 // embedded purchase list — their orders live only in the `orders` table.
+//
+// This MUST match what /mine shows that same customer, and it did not. /mine
+// finds an order two ways — by web_user_id, and by the account's verified
+// discord_id — while this found it only the first way. An order delivered by
+// `/order manual` to a Discord id that had no site account at the time carries
+// a discord_id and a NULL web_user_id forever; the customer sees it the moment
+// they sign up and link Discord, and staff looking at that same customer saw a
+// shorter history and no sign that anything was missing. Answering "where is
+// my order" from a list that is quietly incomplete is the worst version of
+// this endpoint. Six of the thirty orders on this store are in exactly that
+// shape.
 router.get('/admin/user/:userId', requireAdmin, async (req, res) => {
   try {
-    const { rows } = await query(
-      `SELECT * FROM orders WHERE guild_id = $1 AND web_user_id = $2 ORDER BY created_at DESC LIMIT 200`,
+    const { rows: [acct] } = await query(
+      `SELECT discord_id, discord_verified FROM web_users WHERE guild_id = $1 AND id = $2`,
       [GUILD_ID, req.params.userId]
+    );
+    const linked = (acct && acct.discord_id && acct.discord_verified) ? String(acct.discord_id) : null;
+    const { rows } = await query(
+      `SELECT * FROM orders
+        WHERE guild_id = $1
+          AND (web_user_id = $2 OR ($3::text IS NOT NULL AND discord_id = $3))
+        ORDER BY created_at DESC LIMIT 200`,
+      [GUILD_ID, req.params.userId, linked]
     );
     res.json({ orders: rows.map(formatOrder) });
   } catch (err) {
@@ -1334,6 +1353,24 @@ router.post('/manual', async (req, res) => {
         [GUILD_ID, String(discord_id)]
       );
       if (rows[0]) { webUserId = rows[0].id; acctEmail = rows[0].email || null; }
+    }
+    // Second try: the address staff typed on the order. A customer who has an
+    // account but has not linked Discord — or linked it and never finished the
+    // verification — resolved to nothing above, so the order was written with
+    // web_user_id NULL and never appeared in their Purchase History. Nothing
+    // told anyone: staff saw a delivered order, the customer saw an empty page,
+    // and the two had no way to discover they were looking at the same order.
+    //
+    // The address is not user input here. Staff type it when they issue the
+    // delivery, and the store already treats it as proof of ownership —
+    // /claim-customer verifies an invoice against exactly this field. Matching
+    // it is the same test, applied earlier.
+    if (!webUserId && String(email || '').trim()) {
+      const { rows } = await query(
+        `SELECT id, email FROM web_users WHERE guild_id = $1 AND lower(email) = lower($2) LIMIT 1`,
+        [GUILD_ID, String(email).trim()]
+      );
+      if (rows[0]) { webUserId = rows[0].id; acctEmail = acctEmail || rows[0].email || null; }
     }
     // /claim-customer verifies an invoice against the buyer's email, so an
     // order with no address on it can never be claimed. Falling back to the
