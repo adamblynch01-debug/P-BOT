@@ -111,11 +111,17 @@ function storeName_() {
 // used to be the bare product name, so a receipt for four months of one thing
 // and one month of another was indistinguishable from two single purchases.
 function goodsHeading(g) {
-  // GAME — PRODUCT — DURATION, matching the buyer's Discord DM exactly. The
-  // receipt and the DM are two views of the same delivered_goods row and a
-  // buyer comparing them should not have to work out that they agree.
-  // Dropped when the game name is already inside the product name, and absent
-  // entirely for balance top-ups and donations, which have no game.
+  // GAME — PRODUCT — DURATION. The Discord DM shows the same three facts but
+  // as separate labelled fields, because an embed lays three inline fields out
+  // as a row and this receipt is a printed page — the layouts differ on
+  // purpose and only the FACTS have to agree.
+  //
+  // Which they do, on the one rule that matters: the game is dropped when its
+  // name is already inside the product name, and absent entirely for balance
+  // top-ups and donations, which have no game. That rule is duplicated here
+  // rather than imported (this is a different repo from the bot); the pair is
+  // held together by test_delivery_game_label.js, which drives both off one
+  // table of cases.
   const game = String(g.game || '').trim();
   const bits = [];
   if (game && !new RegExp(`(^|\\s)${game.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}(\\s|$)`, 'i').test(String(g.product || ''))) {

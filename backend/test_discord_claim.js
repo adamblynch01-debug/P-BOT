@@ -54,7 +54,12 @@ const acctSrc    = read(path.join(__dirname, 'utils', 'discordAccount.js'));
 const migSrc     = read(path.join(__dirname, 'migrations', 'discord_signup.sql'));
 const botSrc     = read(path.join(BOT, 'index.js'));
 const twofaSrc   = read(path.join(BOT, 'modules', 'auth2fa.js'));
-const manualSrc  = read(path.join(BOT, 'modules', 'manualDelivery.js'));
+// The hand-delivery path is two files now: manualDelivery.js still writes the
+// staff-facing strings, but the buyer's DM was lifted into deliveryEmbed.js so
+// a website order and a hand-delivered one stop drifting apart. The claim copy
+// lives in whichever of the two writes it, so both are searched as one.
+const manualSrc  = read(path.join(BOT, 'modules', 'manualDelivery.js'))
+                 + read(path.join(BOT, 'modules', 'deliveryEmbed.js'));
 const htmlSrc    = read(path.join(SITE, 'index.html'));
 
 // The real module, not a copy. It requires ../db, which builds a Pool lazily —

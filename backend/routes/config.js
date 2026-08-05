@@ -2,6 +2,7 @@ const express = require('express');
 const router = express.Router();
 const { query } = require('../db');
 const { failureLimiter, safeCompare } = require('../utils/rateLimit');
+const EXPIRY = require('../utils/expiry');
 
 const GUILD_ID = process.env.GUILD_ID;
 
@@ -30,6 +31,20 @@ router.get('/', (req, res) => {
     cashapp_fee: process.env.CASHAPP_FEE_PERCENT || 10,
     paypal_fee: process.env.PAYPAL_FEE_PERCENT || 10,
     crypto_discount: process.env.CRYPTO_DISCOUNT_PERCENT || 5,
+    // The number routes/orders.js actually ADDS to a crypto total. It is a fee,
+    // not a discount: `crypto_discount` above is served to nobody who applies
+    // it and has never been subtracted from a total. Both are here rather than
+    // one quietly replacing the other, because a caller reading the old key is
+    // better off seeing them disagree than being silently re-pointed.
+    crypto_fee: process.env.CRYPTO_FEE_PERCENT || 5,
+    // How long an unpaid order of each kind stays payable — the same values the
+    // expiry sweeper enforces, so a payment window quoted to a buyer on Discord
+    // cannot drift from the one the pay screen counts down to.
+    expiry_minutes: {
+      crypto: EXPIRY.ORDER_EXPIRY_MINUTES_CRYPTO,
+      cash: EXPIRY.ORDER_EXPIRY_MINUTES_CASH,
+      default: EXPIRY.ORDER_EXPIRY_MINUTES,
+    },
     payment_methods: {
       cashapp: !!process.env.CASHAPP_CASHTAG,
       paypal: !!process.env.PAYPAL_EMAIL,

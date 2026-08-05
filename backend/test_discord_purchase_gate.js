@@ -65,7 +65,12 @@ const exec = async (text, params) => {
     REVIEWS.push(row);
     return { rows: [pub(row)] };
   }
-  if (/SELECT id, image_url, \(image_data IS NOT NULL\) AS has_image FROM reviews/.test(t)) {
+  // Matched on the two columns the dedup lookup exists to fetch, not on the
+  // whole select list. Pinning the list verbatim is what broke this stub when
+  // avatar_hash was added: the regex stopped matching, the lookup fell through
+  // to `{ rows: [] }`, and every re-send of a message id became a second vouch
+  // — a failure that reads as "dedup is broken" rather than "the stub is stale".
+  if (/SELECT id, image_url,[^;]*\bhas_image\b[^;]*FROM reviews/.test(t)) {
     const hit = REVIEWS.filter(r => r.source === 'discord' && String(r.external_id) === String(params[1]));
     return { rows: hit.map(r => ({ id: r.id, image_url: r.image_url, has_image: r.image_data != null })) };
   }
@@ -89,7 +94,10 @@ const exec = async (text, params) => {
     r.approved = params[0];
     return { rows: [pub(r)] };
   }
-  if (/FROM reviews WHERE guild_id = \$1 AND approved = true/.test(t)) {
+  // The public list grew a LATERAL join onto web_users for avatars, so the
+  // table is aliased `r` and the predicate reads `r.approved = true`. Match on
+  // the predicate rather than on the shape of the FROM clause.
+  if (/FROM reviews r?\b/.test(t) && /\br?\.?approved = true/.test(t)) {
     return { rows: REVIEWS.filter(r => r.approved).map(pub) }; // public list
   }
   if (/FROM reviews WHERE guild_id = \$1 ORDER BY/.test(t)) {

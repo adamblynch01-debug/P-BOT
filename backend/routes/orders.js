@@ -72,29 +72,10 @@ const MAX_ITEM_QTY = 25;
 // amount on the pay screen is quoted at the rate when the order was placed, so
 // the window is also how long the customer holds a free option on the price.
 //
-// Each is an env var: these are judgement calls, and changing one should not
-// need a deploy. ORDER_EXPIRY_MINUTES keeps its old name and its old meaning
-// so an override already set on Railway still does what whoever set it meant.
-// Floored at 5 minutes, and that floor is a guard rather than a preference: a
-// typo'd `ORDER_EXPIRY_MINUTES=0` would otherwise write a deadline already in
-// the past and the sweeper would cancel every order the moment it was placed.
-const envMinutes = (raw, dflt) => Math.max(5, parseInt(raw, 10) || dflt);
-const ORDER_EXPIRY_MINUTES        = envMinutes(process.env.ORDER_EXPIRY_MINUTES, 60);
-const ORDER_EXPIRY_MINUTES_CRYPTO = envMinutes(process.env.ORDER_EXPIRY_MINUTES_CRYPTO, 180);
-const ORDER_EXPIRY_MINUTES_CASH   = envMinutes(process.env.ORDER_EXPIRY_MINUTES_CASH, ORDER_EXPIRY_MINUTES);
-
-// Unknown methods fall through to ORDER_EXPIRY_MINUTES rather than to no
-// deadline at all. A missing entry here must never mean "lives forever" —
-// that is the exact bug this whole path exists to close.
-function expiryMinutesFor(payment_method) {
-  switch (payment_method) {
-    case 'btc':
-    case 'ltc':     return ORDER_EXPIRY_MINUTES_CRYPTO;
-    case 'cashapp':
-    case 'paypal':  return ORDER_EXPIRY_MINUTES_CASH;
-    default:        return ORDER_EXPIRY_MINUTES;
-  }
-}
+// The values themselves, and the reasoning for each, now live in
+// utils/expiry.js — /api/config serves them to the Discord bot's payment panel,
+// and a window quoted to a buyer must be the same one the sweeper enforces.
+const { expiryMinutesFor } = require('../utils/expiry');
 
 // Re-price a cart against product_tiers. The browser sends a price so it can
 // render a total, but that number is worthless as an authority: this is the
