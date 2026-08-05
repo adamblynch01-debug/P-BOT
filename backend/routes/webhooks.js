@@ -121,9 +121,22 @@ router.post('/crypto', async (req, res) => {
     //     auto-delivered.
     if (order.expires_at && new Date(order.expires_at) < new Date()) {
       console.warn(`[Webhook] Order ${order_id} paid after expiry — manual review`);
+      // 'expired' is in this list because that is now the status the order is
+      // MOST likely to be in when we get here. This branch fires precisely
+      // when `expires_at` has passed, and watchers/orderExpiry.js moves an
+      // unpaid order off 'waiting' within a couple of minutes of that instant
+      // — so the old two-status list matched no row in the common case, and
+      // the sats that just arrived were never written down. The alert below
+      // still fired, which is how it would have been noticed eventually, but
+      // an alert is not a record: staff would have had nothing on the order
+      // itself to reconcile against.
+      //
+      // 'paid'/'delivered' are handled and returned above; 'expired_paid'
+      // stays out so a second webhook for the same address cannot overwrite a
+      // recorded amount with a partial one.
       await query(
         `UPDATE orders SET status = 'expired_paid', amount_received_native = $1, amount_received_unit = 'sats'
-          WHERE id = $2 AND status IN ('waiting','underpaid')`,
+          WHERE id = $2 AND status IN ('waiting','underpaid','expired')`,
         [receivedSats, order_id]
       ).catch(() => {});
       await raiseAlert('crypto_payment_after_expiry',

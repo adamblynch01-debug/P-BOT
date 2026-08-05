@@ -627,8 +627,26 @@ const CASH_ORDER = { ...ORDER, payment_method: 'cashapp' };
 
   // The status transition IS the lock. Two confirmations arriving within one DB
   // round-trip both saw 'waiting' and both ran delivery.
-  check('/confirm gates the write on the status it replaces',
-    /WHERE id = \$5 AND status IN \('waiting', 'underpaid'\)/.test(ordersSrc));
+  //
+  // The list is read out of the source rather than matched whole, because it
+  // has already grown once — 'expired' joined it when unpaid orders started
+  // being closed automatically, and a customer who pays at minute seventy has
+  // to remain settleable by staff. What this pins is not the exact membership
+  // but the two properties that make the gate a gate: the write is conditional
+  // on the status it replaces, and the statuses that must never be re-settled
+  // are absent.
+  const confirmGate = (ordersSrc.match(/WHERE id = \$5 AND status IN \(([^)]*)\)/) || [])[1];
+  check('/confirm gates the write on the status it replaces', !!confirmGate);
+  check('...on a list that still starts from an unpaid order',
+    !!confirmGate && /'waiting'/.test(confirmGate) && /'underpaid'/.test(confirmGate));
+  check('...and never lets a settled order be confirmed twice',
+    // The double-delivery this gate exists for.
+    !!confirmGate && !/'paid'/.test(confirmGate) && !/'delivered'/.test(confirmGate));
+  check("...nor a 'cancelled' one, whose wallet debit was rolled back",
+    // 'cancelled' is written by the catch in createOrder when a BALANCE
+    // checkout fails. Confirming one delivers goods against money never taken
+    // — which is the whole reason the expiry sweeper writes 'expired' instead.
+    !!confirmGate && !/'cancelled'/.test(confirmGate));
   check('cancelled/expired orders are not confirmable',
     !/status != 'paid'/.test(ordersSrc));
 

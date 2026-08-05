@@ -42,10 +42,14 @@ const { raiseAlert } = require('../utils/alerts');
 
 const GUILD_ID = process.env.GUILD_ID;
 
-// Every five minutes. The deadline itself is the promise (see
-// ORDER_EXPIRY_MINUTES in routes/orders.js); this is only how soon after it we
-// notice. Sweeping faster would buy nothing and poll the DB for no reason.
-const SCHEDULE = process.env.ORDER_EXPIRY_CRON || '*/5 * * * *';
+// Every two minutes. The deadline itself is the promise (see
+// expiryMinutesFor in routes/orders.js); this is only how soon after it we
+// notice, and it matters more than it looks: the pay screen now counts down to
+// that deadline, so the gap between the countdown hitting zero and the status
+// changing is a window where the page says one thing and the order says
+// another. Two minutes keeps it short. It is one indexed UPDATE that usually
+// matches nothing — the same cadence the crypto poller already runs at.
+const SCHEDULE = process.env.ORDER_EXPIRY_CRON || '*/2 * * * *';
 
 // How many cancellations in one sweep stop looking like abandoned carts and
 // start looking like a broken payment watcher. See the alert below.

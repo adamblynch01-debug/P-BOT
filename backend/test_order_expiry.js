@@ -184,5 +184,69 @@ const order = (o) => ({
     assert.ok(/watcher/i.test(alerts[0].message), alerts[0].message);
   });
 
+  // ─── How long each method gets ──────────────────────────────────────────────
+  //
+  // The sweeper above is deliberately method-agnostic — it reads `expires_at`
+  // off the row and never asks how the customer was paying. That is the right
+  // split, but it means nothing in these tests so far pins the number that goes
+  // INTO `expires_at`, and that number is the whole customer-facing promise.
+  //
+  // The windows are read from env at module load, so an override can only be
+  // tested in a fresh process. Each case below runs one.
+  console.log('\neach payment method gets a window that suits it');
+
+  const { execFileSync } = require('child_process');
+  const windows = (env) => JSON.parse(execFileSync(process.execPath, ['-e',
+    "const f = require('./routes/orders').__test__.expiryMinutesFor;" +
+    "console.log(JSON.stringify({btc:f('btc'),ltc:f('ltc'),cashapp:f('cashapp')," +
+    "paypal:f('paypal'),balance:f('balance'),unknown:f('something-new')}))",
+  ], { cwd: __dirname, encoding: 'utf8', env: { ...process.env, ...env } }));
+
+  const dflt = windows({ ORDER_EXPIRY_MINUTES: '', ORDER_EXPIRY_MINUTES_CRYPTO: '', ORDER_EXPIRY_MINUTES_CASH: '' });
+
+  await check('btc and ltc get three hours, because a send has to be mined', () => {
+    // The case that prompted this: at sixty minutes a transaction composed at
+    // minute fifty could confirm at minute seventy, landing on a dead order.
+    assert.strictEqual(dflt.btc, 180);
+    assert.strictEqual(dflt.ltc, 180);
+  });
+  await check('cashapp and paypal get an hour, because the transfer is instant', () => {
+    assert.strictEqual(dflt.cashapp, 60);
+    assert.strictEqual(dflt.paypal, 60);
+  });
+  await check('a method nobody has taught it about still gets a deadline', () => {
+    // The one answer that must never appear here is "no deadline". A method
+    // added later and forgotten in expiryMinutesFor should be short-lived and
+    // noisy, not immortal and silent — the immortal case is the entire bug.
+    assert.ok(Number.isFinite(dflt.unknown) && dflt.unknown > 0, String(dflt.unknown));
+    assert.strictEqual(dflt.unknown, 60);
+    assert.strictEqual(dflt.balance, 60);
+  });
+
+  const raised = windows({ ORDER_EXPIRY_MINUTES_CRYPTO: '360' });
+  await check('crypto can be lengthened on its own without moving the others', () => {
+    assert.strictEqual(raised.btc, 360);
+    assert.strictEqual(raised.cashapp, 60);
+  });
+
+  const legacy = windows({ ORDER_EXPIRY_MINUTES: '90', ORDER_EXPIRY_MINUTES_CASH: '' });
+  await check('an ORDER_EXPIRY_MINUTES already set on Railway still means what it did', () => {
+    // It was the only knob before this change. Whoever set it meant "how long
+    // a card-like payment gets", so it keeps driving cashapp/paypal and the
+    // unknown-method default rather than being quietly demoted to nothing.
+    assert.strictEqual(legacy.cashapp, 90);
+    assert.strictEqual(legacy.paypal, 90);
+    assert.strictEqual(legacy.unknown, 90);
+    assert.strictEqual(legacy.btc, 180, 'crypto has its own knob and should not follow');
+  });
+
+  const nonsense = windows({ ORDER_EXPIRY_MINUTES: '0', ORDER_EXPIRY_MINUTES_CRYPTO: 'soon' });
+  await check('a nonsense or zero window falls back rather than expiring on arrival', () => {
+    // ORDER_EXPIRY_MINUTES=0 would write a deadline already in the past and the
+    // sweeper would cancel every order the moment it was placed.
+    assert.ok(nonsense.cashapp >= 5, String(nonsense.cashapp));
+    assert.strictEqual(nonsense.btc, 180);
+  });
+
   console.log(`\n${passed} passed, ${failed} failed`);
 })();

@@ -116,7 +116,21 @@ async function claimRecycledAddress(coin, order_id) {
        JOIN orders o ON o.id = ca.order_id
       WHERE ca.guild_id = $1 AND ca.coin = $2
         AND ca.baseline_received IS NOT NULL
-        AND o.status IN ('waiting','cancelled')
+        -- 'expired' belongs here, and its absence was a live regression the
+        -- moment watchers/orderExpiry.js shipped. Before the sweeper, an
+        -- abandoned crypto cart sat at 'waiting' forever and this query found
+        -- it; now the sweeper moves it to 'expired' within minutes of its
+        -- deadline, and without this line the one status that MEANS "unpaid
+        -- and closed" was the one status that could never be recycled. Every
+        -- abandoned cart would burn a derivation index permanently — which is
+        -- precisely the gap-limit problem the block above exists to avoid.
+        --
+        -- Safe for the same reasons the other two are: the sweeper only writes
+        -- 'expired' when both receipt columns are zero, the grace period below
+        -- puts a day between the deadline and reuse, and the address is still
+        -- checked against its baseline on-chain before anything is handed over.
+        -- 'expired_paid' stays out — that one has money on it.
+        AND o.status IN ('waiting','cancelled','expired')
         AND o.expires_at IS NOT NULL
         AND o.expires_at < now() - ($3 || ' hours')::interval
       ORDER BY ca.address_index ASC

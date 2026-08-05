@@ -697,12 +697,61 @@ async function matchAndConfirmOrder(note, amount, method, messageId) {
 
     if (!order) {
       console.warn(`[EmailWatcher] No pending ${method} order for note: ${note}`);
-      await recordOutcome(messageId, 'rejected: no matching open order', null);
-      // Money may have arrived for an expired or already-settled order. That is
-      // a customer who paid and is waiting.
+
+      // "Possibly expired or already paid" was as much as this could say, and
+      // it was not enough to act on: staff got a payment note and had to go
+      // find the order themselves. Now that unpaid orders are actually closed
+      // (watchers/orderExpiry.js), late-but-genuine is the LIKELY reason to be
+      // standing here rather than a rare one, so it is worth the second query
+      // to name the order and write the money down on it.
+      //
+      // Deliberately the same treatment routes/webhooks.js gives late crypto:
+      // record the receipt, move to 'expired_paid', page a human. Never
+      // auto-deliver — the quote is stale and this path has already decided
+      // the deadline was missed.
+      let late = null;
+      try {
+        const { rows: hist } = await query(
+          `SELECT id, invoice_no, status, total_cents, expires_at FROM orders
+            WHERE guild_id = $1 AND payment_note = $2 AND payment_method = $3
+            ORDER BY created_at DESC LIMIT 1`,
+          [GUILD_ID, note, method]
+        );
+        late = hist[0] || null;
+      } catch (e) { /* the alert below still goes out without it */ }
+
+      const unpaidAndClosed = late
+        && (late.status === 'expired' || late.status === 'waiting')
+        && Number.isFinite(amount) && amount > 0;
+
+      // Recorded after the lookup rather than before it so the replay record
+      // carries the order this email actually belongs to. It is still the
+      // first thing that must not be skipped — the same message arriving twice
+      // has to be recognisable — so it goes ahead of the UPDATE.
+      await recordOutcome(messageId,
+        unpaidAndClosed ? 'rejected: order past its deadline, flagged expired_paid'
+                        : 'rejected: no matching open order',
+        late ? late.id : null);
+
+      if (unpaidAndClosed) {
+        await query(
+          `UPDATE orders SET status = 'expired_paid', amount_received_cents = $1
+            WHERE id = $2 AND guild_id = $3 AND status IN ('waiting','expired')`,
+          [Math.round(amount * 100), late.id, GUILD_ID]
+        ).catch(() => {});
+      }
+
       await raiseAlert('email_payment_unmatched',
-        `A verified ${method} payment of $${amount} quoted note "${note}" but no open order matches — possibly expired or already paid`,
-        { severity: 'error', context: { method, note, amount } }).catch(() => {});
+        late
+          ? `A verified ${method} payment of $${amount} quoted note "${note}", which belongs to order ` +
+            `${late.invoice_no || '#' + late.id} — status '${late.status}', deadline ${late.expires_at}, ` +
+            `total $${((late.total_cents || 0) / 100).toFixed(2)}. ` +
+            (unpaidAndClosed
+              ? 'The amount has been recorded and the order flagged expired_paid; confirm it with /order forceconfirm if the payment is good.'
+              : 'No change made — check whether it was already settled.')
+          : `A verified ${method} payment of $${amount} quoted note "${note}" but no order has ever used that note`,
+        { severity: 'error', order_id: late ? late.id : undefined,
+          context: { method, note, amount, matched_status: late ? late.status : null } }).catch(() => {});
       return;
     }
 

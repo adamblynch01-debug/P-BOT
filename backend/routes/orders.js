@@ -45,11 +45,56 @@ const MAX_ITEM_QTY = 25;
 // actionable in `/manual-order-delivery pending` while being unconfirmable by
 // either watcher. One from July was still listed a fortnight later.
 //
-// An env var rather than a constant because this number is a judgement call
-// that differs by payment method: a Cash App transfer is instant, but a BTC
-// send has to be composed, broadcast and mined. Raising it here does not need
-// a code change — see watchers/orderExpiry.js, which does the cancelling.
-const ORDER_EXPIRY_MINUTES = Math.max(5, parseInt(process.env.ORDER_EXPIRY_MINUTES, 10) || 60);
+// One number could not serve every method, which is why there are now three.
+// The deadline is not an arbitrary cutoff: it is the moment BOTH payment
+// watchers stop settling this order (each filters `expires_at > now()`), so it
+// has to be longer than the payment itself plausibly takes.
+//
+//   cashapp / paypal — 60 minutes. The transfer is instant and the customer is
+//     sitting in front of the app; an hour is already generous for someone who
+//     has to go and find their phone.
+//
+//   btc / ltc — 3 hours. A crypto payment is not instant and the customer does
+//     not control how long it takes: the transaction has to be composed, the
+//     fee guessed, then broadcast and mined, and a fee guessed low on a busy
+//     mempool can leave it unconfirmed for an hour on its own. An hour here
+//     meant a send started at minute fifty landed on a dead order — the money
+//     is not lost (routes/webhooks.js records it as 'expired_paid' and pages
+//     staff) but it needs a human, and it should not have needed one.
+//
+//   anything else — 60 minutes. 'balance' settles inside the checkout request
+//     and never reaches 'waiting' at all, so this is really the default for a
+//     method added later: short, and therefore safe, because a method whose
+//     window is too short fails loudly on the pay screen while one that is too
+//     long goes back to hanging silently.
+//
+// Longer is not free, which is why crypto is 3 hours and not a day. The coin
+// amount on the pay screen is quoted at the rate when the order was placed, so
+// the window is also how long the customer holds a free option on the price.
+//
+// Each is an env var: these are judgement calls, and changing one should not
+// need a deploy. ORDER_EXPIRY_MINUTES keeps its old name and its old meaning
+// so an override already set on Railway still does what whoever set it meant.
+// Floored at 5 minutes, and that floor is a guard rather than a preference: a
+// typo'd `ORDER_EXPIRY_MINUTES=0` would otherwise write a deadline already in
+// the past and the sweeper would cancel every order the moment it was placed.
+const envMinutes = (raw, dflt) => Math.max(5, parseInt(raw, 10) || dflt);
+const ORDER_EXPIRY_MINUTES        = envMinutes(process.env.ORDER_EXPIRY_MINUTES, 60);
+const ORDER_EXPIRY_MINUTES_CRYPTO = envMinutes(process.env.ORDER_EXPIRY_MINUTES_CRYPTO, 180);
+const ORDER_EXPIRY_MINUTES_CASH   = envMinutes(process.env.ORDER_EXPIRY_MINUTES_CASH, ORDER_EXPIRY_MINUTES);
+
+// Unknown methods fall through to ORDER_EXPIRY_MINUTES rather than to no
+// deadline at all. A missing entry here must never mean "lives forever" —
+// that is the exact bug this whole path exists to close.
+function expiryMinutesFor(payment_method) {
+  switch (payment_method) {
+    case 'btc':
+    case 'ltc':     return ORDER_EXPIRY_MINUTES_CRYPTO;
+    case 'cashapp':
+    case 'paypal':  return ORDER_EXPIRY_MINUTES_CASH;
+    default:        return ORDER_EXPIRY_MINUTES;
+  }
+}
 
 // Re-price a cart against product_tiers. The browser sends a price so it can
 // render a total, but that number is worthless as an authority: this is the
@@ -277,7 +322,9 @@ async function createOrderPriced({ items, email, discord_id, payment_method, web
           subtotalCents, totalCents,
           payment_method, note, publicRef, invNo,
           coupon ? coupon.code : null, discountCents,
-          ORDER_EXPIRY_MINUTES,
+          // Resolved from the method, not a single global: crypto gets hours
+          // because a crypto payment takes them. See expiryMinutesFor.
+          expiryMinutesFor(payment_method),
         ]
       );
       order = rows[0];
@@ -1524,4 +1571,4 @@ router.post('/manual', async (req, res) => {
 module.exports = router;
 module.exports.createOrder = createOrder;
 module.exports.formatOrder = formatOrder;
-module.exports.__test__ = { applyFee, nativeToUsdCents, repriceItems };
+module.exports.__test__ = { applyFee, nativeToUsdCents, repriceItems, expiryMinutesFor };
