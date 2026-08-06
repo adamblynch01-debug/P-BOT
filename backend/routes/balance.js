@@ -108,6 +108,10 @@ router.post('/topup/create', requireAuth, requireDiscordLinked, async (req, res)
       expires_at: order.expires_at,
     });
   } catch (err) {
+    // createOrder refuses a method whose address is not payable (see
+    // utils/paymentAddress.js). A top-up goes through the same path, so it
+    // gets the same answer rather than a 500 the buyer cannot act on.
+    if (err && err.statusCode === 503) return res.status(503).json({ error: err.message });
     console.error('[Balance] Topup create error:', err);
     res.status(500).json({ error: 'Failed to start top-up' });
   }

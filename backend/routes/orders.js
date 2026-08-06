@@ -15,6 +15,8 @@ const { ensureDiscordAccount } = require('../utils/discordAccount');
 const {
   normalizeCode, previewCoupon, reserveCoupon, attachRedemptionOrder, releaseCoupon, publicView,
 } = require('../utils/coupons');
+// A payment method whose address cannot be paid must not take an order.
+const { isPayableCashtag, isPayableEmail } = require('../utils/paymentAddress');
 
 const GUILD_ID = process.env.GUILD_ID;
 
@@ -260,6 +262,25 @@ async function createOrder(opts) {
 // both paths go through the exact same fee/note/crypto-address/notify logic.
 async function createOrderPriced({ items, email, discord_id, payment_method, web_user_id,
                                    coupon, couponDiscountCents }) {
+  // Fail closed BEFORE the row is written. Production had CASHAPP_CASHTAG set
+  // to " your $cashtag", and the `|| '$YOUR_CASHTAG'` fallback further down
+  // only catches an EMPTY variable — so a real customer was issued a real
+  // order and shown an address that does not exist, and it sat unpaid until
+  // the sweeper expired it. An order nobody can pay is worse than a refusal:
+  // the refusal is visible.
+  if (payment_method === 'cashapp' && !isPayableCashtag(process.env.CASHAPP_CASHTAG)) {
+    const err = new Error('Cash App is not available right now. Please choose another payment method.');
+    err.statusCode = 503;
+    console.error('[Orders] refused a Cash App order — CASHAPP_CASHTAG is not a cashtag');
+    throw err;
+  }
+  if (payment_method === 'paypal' && !isPayableEmail(process.env.PAYPAL_EMAIL)) {
+    const err = new Error('PayPal is not available right now. Please choose another payment method.');
+    err.statusCode = 503;
+    console.error('[Orders] refused a PayPal order — PAYPAL_EMAIL is not an email address');
+    throw err;
+  }
+
   const subtotalCents = subtotalCentsOf(items);
 
   // The coupon comes off the subtotal BEFORE the payment-method fee, so the
@@ -357,9 +378,12 @@ async function createOrderPriced({ items, email, discord_id, payment_method, web
 
   let payment_info = {};
   if (payment_method === 'cashapp') {
-    payment_info = { cashtag: process.env.CASHAPP_CASHTAG || '$YOUR_CASHTAG', note: order.payment_note, amount: total };
+    // No placeholder fallback. The guard at the top of this function means we
+    // cannot get here without a real cashtag, and a fallback would be a second
+    // way to put an unpayable address on a pay screen.
+    payment_info = { cashtag: String(process.env.CASHAPP_CASHTAG).trim(), note: order.payment_note, amount: total };
   } else if (payment_method === 'paypal') {
-    payment_info = { email: process.env.PAYPAL_EMAIL || 'your@paypal.com', note: order.payment_note, amount: total };
+    payment_info = { email: String(process.env.PAYPAL_EMAIL).trim(), note: order.payment_note, amount: total };
   } else if (payment_method === 'btc' || payment_method === 'ltc') {
     // Lock the USD→coin rate at order time. The customer is quoted dollars but
     // pays satoshis, so without a stored quote there is nothing to validate the
@@ -638,6 +662,10 @@ router.post('/create', requireAuth, requireDiscordLinked, async (req, res) => {
 
   } catch (err) {
     if (err && err.statusCode === 400) return res.status(400).json({ error: err.message });
+    // A payment method that is switched on but has no payable address. The
+    // message names the way out ("choose another payment method") because the
+    // buyer can act on it and a 500 gives them nothing.
+    if (err && err.statusCode === 503) return res.status(503).json({ error: err.message });
     console.error('[Orders] Create error:', err);
     res.status(500).json({ error: 'Failed to create order' });
   }

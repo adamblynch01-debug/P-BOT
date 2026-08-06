@@ -143,6 +143,12 @@ process.env.GUILD_ID = 'test-guild';
 process.env.CASHAPP_FEE_PERCENT = '10';
 process.env.PAYPAL_FEE_PERCENT = '10';
 process.env.CRYPTO_FEE_PERCENT = '5';
+// The subject here is coupons, and the orders below pay by Cash App. Since
+// round 38 createOrderPriced refuses a cashapp/paypal order when the address is
+// not payable (utils/paymentAddress.js — production ran with " your $cashtag"),
+// so the suite has to give it real ones or every order 503s before pricing.
+process.env.CASHAPP_CASHTAG = '$uhtest';
+process.env.PAYPAL_EMAIL = 'pay@uhservices.xyz';
 
 const app = express();
 app.use(express.json());

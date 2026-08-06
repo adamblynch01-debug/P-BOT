@@ -60,11 +60,19 @@ const app = express();
   for (const k of missingRequired) console.error(`[Startup] MISSING ${k} — ${required[k]}`);
   for (const k of missingRecommended) console.warn(`[Startup] missing ${k} — ${recommended[k]}`);
 
+  // SET but not usable, which is the state nothing was looking for. Production
+  // ran for months with CASHAPP_CASHTAG = " your $cashtag": non-empty, so every
+  // check above passed it, and checkout published it to buyers as the address
+  // to send money to.
+  let addressProblems = () => [];
+  try { ({ addressProblems } = require('./utils/paymentAddress')); } catch (_) {}
+  for (const line of addressProblems()) console.error(`[Startup] ${line}`);
+
   if (missingRequired.length) {
     console.error('[Startup] Refusing to start. Set the above on the Railway service.');
     process.exit(1);
   }
-  if (!missingRecommended.length) console.log('[Startup] Environment check passed.');
+  if (!missingRecommended.length && !addressProblems().length) console.log('[Startup] Environment check passed.');
 })();
 
 // Railway terminates TLS at its edge and forwards to us over plain HTTP, so

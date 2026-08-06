@@ -3,6 +3,7 @@ const router = express.Router();
 const { query } = require('../db');
 const { failureLimiter, safeCompare } = require('../utils/rateLimit');
 const EXPIRY = require('../utils/expiry');
+const { payableMethods, isPayableCashtag, isPayableEmail } = require('../utils/paymentAddress');
 
 const GUILD_ID = process.env.GUILD_ID;
 
@@ -26,8 +27,11 @@ const ENV_ONLY_KEYS = ['PANEL_PASSWORD', 'VAULT_PASSWORD', 'ORDER_LOG_CHANNEL_ID
 router.get('/', (req, res) => {
   res.json({
     store_name: process.env.STORE_NAME || 'H8ED Shop',
-    cashapp_cashtag: process.env.CASHAPP_CASHTAG || null,
-    paypal_email: process.env.PAYPAL_EMAIL || null,
+    // Served as null when it is not an address, so no caller can print it as
+    // one. Production had " your $cashtag" here and the storefront was
+    // publishing it. See utils/paymentAddress.js.
+    cashapp_cashtag: isPayableCashtag(process.env.CASHAPP_CASHTAG) ? String(process.env.CASHAPP_CASHTAG).trim() : null,
+    paypal_email: isPayableEmail(process.env.PAYPAL_EMAIL) ? String(process.env.PAYPAL_EMAIL).trim() : null,
     cashapp_fee: process.env.CASHAPP_FEE_PERCENT || 10,
     paypal_fee: process.env.PAYPAL_FEE_PERCENT || 10,
     crypto_discount: process.env.CRYPTO_DISCOUNT_PERCENT || 5,
@@ -45,12 +49,10 @@ router.get('/', (req, res) => {
       cash: EXPIRY.ORDER_EXPIRY_MINUTES_CASH,
       default: EXPIRY.ORDER_EXPIRY_MINUTES,
     },
-    payment_methods: {
-      cashapp: !!process.env.CASHAPP_CASHTAG,
-      paypal: !!process.env.PAYPAL_EMAIL,
-      btc: !!process.env.BTC_XPUB,
-      ltc: !!process.env.LTC_XPUB,
-    }
+    // A method whose address cannot be paid is not a method. This was
+    // `!!process.env.CASHAPP_CASHTAG`, which is true of a placeholder, so
+    // checkout offered Cash App and then showed the placeholder as the address.
+    payment_methods: payableMethods(),
   });
 });
 
@@ -96,6 +98,22 @@ router.post('/update', async (req, res) => {
 
     if (!allowed_keys.includes(key.toUpperCase())) {
       return res.status(400).json({ error: `Key "${key}" is not configurable` });
+    }
+
+    // Refused on the way IN as well as on the way out. Saving a payment address
+    // that cannot be paid is never what anybody meant, and accepting it here is
+    // how " your $cashtag" got onto production in the first place — silently,
+    // with a success message.
+    if (key.toUpperCase() === 'CASHAPP_CASHTAG' && String(value || '').trim() && !isPayableCashtag(value)) {
+      return res.status(400).json({
+        error: `"${String(value).trim()}" is not a cashtag. It must be $ followed by up to 20 letters, `
+             + 'digits or underscores — e.g. $uhservices. Cash App stays switched off until it is.',
+      });
+    }
+    if (key.toUpperCase() === 'PAYPAL_EMAIL' && String(value || '').trim() && !isPayableEmail(value)) {
+      return res.status(400).json({
+        error: `"${String(value).trim()}" is not an email address, so PayPal would show it to buyers as one.`,
+      });
     }
 
     await query(
