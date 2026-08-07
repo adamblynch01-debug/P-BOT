@@ -97,9 +97,26 @@ function startHeartbeat(w) {
   if (w.heartbeatTimer.unref) w.heartbeatTimer.unref();
 }
 
-// Cheap liveness check: ask the server for the mailbox status. Resolves true
-// only if the round trip actually completes, so a half-open socket that no
-// longer answers is correctly reported as dead.
+// Cheap liveness check: make the server complete one round trip. Resolves true
+// only if it answers, so a half-open socket that no longer replies is correctly
+// reported as dead.
+//
+// This used to call `status('INBOX')` and it could NEVER succeed. node-imap
+// refuses STATUS on the mailbox that is currently selected —
+//
+//   if (this._box && this._box.name === boxName)
+//     throw new Error('Cannot call status on currently selected mailbox');
+//
+// — and INBOX is selected for the whole life of the watcher, so every single
+// probe threw, every probe counted as unhealthy, and the heartbeat's only job
+// (proving a QUIET mailbox is still alive) never got done. Production logged
+// `health probe threw: Cannot call status on currently selected mailbox` on a
+// loop and raised a false "watcher cannot reach its mailbox" alarm any time
+// 20 minutes passed without inbound mail.
+//
+// A SEARCH that matches nothing is the replacement: it runs against the
+// selected mailbox, costs the server nothing, and still proves the connection
+// answers. An empty result is a success — only an error or a timeout is not.
 function probeConnection(w) {
   return new Promise((resolve) => {
     if (!w.imapClient || w.imapClient.state !== 'authenticated') return resolve(false);
@@ -109,7 +126,7 @@ function probeConnection(w) {
     const t = setTimeout(() => done(false), 15000);
     if (t.unref) t.unref();
     try {
-      w.imapClient.status('INBOX', (err) => {
+      w.imapClient.search([['HEADER', 'MESSAGE-ID', '<liveness-probe@local.invalid>']], (err) => {
         clearTimeout(t);
         if (err) console.warn(`[EmailWatcher:${w.label}] health probe failed:`, err.message);
         done(!err);
@@ -355,6 +372,32 @@ function verifiedSenderDomain(parsed, account) {
 // recipient, so it still verifies. The body must therefore be checked for our
 // own receiving identity, and for evidence the money has actually settled.
 
+// ─── what a PayPal notification actually contains ────────────────────────────
+// Checked against two real ones on 2026-08-06, after every PayPal payment this
+// store took had been refused here with "email does not name our paypal
+// account". The plain-text body is, in full:
+//
+//     SNAYDER VELASQUEZ, HERE ARE THE DETAILS.
+//     Hello, Snayder Velasquez
+//     PayPal
+//     Keylin Velasquez sent you $1.10 USD
+//     Amount
+//     $1.10 USD
+//     Note from Keylin Velasquez
+//     steelmark9647
+//     Transaction date ... Transaction ID ... [footer]
+//
+// **The receiving email address is nowhere in it.** Not in the header block,
+// not in the footer, nowhere — PayPal identifies the recipient by FULL NAME
+// and says so itself further down the same email: "Emails from PayPal will
+// always contain your full name." So `PAYPAL_EMAIL`, the only identity this
+// deployment had configured, could never match, and the check that exists to
+// stop a forwarded receipt was rejecting all of our own receipts instead.
+//
+// PAYPAL_MERCHANT_NAME is the identity that works for PayPal, which is why it
+// was already in this list. It was simply never set. `payPalIdentityMissing()`
+// below now says so at boot instead of leaving it to be discovered by a
+// customer who paid and got nothing.
 function merchantIdentities(method) {
   const ids = [];
   if (method === 'paypal') {
@@ -402,9 +445,17 @@ function addressedToUs(email, text, method) {
   const ids = merchantIdentities(method);
   if (!ids.length) return { ok: false, reason: `no merchant identity configured for ${method}` };
 
-  const haystack = [providerPortion(text), email.subject || ''].join('\n').toLowerCase();
+  // Whitespace is flattened on both sides before comparing. An email address
+  // has none, so this changes nothing for the address identities — it is here
+  // for PAYPAL_MERCHANT_NAME, which is a human name typed into a Railway
+  // variable by hand. "Snayder  Velasquez" with a stray double space, or a
+  // name that PayPal happens to wrap across two lines in the plain-text part,
+  // would otherwise fail to match a receipt that plainly contains it, and the
+  // failure mode is the expensive one: the payment is refused, not confirmed.
+  const flat = (s) => String(s).toLowerCase().replace(/\s+/g, ' ').trim();
+  const haystack = flat([providerPortion(text), email.subject || ''].join('\n'));
 
-  const hit = ids.find(id => haystack.includes(id));
+  const hit = ids.find(id => haystack.includes(flat(id)));
   return hit ? { ok: true } : { ok: false, reason: `email does not name our ${method} account` };
 }
 
@@ -550,6 +601,8 @@ async function processEmail(email, account) {
     return;
   }
 
+  const signals = paymentSignals(method, text);
+
   const recipient = addressedToUs(email, text, method);
   if (!recipient.ok) {
     // Genuine provider mail that is not about a payment to us. Most often a
@@ -557,6 +610,25 @@ async function processEmail(email, account) {
     // notification for someone else's account, so it is worth surfacing.
     console.warn(`[EmailWatcher] Ignored "${subject}" — ${recipient.reason}`);
     await recordOutcome(claim.messageId, `rejected: ${recipient.reason}`, null);
+
+    // This branch used to be entirely silent, and that silence is what turned a
+    // misconfiguration into an outage nobody could see. Every PayPal payment
+    // this store took was refused here — the receipts name the account holder
+    // and this deployment had only PAYPAL_EMAIL configured, which PayPal never
+    // writes — and because a rejection wrote a row and nothing else, the alerts
+    // channel stayed empty while customers paid and waited.
+    //
+    // An amount AND a note together mean somebody paid us and quoted an order:
+    // that is not mail we merely failed to care about, it is money on the floor.
+    // Marketing mail has neither, so this cannot become noise.
+    if (Number.isFinite(signals.amount) && signals.note) {
+      await raiseAlert('email_payment_identity_refused',
+        `A verified ${method} payment of $${signals.amount} quoting note "${signals.note}" was REFUSED because ${recipient.reason}. `
+        + (method === 'paypal'
+          ? 'PayPal receipts identify the recipient by full name, not by email address — set PAYPAL_MERCHANT_NAME to the name on the PayPal account.'
+          : 'Set CASHAPP_CASHTAG (and optionally CASHAPP_DISPLAY_NAME) to the account the money was sent to.'),
+        { severity: 'error', context: { method, note: signals.note, amount: signals.amount, subject } }).catch(() => {});
+    }
     return;
   }
 
@@ -580,8 +652,7 @@ async function processEmail(email, account) {
     return;
   }
 
-  if (method === 'cashapp') await handleCashApp(email, text, claim.messageId);
-  else await handlePayPal(email, text, claim.messageId);
+  await handleProviderEmail(method, email, text, claim.messageId, signals);
 }
 
 // Amount parsing. Anchored on the provider's own receipt wording rather than
@@ -600,82 +671,84 @@ function parseAmount(text, patterns) {
   return null;
 }
 
-async function handleCashApp(email, text, messageId) {
-  try {
-    const amount = parseAmount(text, [
-      /you received \$([\d,]+\.?\d*)/i,
-      /\bpaid you \$([\d,]+\.?\d*)/i,
-    ]);
+// Only ever an INBOUND receipt. "You sent a $34.50 USD payment" is a payment we
+// made and must not match, which is why there is no bare /\$([\d,]+)/ here.
+const AMOUNT_PATTERNS = {
+  cashapp: [/you received \$([\d,]+\.?\d*)/i, /\bpaid you \$([\d,]+\.?\d*)/i],
+  paypal: [/you received \$([\d,]+\.?\d*)/i, /sent you \$([\d,]+\.?\d*)/i,
+           /\bamount received[:\s]+\$([\d,]+\.?\d*)/i],
+};
 
-    // Note is a single word: letters then the 4-digit suffix generateNote adds.
-    const notePatterns = [
-      /note[:\s]+([a-z]{4,12}\d{4})/i,
-      /for[:\s]+"?([a-z]{4,12}\d{4})"?/i,
-      /memo[:\s]+([a-z]{4,12}\d{4})/i,
-    ];
-    let note = null;
-    for (const p of notePatterns) {
-      const m = text.match(p);
-      if (m) { note = m[1].toLowerCase().trim(); break; }
+// The note is a single word: letters then the 4-digit suffix generateNote adds.
+function parseNote(method, text) {
+  if (method === 'paypal') {
+    // PayPal puts the memo on the LINE AFTER "Note from <payer name>".
+    const lines = text.split('\n').map(l => l.trim()).filter(Boolean);
+    for (let i = 0; i < lines.length; i++) {
+      const l = lines[i].toLowerCase();
+      if (l.startsWith('note from') || l === 'note') {
+        const m = (lines[i + 1] || '').match(/^([a-z]{4,12}\d{4})$/i);
+        if (m) return m[1].toLowerCase();
+      }
     }
+    return null;
+  }
+  for (const p of [/note[:\s]+([a-z]{4,12}\d{4})/i,
+                   /for[:\s]+"?([a-z]{4,12}\d{4})"?/i,
+                   /memo[:\s]+([a-z]{4,12}\d{4})/i]) {
+    const m = text.match(p);
+    if (m) return m[1].toLowerCase().trim();
+  }
+  return null;
+}
+
+// Amount and note together, read BEFORE the identity check rather than after.
+//
+// They are the difference between "a payment for us that we failed to
+// recognise" and "PayPal's newsletter". The identity check needs to know which
+// one it just refused — refusing the first in silence is how a paying customer
+// ends up waiting forever with nothing in the alerts channel — and the handlers
+// need to know so they do not raise a format-drift alarm about a marketing
+// email that happens to greet the account holder by name.
+function paymentSignals(method, text) {
+  return {
+    amount: parseAmount(text, AMOUNT_PATTERNS[method] || []),
+    note: parseNote(method, text),
+  };
+}
+
+const looksLikeAPayment = (s) => Number.isFinite(s.amount) || s.note != null;
+
+async function handleProviderEmail(method, email, text, messageId, signals) {
+  const label = method === 'cashapp' ? 'Cash App' : 'PayPal';
+  try {
+    const { amount, note } = signals;
 
     if (!note) {
-      console.warn('[EmailWatcher] Cash App email had no parseable note — ignoring');
+      // Neither an amount nor a note: this is not a payment notification at
+      // all — a receipt for something WE bought, a policy update, an advert.
+      // Alerting on these would bury the real ones.
+      if (!Number.isFinite(amount)) {
+        console.log(`[EmailWatcher] ${label} email is not a payment notification — ignoring: "${email.subject || ''}"`);
+        await recordOutcome(messageId, 'ignored: not a payment notification', null);
+        return;
+      }
+      console.warn(`[EmailWatcher] ${label} email had no parseable note — ignoring`);
       // Released, not recorded: if this is a format change, the fix should be
       // able to pick the payment up on the next scan.
       await releaseClaim(messageId);
       // A verified provider email we could not read is how format drift shows
       // up. Silence here means a paying customer waits forever.
       await raiseAlert('email_unparseable',
-        `A verified Cash App email could not be parsed — check for a format change: "${email.subject || ''}"`,
-        { severity: 'warn', context: { method: 'cashapp' } }).catch(() => {});
-      return;
-    }
-    console.log(`[EmailWatcher] Cash App — amount: $${amount}, note: ${note}`);
-    await matchAndConfirmOrder(note, amount, 'cashapp', messageId);
-  } catch (err) {
-    console.error('[EmailWatcher] Cash App parse error:', err.message);
-  }
-}
-
-async function handlePayPal(email, text, messageId) {
-  try {
-    const amount = parseAmount(text, [
-      /you received \$([\d,]+\.?\d*)/i,
-      /sent you \$([\d,]+\.?\d*)/i,
-      /\bamount received[:\s]+\$([\d,]+\.?\d*)/i,
-    ]);
-
-    // Note — PayPal format has note on the LINE AFTER "Note from Name"
-    let note = null;
-
-    // Split into lines and find the note
-    const lines = text.split('\n').map(l => l.trim()).filter(l => l.length > 0);
-    for (let i = 0; i < lines.length; i++) {
-      if (lines[i].toLowerCase().startsWith('note from') || lines[i].toLowerCase() === 'note') {
-        // Note text is on the next line
-        const nextLine = lines[i + 1] || '';
-        const match = nextLine.match(/^([a-z]{4,12}\d{4})$/i);
-        if (match) {
-          note = match[1].toLowerCase();
-          break;
-        }
-      }
-    }
-
-    if (!note) {
-      console.warn('[EmailWatcher] PayPal email had no parseable note — ignoring');
-      await releaseClaim(messageId);
-      await raiseAlert('email_unparseable',
-        `A verified PayPal email could not be parsed — check for a format change: "${email.subject || ''}"`,
-        { severity: 'warn', context: { method: 'paypal' } }).catch(() => {});
+        `A verified ${label} email states an amount of $${amount} but no note could be read — check for a format change: "${email.subject || ''}"`,
+        { severity: 'warn', context: { method, amount } }).catch(() => {});
       return;
     }
 
-    console.log(`[EmailWatcher] PayPal — amount: $${amount}, note: ${note}`);
-    await matchAndConfirmOrder(note, amount, 'paypal', messageId);
+    console.log(`[EmailWatcher] ${label} — amount: $${amount}, note: ${note}`);
+    await matchAndConfirmOrder(note, amount, method, messageId);
   } catch (err) {
-    console.error('[EmailWatcher] PayPal parse error:', err.message);
+    console.error(`[EmailWatcher] ${label} parse error:`, err.message);
   }
 }
 
@@ -816,8 +889,38 @@ async function matchAndConfirmOrder(note, amount, method, messageId) {
   }
 }
 
-module.exports = { start };
+// ─── can a payment even be recognised once it lands? ─────────────────────────
+// The sibling of utils/paymentAddress. That one asks "can a customer pay this
+// address"; this one asks "will we know when they have". Both are needed, and
+// only having the first is how a store ends up publishing a perfectly good
+// PayPal address whose receipts it then throws away.
+//
+// PayPal is the case that bit: its notifications carry the recipient's FULL
+// NAME and never the recipient's email, so a deployment with PAYPAL_EMAIL set
+// and PAYPAL_MERCHANT_NAME unset takes money it can never match to an order.
+// Nothing anywhere reported that, because every individual variable was
+// present and non-empty.
+function confirmationProblems(env = process.env) {
+  const out = [];
+  let payable = { paypal: false, cashapp: false };
+  try { payable = require('../utils/paymentAddress').payableMethods(env); } catch (_) {}
+
+  if (payable.paypal && !(env.PAYPAL_MERCHANT_NAME || '').trim()) {
+    out.push('PAYPAL_MERCHANT_NAME is not set. PayPal receipts identify the recipient by full name '
+      + '("Hello, <name>") and never contain the receiving email address, so PAYPAL_EMAIL alone can never '
+      + 'match one — every PayPal payment will be received and then refused as "does not name our paypal '
+      + 'account". Set it to the name on the PayPal account.');
+  }
+  if (payable.cashapp && !(env.CASHAPP_CASHTAG || '').trim() && !(env.CASHAPP_DISPLAY_NAME || '').trim()) {
+    out.push('Neither CASHAPP_CASHTAG nor CASHAPP_DISPLAY_NAME is set, so no Cash App payment can be '
+      + 'matched to this account.');
+  }
+  return out;
+}
+
+module.exports = { start, confirmationProblems };
 module.exports.__test__ = {
   processEmail, verifiedSenderDomain, domainMatches,
   addressedToUs, nonFinalReason, foreignCurrencyReason, parseAmount,
+  paymentSignals, parseNote, looksLikeAPayment, confirmationProblems,
 };

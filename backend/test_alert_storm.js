@@ -90,7 +90,20 @@ const { raiseAlert } = require('./utils/alerts');
   const src = fs.readFileSync(path.join(__dirname, 'watchers', 'emailWatcher.js'), 'utf8');
   check('the heartbeat actively probes the connection', () => {
     assert.ok(/probeConnection/.test(src), 'no probeConnection');
-    assert.ok(/imapClient\.status\(/.test(src), 'probe does not query the mailbox');
+    const probe = src.slice(src.indexOf('function probeConnection'));
+    assert.ok(/imapClient\.(search|status)\(/.test(probe.slice(0, 900)),
+      'probe does not send a command to the server');
+  });
+  // This assertion is the fix, not decoration. `status()` was the original
+  // probe and it NEVER once succeeded: node-imap throws outright when the box
+  // named is the box already selected (Connection.js — "Cannot call status on
+  // currently selected mailbox"), and the watcher lives inside INBOX. So the
+  // heartbeat's one job, proving a quiet mailbox is still connected, never
+  // ran, and it invented email_watcher_silent alarms instead. A SEARCH that
+  // matches nothing is a real round trip to the server on the selected box.
+  check('the probe does not STATUS the box it already has open', () => {
+    assert.ok(!/imapClient\.status\(\s*['"]INBOX['"]/.test(src),
+      'status() on INBOX always throws — the probe can never succeed');
   });
   // Per-mailbox now: the connection state moved off the module and onto a
   // watcher object, one per configured payment inbox, so the probe and the

@@ -68,11 +68,22 @@ const app = express();
   try { ({ addressProblems } = require('./utils/paymentAddress')); } catch (_) {}
   for (const line of addressProblems()) console.error(`[Startup] ${line}`);
 
+  // The other half of the same question. An address a customer can pay is
+  // worthless if the receipt for it cannot be matched back to an order, and
+  // that is not hypothetical — every PayPal payment this store took was
+  // refused by the watcher because PAYPAL_MERCHANT_NAME was never set and
+  // PayPal receipts do not contain an email address to match instead.
+  let confirmationProblems = () => [];
+  try { ({ confirmationProblems } = require('./watchers/emailWatcher')); } catch (_) {}
+  for (const line of confirmationProblems()) console.error(`[Startup] ${line}`);
+
   if (missingRequired.length) {
     console.error('[Startup] Refusing to start. Set the above on the Railway service.');
     process.exit(1);
   }
-  if (!missingRecommended.length && !addressProblems().length) console.log('[Startup] Environment check passed.');
+  if (!missingRecommended.length && !addressProblems().length && !confirmationProblems().length) {
+    console.log('[Startup] Environment check passed.');
+  }
 })();
 
 // Railway terminates TLS at its edge and forwards to us over plain HTTP, so
