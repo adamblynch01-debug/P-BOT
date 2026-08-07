@@ -75,7 +75,11 @@ router.get('/links', canEdit, async (req, res) => {
     const { rows } = await query(LINK_SELECT + ' ORDER BY p.game_name ASC, p.name ASC, t.sort_order ASC', [GUILD_ID]);
     res.json({
       links: rows.map(publicLink),
-      // Whether it is SET, never what it is.
+      // Whether it is SET, never what it is. Per supplier, because with two of
+      // them one missing key does not mean "nothing can be bought" — it means
+      // that supplier's links are bypassed and the other's are not, and the
+      // panel has to be able to say which.
+      suppliers: supplier.providerSummary(),
       key_configured: supplier.hasApiKey(),
       supplier_off: supplier.supplierGloballyOff(),
       migrated: true,
@@ -83,7 +87,7 @@ router.get('/links', canEdit, async (req, res) => {
   } catch (err) {
     if (isMissingTable(err)) {
       return res.json({
-        links: [], key_configured: supplier.hasApiKey(),
+        links: [], suppliers: supplier.providerSummary(), key_configured: supplier.hasApiKey(),
         supplier_off: supplier.supplierGloballyOff(), migrated: false,
         notice: 'Run backend/migrations/supplier_links.sql — the supplier tables do not exist yet.',
       });
@@ -123,6 +127,17 @@ router.post('/links', canEdit, async (req, res) => {
     const qty = b.qty_per_unit != null && b.qty_per_unit !== '' ? parseInt(b.qty_per_unit, 10) : 1;
     if (!Number.isFinite(qty) || qty < 1) return res.status(400).json({ error: 'Units per purchase must be 1 or more' });
 
+    // Refused rather than stored, because an unrecognised supplier name is a
+    // link that will never buy anything and will never say why: linkForTier
+    // silently drops it back to local stock, which looks exactly like a working
+    // shop until the day the local pool runs dry.
+    const supName = String(b.supplier || supplier.DEFAULT_SUPPLIER).trim().toLowerCase();
+    if (!supplier.providerFor(supName)) {
+      return res.status(400).json({
+        error: `Unknown supplier "${supName}". This build can buy from: ${supplier.providerNames().join(', ')}.`,
+      });
+    }
+
     const { rows } = await query(
       `INSERT INTO supplier_links
          (guild_id, tier_id, supplier, supplier_product_id, label, cost_cents, enabled, qty_per_unit)
@@ -136,13 +151,13 @@ router.post('/links', canEdit, async (req, res) => {
          qty_per_unit = EXCLUDED.qty_per_unit,
          updated_at = now()
        RETURNING id`,
-      [GUILD_ID, tierId, String(b.supplier || 'gandy').trim().toLowerCase(), pid,
+      [GUILD_ID, tierId, supName, pid,
        b.label ? String(b.label).slice(0, 200) : null, cost,
        b.enabled === undefined ? true : !!b.enabled, qty]
     );
 
     const { rows: full } = await query(LINK_SELECT + ' AND sl.id = $2', [GUILD_ID, rows[0].id]);
-    console.log(`[Supplier] link for tier ${tierId} → product ${pid} saved by ${req.user.username || req.user.id}`);
+    console.log(`[Supplier] link for tier ${tierId} → ${supName} product ${pid} saved by ${req.user.username || req.user.id}`);
     res.json({ success: true, link: publicLink(full[0]) });
   } catch (err) {
     if (isMissingTable(err)) return res.status(503).json({ error: 'Run backend/migrations/supplier_links.sql first' });
@@ -167,6 +182,20 @@ router.patch('/links/:id', canEdit, async (req, res) => {
       return res.status(400).json({ error: 'Units per purchase must be 1 or more' });
     }
 
+    // Moving a link between suppliers is a real edit and has to be possible —
+    // the same cheat is often listed by both. Validated to the same list as
+    // POST, and COALESCEd like everything else so an unrelated edit cannot
+    // re-point it.
+    let supName = null;
+    if (b.supplier != null && String(b.supplier).trim() !== '') {
+      supName = String(b.supplier).trim().toLowerCase();
+      if (!supplier.providerFor(supName)) {
+        return res.status(400).json({
+          error: `Unknown supplier "${supName}". This build can buy from: ${supplier.providerNames().join(', ')}.`,
+        });
+      }
+    }
+
     const { rows } = await query(
       `UPDATE supplier_links SET
          supplier_product_id = COALESCE($1, supplier_product_id),
@@ -174,13 +203,14 @@ router.patch('/links/:id', canEdit, async (req, res) => {
          cost_cents          = COALESCE($3, cost_cents),
          enabled             = COALESCE($4, enabled),
          qty_per_unit        = COALESCE($5, qty_per_unit),
+         supplier            = COALESCE($8, supplier),
          updated_at = now()
        WHERE id = $6 AND guild_id = $7
        RETURNING id`,
       [pid, b.label != null ? String(b.label).slice(0, 200) : null,
        cost != null && Number.isFinite(cost) ? cost : null,
        b.enabled === undefined ? null : !!b.enabled, qty,
-       req.params.id, GUILD_ID]
+       req.params.id, GUILD_ID, supName]
     );
     if (!rows.length) return res.status(404).json({ error: 'No such supplier link' });
 
@@ -290,6 +320,9 @@ router.get('/deliveries', canEdit, async (req, res) => {
     res.json({
       deliveries: rows.map(r => ({
         id: Number(r.id), order_id: r.order_id, tier_id: r.tier_id != null ? Number(r.tier_id) : null,
+        // Which upstream was charged. With two of them, a log line that does not
+        // say is a log line nobody can reconcile against an invoice.
+        supplier: r.supplier || null,
         supplier_product_id: r.supplier_product_id, qty: Number(r.qty || 1),
         status: r.status, buyer_ref: r.buyer_ref,
         // The keys themselves. Deliberately included: re-issuing a lost key is

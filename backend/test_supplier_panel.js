@@ -63,9 +63,14 @@ const html = fs.readFileSync(STOREFRONT, 'utf8');
 // ── what the page contains, before anything is executed ──────────────────────
 console.log('\nthe key is not in the file, and the file cannot ask for one');
 
-check('no GANDY_API_KEY anywhere in the storefront', () => {
-  assert.ok(!/GANDY_API_KEY\s*[:=]\s*['"][^'"]+['"]/.test(html),
-    'a value is assigned to GANDY_API_KEY in a file the whole internet can read');
+check('no supplier API key anywhere in the storefront', () => {
+  // Every supplier, not just the first one. A check that names one key is a
+  // check that says nothing the day a second upstream is added — which is
+  // exactly the day this file gained a second key to leak.
+  for (const env of ['GANDY_API_KEY', 'AIMBETTER_API_KEY']) {
+    assert.ok(!new RegExp(env + '\\s*[:=]\\s*[\'"][^\'"]+[\'"]').test(html),
+      `a value is assigned to ${env} in a file the whole internet can read`);
+  }
 });
 
 // Both halves of the tab: the markup an admin sees and the code behind it. The
@@ -91,10 +96,16 @@ check('the panel has no input for an API key', () => {
   // the one edit that would turn this page into a way to spend someone
   // else's money.
   assert.ok(!/id="sup(Api)?Key"/i.test(PANEL), 'there is an API key field on the panel');
-  // The prose that NAMES the key (to say where it lives instead) is allowed;
-  // anything else mentioning one is not.
-  const prose = /GANDY_API_KEY on Railway|NO API KEY IS SET|no API key|a key here|key would be a key/gi;
-  assert.ok(!/api[_ -]?key/i.test(PANEL.replace(prose, '')), 'the panel asks for an api key somewhere');
+  // Scoped to FIELDS, not to prose. The panel has to name the Railway variables
+  // out loud — that is the whole point of saying where the key does live — and
+  // an earlier version of this check counted those sentences as offences, which
+  // is how a check gets deleted rather than fixed. What must not exist is
+  // somewhere to TYPE one, or anywhere that sends one.
+  const fields = PANEL.match(/<(?:input|textarea)[^>]*>/gi) || [];
+  const typeable = fields.find(f => /key/i.test(f));
+  assert.ok(!typeable, 'there is a field to type a key into: ' + String(typeable).slice(0, 120));
+  assert.ok(!/\bkey\s*:\s*(?:val|document\.getElementById)/i.test(PANEL),
+    'the panel puts a key into a request body');
 });
 
 check('the panel never calls the supplier directly, and has no test button', () => {
@@ -121,15 +132,19 @@ assert.ok(SUP_STATE_LINE, 'supState declaration not found in index.html');
 
 const SRC = [SUP_STATE_LINE].concat([
   'supEsc', 'supMoney', 'supWhen', 'supMsg',
+  // Per-supplier state. These three are what keep "this build knows two
+  // upstreams" from collapsing back into one global "is a key set" flag.
+  'supKeyReady', 'supLabelFor',
   'supLoadAll', 'supRenderHeader', 'supToggleGlobal', 'supRenderLinks',
   'supFindLink', 'supViewLink', 'supToggleLink', 'supRemoveLink',
-  'supProductsList', 'supFillGames', 'supCascadeGame', 'supCascadeProduct',
+  'supProductsList', 'supFillSuppliers', 'supFillGames', 'supCascadeGame', 'supCascadeProduct',
   'supResetForm', 'supEditLink', 'supSaveLink', 'supLoadDeliveries',
 ].map(n => extractFn(html, n))).join('\n');
 
 const dom = new JSDOM(`<!doctype html><html><body>
   <div id="supHeader"></div>
   <div id="supFormTitle"></div>
+  <select id="supSupplier"></select>
   <select id="supGame"></select><select id="supProduct"></select><select id="supTier"></select>
   <input id="supProductId"><input id="supCost"><input id="supQty"><input id="supLabel">
   <div id="supFormMsg"></div>
@@ -175,10 +190,13 @@ const sandbox = {
   },
 };
 const DELIVERIES = [
-  { id: 500, order_id: 'ord-1', supplier_product_id: '48', qty: 1, status: 'ok',
+  { id: 500, order_id: 'ord-1', supplier: 'gandy', supplier_product_id: '48', qty: 1, status: 'ok',
     buyer_ref: 'INV-1001', response_lines: ['UPSTREAM-KEY-AAAA'], error_text: null,
     cost_cents: 60, created_at: '2026-08-07T10:00:00Z' },
-  { id: 501, order_id: 'ord-2', supplier_product_id: '48', qty: 1, status: 'timeout',
+  // The unanswered one is the OTHER supplier on purpose. "Check their panel" is
+  // not an instruction anybody can follow when there are two of them and the row
+  // does not say which was charged.
+  { id: 501, order_id: 'ord-2', supplier: 'aimbetter', supplier_product_id: '48', qty: 1, status: 'timeout',
     buyer_ref: 'INV-1002', response_lines: null, error_text: 'timeout of 30000ms exceeded',
     cost_cents: 60, created_at: '2026-08-07T11:00:00Z' },
 ];
@@ -194,8 +212,16 @@ const LINK = (over) => Object.assign({
   tier_label: 'Day', tier_price_cents: 200,
 }, over || {});
 
+// Shaped exactly like supplier.providerSummary(): a name, a label, the Railway
+// variable that holds the key, and WHETHER it is set — never the key.
+const SUPPLIERS = (gandy, aim) => [
+  { name: 'gandy', label: 'Gandy Reseller', key_env: 'GANDY_API_KEY', key_configured: gandy, host: 'gandyreseller.uk' },
+  { name: 'aimbetter', label: 'AimBetter', key_env: 'AIMBETTER_API_KEY', key_configured: aim, host: 'aimbetter.site' },
+];
+
 const reply = (over) => Object.assign(
-  { links: [LINK()], key_configured: true, supplier_off: false, migrated: true }, over || {});
+  { links: [LINK()], suppliers: SUPPLIERS(true, true),
+    key_configured: true, supplier_off: false, migrated: true }, over || {});
 
 const headerText = () => dom.window.document.getElementById('supHeader').textContent;
 const listText = () => dom.window.document.getElementById('supLinkList').textContent;
@@ -221,7 +247,7 @@ async function run() {
       'a link switched on during a kill-switch incident rendered as if it were buying');
   });
 
-  reset(); linksReply = reply({ key_configured: false });
+  reset(); linksReply = reply({ key_configured: false, suppliers: SUPPLIERS(false, false) });
   await sandbox.supLoadAll();
   await checkAsync('no key configured is its OWN message, not "off"', () => {
     // "Off" and "broken" are one state to a customer and opposite states to
@@ -349,6 +375,85 @@ async function run() {
     assert.strictEqual(dom.window.document.getElementById('supCost').value, '0.60');
   });
 
+  console.log('\ntwo suppliers, and the panel never confuses them');
+
+  reset(); linksReply = reply();
+  await sandbox.supLoadAll();
+  await checkAsync('the picker offers exactly what the SERVER says it can buy from', () => {
+    const opts = Array.from(dom.window.document.getElementById('supSupplier').options);
+    assert.deepStrictEqual(opts.map(o => o.value), ['gandy', 'aimbetter'],
+      'the list is hard-coded in the page rather than read from the backend');
+  });
+
+  await checkAsync('the header names both upstreams and warns their ids are not interchangeable', () => {
+    const h = headerText();
+    assert.match(h, /Gandy Reseller/);
+    assert.match(h, /AimBetter/);
+    assert.match(h, /not interchangeable/i,
+      'nothing on the page said id 48 is a different item at each of them');
+  });
+
+  reset(); linksReply = reply({ suppliers: SUPPLIERS(true, false) });
+  await sandbox.supLoadAll();
+  await checkAsync('one supplier missing its key is a warning, NOT "no api key is set"', () => {
+    const h = headerText();
+    assert.ok(!/NO API KEY IS SET/.test(h),
+      'a half-configured build claimed nothing could be bought — the other supplier works fine');
+    assert.match(h, /NO KEY FOR AIMBETTER/i, 'it did not say WHICH supplier is unconfigured');
+    assert.match(h, /AIMBETTER_API_KEY/, 'it should name the Railway variable to set');
+  });
+
+  await checkAsync('a link on the KEYED supplier still reads BUYING', () =>
+    assert.match(listText(), /BUYING/,
+      'one missing key switched off the supplier that is working'));
+
+  reset(); linksReply = reply({ suppliers: SUPPLIERS(true, false), links: [LINK({ supplier: 'aimbetter' })] });
+  await sandbox.supLoadAll();
+  await checkAsync('a link on the UNKEYED supplier reads ON, BYPASSED', () => {
+    assert.match(listText(), /ON, BYPASSED/,
+      'it claimed to be buying from a supplier this build has no key for');
+    assert.match(listText(), /AimBetter/, 'the row does not say which upstream it buys from');
+  });
+
+  await checkAsync('the unkeyed one is still OFFERED, marked as unkeyed', () => {
+    // Mapping a tier now and setting the key later is a reasonable order to do
+    // things in — silently omitting the supplier is not.
+    const opts = Array.from(dom.window.document.getElementById('supSupplier').options);
+    const aim = opts.find(o => o.value === 'aimbetter');
+    assert.ok(aim, 'the supplier with no key vanished from the picker');
+    assert.match(aim.text, /no key/i, 'it was offered as if it would buy something');
+    assert.strictEqual(dom.window.document.getElementById('supSupplier').value, 'gandy',
+      'the form defaulted to the supplier that cannot buy anything');
+  });
+
+  reset(); linksReply = reply({ links: [LINK({ supplier: 'aimbetter' })] });
+  await sandbox.supLoadAll();
+  sandbox.supEditLink(1);
+  await checkAsync('EDIT selects the supplier the mapping actually points at', () =>
+    assert.strictEqual(dom.window.document.getElementById('supSupplier').value, 'aimbetter',
+      'editing an AimBetter mapping showed Gandy — saving would silently re-point it'));
+
+  reset();
+  dom.window.document.getElementById('supProductId').value = '48';
+  await sandbox.supSaveLink();
+  await checkAsync('SAVE sends the supplier explicitly, never leaving it to a default', () => {
+    const p = calls.find(c => c.path === '/api/supplier/links' && c.method === 'POST');
+    assert.ok(p, 'nothing was posted');
+    assert.strictEqual(p.body.supplier, 'aimbetter',
+      'the mapping would have been saved against the wrong upstream — id 48 is a different item there');
+  });
+
+  // The FIRST supplier is the unkeyed one here on purpose. With the keyed one
+  // first, a form that simply leaves the browser's default selection lands on
+  // the right answer by accident and this check proves nothing.
+  reset(); linksReply = reply({ suppliers: SUPPLIERS(false, true) });
+  await sandbox.supLoadAll();
+  sandbox.supEditLink(1);
+  sandbox.supResetForm();
+  await checkAsync('RESET drops back to a supplier that CAN buy, not the last-edited one', () =>
+    assert.strictEqual(dom.window.document.getElementById('supSupplier').value, 'aimbetter',
+      'a new mapping was pre-pointed at an upstream with no key — it would never buy anything'));
+
   console.log('\nwhat the numbers say');
 
   reset(); linksReply = reply({ links: [LINK({ cost_cents: 1200, tier_price_cents: 200 })] });
@@ -383,6 +488,15 @@ async function run() {
     assert.match(log, /MAY HAVE BEEN CHARGED/,
       'a timeout rendered like any other failure — that row is the only trace of the money');
     assert.match(log, /UPSTREAM-KEY-AAAA/, 'the keys must be readable; re-issuing one is why the log exists');
+  });
+
+  await checkAsync('every log line names WHICH upstream was charged', () => {
+    const log = dom.window.document.getElementById('supDeliveryLog').textContent;
+    assert.match(log, /Gandy Reseller/, 'the delivered row does not say who was paid');
+    // The one that has to name it. Someone reading this row is about to go and
+    // check a supplier panel against it, and there are two of them.
+    assert.match(log, /AimBetter[\s\S]*MAY HAVE BEEN CHARGED|MAY HAVE BEEN CHARGED[\s\S]*AimBetter/,
+      'the maybe-charged row does not say which supplier panel to check');
   });
 
   await checkAsync('nothing the panel rendered contains an API key', () => {

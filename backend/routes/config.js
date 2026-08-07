@@ -25,11 +25,16 @@ const secretLimiter = failureLimiter({ windowMs: 15 * 60 * 1000, max: 30, global
 // a dead or wrong channel at boot, and the symptom (orders "not logging") looks
 // identical to the bug that started this whole audit.
 //
-// GANDY_API_KEY is on the list for the same reason as the two passwords, plus a
-// worse one: it spends real money. A key in a `config` row is a key readable by
-// anything holding API_SECRET, and one that boot would restore over a rotation
-// made after the old one leaked. Railway only.
-const ENV_ONLY_KEYS = ['PANEL_PASSWORD', 'VAULT_PASSWORD', 'ORDER_LOG_CHANNEL_ID', 'GANDY_API_KEY'];
+// The supplier keys are on the list for the same reason as the two passwords,
+// plus a worse one: they spend real money. A key in a `config` row is a key
+// readable by anything holding API_SECRET, and one that boot would restore over
+// a rotation made after the old one leaked. Railway only.
+//
+// One entry per supplier, listed explicitly rather than matched on a pattern
+// like /_API_KEY$/: a rule that guesses which names are dangerous will one day
+// guess wrong in the direction that costs money.
+const ENV_ONLY_KEYS = ['PANEL_PASSWORD', 'VAULT_PASSWORD', 'ORDER_LOG_CHANNEL_ID',
+  'GANDY_API_KEY', 'AIMBETTER_API_KEY'];
 
 router.get('/', (req, res) => {
   res.json({

@@ -30,6 +30,10 @@ const Module = require('module');
 process.env.GUILD_ID = 'test-guild';
 process.env.GANDY_API_KEY = 'live-key-must-never-appear';
 process.env.GANDY_API_BASE = 'https://supplier.invalid/api/v1';
+// The second supplier. Distinct key and distinct host on purpose: every check
+// below that says "the right one" would pass by accident if they shared either.
+process.env.AIMBETTER_API_KEY = 'second-key-must-never-appear';
+process.env.AIMBETTER_API_BASE = 'https://second-supplier.invalid/api/v1';
 process.env.SUPPLIER_OFF = '';
 
 let passed = 0, failed = 0;
@@ -77,9 +81,13 @@ const exec = async (text, params) => {
       l.guild_id === params[0] && l.tier_id === Number(params[1]) && (!wantsEnabled || l.enabled)) };
   }
   if (/INSERT INTO supplier_deliveries/.test(t)) {
+    // (guild_id, order_id, tier_id, link_id, buyer_ref, supplier,
+    //  supplier_product_id, qty, status, cost_cents) — read off the real
+    // statement. params[5] is the supplier, and leaving it out here is how a
+    // log row that names no upstream would have gone unnoticed.
     const row = {
       id: 500 + deliveries.length, order_id: params[1], tier_id: params[2], link_id: params[3],
-      buyer_ref: params[4], supplier_product_id: params[6], qty: params[7],
+      buyer_ref: params[4], supplier: params[5], supplier_product_id: params[6], qty: params[7],
       status: 'pending', response_lines: null, error_text: null, cost_cents: params[8],
     };
     deliveries.push(row);
@@ -327,6 +335,65 @@ async function run() {
   await checkAsync('no key configured means no supplier, not a failed sale', async () =>
     assert.strictEqual(await supplier.linkForTier(401), null));
   process.env.GANDY_API_KEY = realKey;
+
+  console.log('\ntwo suppliers, running the same API');
+
+  // They are the same panel software behind different domains, so the only
+  // things that distinguish them are the host and the key — which is exactly
+  // why a link pointing at the wrong one cannot be spotted by looking.
+  reset();
+  links[0].supplier = 'aimbetter';
+  await supplier.purchase(links[0], { qty: 1, orderId: 'ord-1' });
+  await checkAsync('a link buys from ITS supplier, with THAT key', () => {
+    assert.strictEqual(requests.length, 1);
+    assert.match(requests[0].url, /^https:\/\/second-supplier\.invalid\//,
+      'it bought from the wrong supplier — product ids do not mean the same thing at both');
+    assert.strictEqual(requests[0].params.key, 'second-key-must-never-appear',
+      'it sent the other supplier key, which would be refused at best and spend the wrong balance at worst');
+  });
+
+  await checkAsync('and the row records WHICH supplier was charged', () =>
+    assert.strictEqual(deliveries[0].supplier, 'aimbetter',
+      'with two upstreams, a log row that does not say cannot be reconciled against an invoice'));
+
+  check('redact() strips BOTH keys, not just the one that failed', () => {
+    // Both keys BARE, not in a key= parameter. In that form the generic
+    // `key=…` rule catches them whatever the per-supplier loop does, and this
+    // check passes without proving anything — which is exactly what it did
+    // until a mutant that redacted only the default supplier survived it. An
+    // upstream error body quoting the credential back at us looks like this.
+    const leak = 'gandy rejected token live-key-must-never-appear ' +
+                 'aim rejected token second-key-must-never-appear';
+    const safe = supplier.redact(leak);
+    assert.ok(!safe.includes('live-key-must-never-appear'));
+    assert.ok(!safe.includes('second-key-must-never-appear'),
+      'the second supplier key survived — a redactor that only knows one of them leaks the other');
+  });
+
+  reset();
+  links[0].supplier = 'aimbetter';
+  const savedAim = process.env.AIMBETTER_API_KEY;
+  process.env.AIMBETTER_API_KEY = '';
+  await checkAsync('one supplier missing its key does NOT switch off the other', async () => {
+    assert.strictEqual(await supplier.linkForTier(401), null, 'it tried to buy with no key');
+    links[0].supplier = 'gandy';
+    assert.ok(await supplier.linkForTier(401),
+      'a configured supplier stopped working because a DIFFERENT one had no key set');
+  });
+  process.env.AIMBETTER_API_KEY = savedAim;
+
+  reset();
+  links[0].supplier = 'nobody-by-that-name';
+  await checkAsync('an unknown supplier name falls back rather than guessing', async () => {
+    assert.strictEqual(await supplier.linkForTier(401), null);
+    const out = await supplier.purchase(links[0], { qty: 1, orderId: 'ord-1' });
+    assert.strictEqual(requests.length, 0, 'it bought from whichever supplier happened to be first');
+    // 'error', not 'timeout': no request went out, so nothing was charged and
+    // the caller is free to fall back. Calling this a timeout would strand a
+    // paid order for a human over a typo.
+    assert.strictEqual(out.status, 'error');
+    assert.strictEqual(deliveries.length, 0, 'it logged a pending charge that was never in flight');
+  });
 
   console.log('\nend to end, through the real delivery path');
 

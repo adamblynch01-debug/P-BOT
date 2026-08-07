@@ -31,11 +31,46 @@ const { raiseAlert } = require('./alerts');
 
 const GUILD_ID = process.env.GUILD_ID;
 
-const BASE = process.env.GANDY_API_BASE || 'https://gandyreseller.uk/api/v1';
+// ─── who we can buy from ─────────────────────────────────────────────────────
+// Two suppliers, and they are running THE SAME PANEL SOFTWARE — same Flask API,
+// same two endpoints, same "one value per line" body, same `ERROR:` prefix, word
+// for word the same guide. So a second supplier is a base URL and its own key,
+// not a second integration, and everything below is written once.
+//
+// What is NOT shared is the product numbering. Product 48 at one of them is a
+// completely different item from product 48 at the other, so `supplier` on a
+// link is load-bearing: pointing a link at the wrong one sells the wrong product
+// at the wrong price, and the first evidence of that is a customer holding
+// somebody else's key. There is no way to check it short of buying one.
+//
+// Each key is its own env var and neither may live in `config` — see
+// ENV_ONLY_KEYS in routes/config.js.
+const PROVIDERS = {
+  gandy: {
+    label: 'Gandy Reseller',
+    base: process.env.GANDY_API_BASE || 'https://gandyreseller.uk/api/v1',
+    keyEnv: 'GANDY_API_KEY',
+  },
+  aimbetter: {
+    label: 'AimBetter',
+    base: process.env.AIMBETTER_API_BASE || 'https://aimbetter.site/api/v1',
+    keyEnv: 'AIMBETTER_API_KEY',
+  },
+};
+const DEFAULT_SUPPLIER = 'gandy';
+
+function providerNames() { return Object.keys(PROVIDERS); }
+// Unknown names resolve to null rather than to the default. A link saved with a
+// typo'd supplier must fall back to our own key pool, not quietly buy from
+// whichever one happens to be first in the list.
+function providerFor(name) {
+  return PROVIDERS[String(name || DEFAULT_SUPPLIER).trim().toLowerCase()] || null;
+}
+
 // Generous, because a slow answer is still an answer and a timeout is the one
 // outcome we cannot recover from. Better to wait than to give up on a purchase
 // that succeeded.
-const TIMEOUT_MS = Number(process.env.GANDY_TIMEOUT_MS || 30000);
+const TIMEOUT_MS = Number(process.env.SUPPLIER_TIMEOUT_MS || process.env.GANDY_TIMEOUT_MS || 30000);
 
 // The markers that reach delivery.js. Both are registered in FAILURE_MARKERS
 // there, so a supplier failure suppresses the customer's confirmation email and
@@ -43,20 +78,35 @@ const TIMEOUT_MS = Number(process.env.GANDY_TIMEOUT_MS || 30000);
 const SUPPLIER_ERROR = 'SUPPLIER_ERROR';
 const SUPPLIER_TIMEOUT = 'SUPPLIER_TIMEOUT';
 
-function apiKey() {
-  return String(process.env.GANDY_API_KEY || '').trim();
+function apiKey(name) {
+  const p = providerFor(name);
+  return p ? String(process.env[p.keyEnv] || '').trim() : '';
 }
-function hasApiKey() { return !!apiKey(); }
+// With a name: is THAT supplier usable. Without one: is ANY of them usable —
+// which is what the panel header asks when it decides whether to shout that
+// nothing can be bought at all.
+function hasApiKey(name) {
+  if (name === undefined || name === null || name === '') {
+    return providerNames().some(n => !!apiKey(n));
+  }
+  return !!apiKey(name);
+}
 
 // Everything that leaves this module — logs, alerts, API responses, the panel —
 // goes through this. The key is in a query string, so it lands in axios' own
 // error messages ("Request failed... at https://.../deliver/48?key=abcd") for
 // free, and those messages are exactly what gets stored in last_error and shown
 // in the admin panel.
+//
+// EVERY supplier's key is stripped, not just the one that failed. A redactor
+// that only knows about the supplier it was called for is a redactor that leaks
+// the other one's key the first time an error message quotes a URL.
 function redact(text) {
-  const k = apiKey();
   let s = String(text == null ? '' : text);
-  if (k) s = s.split(k).join('<GANDY_API_KEY>');
+  for (const n of providerNames()) {
+    const k = apiKey(n);
+    if (k) s = s.split(k).join(`<${PROVIDERS[n].keyEnv}>`);
+  }
   return s.replace(/([?&]key=)[^&\s]+/gi, '$1<redacted>');
 }
 
@@ -89,14 +139,26 @@ function supplierGloballyOff() {
 // The link for one tier, or null. `enabled = false` and the global switch both
 // return null, which is what makes turning either off fall the tier straight
 // back to the local key pool rather than failing the sale.
+//
+// The key check is PER LINK, deliberately. With two suppliers, "is a key set"
+// is no longer one question: a link pointing at a supplier whose key is unset
+// must fall back to local stock, while links pointing at the configured one keep
+// working. A single global check would have one missing key silently switch off
+// the supplier that is working fine.
 async function linkForTier(tierId) {
-  if (!hasApiKey() || supplierGloballyOff()) return null;
+  if (supplierGloballyOff()) return null;
   try {
     const { rows } = await query(
       'SELECT * FROM supplier_links WHERE guild_id = $1 AND tier_id = $2 AND enabled = TRUE',
       [GUILD_ID, tierId]
     );
-    return rows[0] || null;
+    const link = rows[0] || null;
+    if (!link) return null;
+    // An unknown supplier name (a typo, or a row left by a build that knew a
+    // provider this one does not) resolves to no provider, so it falls back to
+    // the local pool. Fail closed towards the thing that still delivers.
+    if (!providerFor(link.supplier) || !hasApiKey(link.supplier)) return null;
+    return link;
   } catch (err) {
     // The table may not exist yet on an instance that has not run the
     // migration. That must not break delivery — it means "no supplier links",
@@ -112,6 +174,20 @@ async function linkForTier(tierId) {
 // order that has already been paid for.
 async function purchase(link, { qty = 1, orderId = null, buyerRef = null } = {}) {
   const units = Math.max(1, Number(qty) || 1) * Math.max(1, Number(link.qty_per_unit) || 1);
+  const supplierName = String(link.supplier || DEFAULT_SUPPLIER).trim().toLowerCase();
+  const provider = providerFor(supplierName);
+
+  // Nowhere to send it. Returned as an `error`, which is the one failure the
+  // caller is allowed to fall back from — and correctly so: no request went
+  // out, so nothing was charged. Checked BEFORE the pre-log, because a
+  // 'pending' row means "a charge may be in flight" and this one never is.
+  if (!provider || !apiKey(supplierName)) {
+    const why = !provider
+      ? `Unknown supplier "${supplierName}" — this build knows ${providerNames().join(', ')}.`
+      : `No API key is set for ${provider.label} (${provider.keyEnv} on Railway).`;
+    console.error(`[Supplier] not buying ${link.supplier_product_id}: ${why}`);
+    return { status: 'error', error: why, deliveryId: null };
+  }
 
   // Logged BEFORE the request. If this process dies mid-call the row stays
   // 'pending', which reads as "we may have been charged and never found out" —
@@ -122,7 +198,7 @@ async function purchase(link, { qty = 1, orderId = null, buyerRef = null } = {})
       `INSERT INTO supplier_deliveries
          (guild_id, order_id, tier_id, link_id, buyer_ref, supplier, supplier_product_id, qty, status, cost_cents)
        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,'pending',$9) RETURNING id`,
-      [GUILD_ID, orderId, link.tier_id, link.id, buyerRef, link.supplier || 'gandy',
+      [GUILD_ID, orderId, link.tier_id, link.id, buyerRef, supplierName,
        link.supplier_product_id, units, link.cost_cents != null ? Number(link.cost_cents) * units : null]
     );
     deliveryId = rows[0].id;
@@ -155,12 +231,12 @@ async function purchase(link, { qty = 1, orderId = null, buyerRef = null } = {})
     return { status, deliveryId, ...patch };
   };
 
-  const url = `${BASE}/deliver/${encodeURIComponent(link.supplier_product_id)}`;
+  const url = `${provider.base}/deliver/${encodeURIComponent(link.supplier_product_id)}`;
   let res;
   try {
     res = await axios.get(url, {
       params: Object.assign(
-        { key: apiKey(), qty: units },
+        { key: apiKey(supplierName), qty: units },
         buyerRef ? { buyerRef } : {}
       ),
       timeout: TIMEOUT_MS,
@@ -175,12 +251,14 @@ async function purchase(link, { qty = 1, orderId = null, buyerRef = null } = {})
     // No answer. This is the ambiguous case and it is treated as such: no
     // retry, no fallback, a human settles it.
     const msg = redact(err.message || 'no response');
-    console.error(`[Supplier] NO ANSWER for product ${link.supplier_product_id} on order ${orderId}: ${msg}`);
+    console.error(`[Supplier:${supplierName}] NO ANSWER for product ${link.supplier_product_id} on order ${orderId}: ${msg}`);
     await raiseAlert('supplier_timeout',
-      `The supplier did not answer while buying ${link.label || link.supplier_product_id} ` +
+      // Names the supplier, because with more than one upstream "check their
+      // panel" is not an instruction anybody can follow.
+      `${provider.label} did not answer while buying ${link.label || link.supplier_product_id} ` +
       `for order ${orderId || '(none)'}. THE CHARGE MAY HAVE GONE THROUGH — this was not retried ` +
       'and did not fall back to local stock, because either would risk handing out two keys for one sale. ' +
-      `Check their panel against supplier_deliveries id ${deliveryId || '(unlogged)'}.`,
+      `Check the ${provider.label} panel against supplier_deliveries id ${deliveryId || '(unlogged)'}.`,
       { severity: 'error', order_id: orderId }).catch(() => {});
     return finish('timeout', { error: msg });
   }
@@ -191,7 +269,7 @@ async function purchase(link, { qty = 1, orderId = null, buyerRef = null } = {})
     // They answered and said no. Nothing was charged and nothing consumed, so
     // the caller is free to fall back to our own pool.
     const msg = redact(parsed.error);
-    console.error(`[Supplier] refused product ${link.supplier_product_id} (HTTP ${res.status}): ${msg}`);
+    console.error(`[Supplier:${supplierName}] refused product ${link.supplier_product_id} (HTTP ${res.status}): ${msg}`);
     return finish('error', { error: msg });
   }
 
@@ -200,7 +278,7 @@ async function purchase(link, { qty = 1, orderId = null, buyerRef = null } = {})
   // arrived — it is real and it is paid for — but say so.
   if (parsed.lines.length < units) {
     await raiseAlert('supplier_short_delivery',
-      `The supplier returned ${parsed.lines.length} value(s) for ${units} asked for on ` +
+      `${provider.label} returned ${parsed.lines.length} value(s) for ${units} asked for on ` +
       `${link.label || link.supplier_product_id} (order ${orderId || '(none)'}). The rest was not delivered.`,
       { severity: 'warn', order_id: orderId }).catch(() => {});
   }
@@ -208,8 +286,22 @@ async function purchase(link, { qty = 1, orderId = null, buyerRef = null } = {})
   return finish('ok', { lines: parsed.lines });
 }
 
+// What the panel is told about each supplier: its name, a readable label, which
+// Railway variable holds its key, and WHETHER that key is set. Never the key,
+// and never the base URL's key-bearing form.
+function providerSummary() {
+  return providerNames().map(n => ({
+    name: n,
+    label: PROVIDERS[n].label,
+    key_env: PROVIDERS[n].keyEnv,
+    key_configured: !!apiKey(n),
+    host: (() => { try { return new URL(PROVIDERS[n].base).host; } catch (e) { return null; } })(),
+  }));
+}
+
 module.exports = {
-  SUPPLIER_ERROR, SUPPLIER_TIMEOUT,
+  SUPPLIER_ERROR, SUPPLIER_TIMEOUT, DEFAULT_SUPPLIER,
   hasApiKey, redact, parseBody, supplierGloballyOff,
+  providerNames, providerFor, providerSummary,
   linkForTier, purchase,
 };
