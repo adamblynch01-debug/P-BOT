@@ -38,6 +38,15 @@ const http = require('http');
 
 process.env.SKIP_BACKGROUND = process.env.SKIP_BACKGROUND || '1';
 
+// See the same guard in test_avatar_upload.js. Without the env this file dies
+// inside server.js's startup check naming CASHAPP_CASHTAG, which looks like a
+// payment fault rather than a test that was handed no database.
+if (!process.env.DATABASE_URL) {
+  console.log('\n  SKIP  test_game_tiles — this one talks to the real database.');
+  console.log('        Run it with:  railway run node backend/test_game_tiles.js\n');
+  process.exit(0);
+}
+
 const { pool } = require('./db');
 
 let passed = 0, failed = 0;

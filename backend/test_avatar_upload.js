@@ -37,6 +37,18 @@ const http = require('http');
 
 process.env.SKIP_BACKGROUND = process.env.SKIP_BACKGROUND || '1';
 
+// Checked BEFORE ./db and ./server are loaded, because without them this file
+// dies inside server.js's startup check complaining that CASHAPP_CASHTAG is
+// missing. That reads like a payment fault, it is nothing of the kind, and it
+// is why these checks spent several rounds written off as "known failures"
+// while covering nothing. A test that cannot be run must say so in the one
+// sentence that gets it running.
+if (!process.env.DATABASE_URL) {
+  console.log('\n  SKIP  test_avatar_upload — this one talks to the real database.');
+  console.log('        Run it with:  railway run node backend/test_avatar_upload.js\n');
+  process.exit(0);
+}
+
 const { pool } = require('./db');
 const { decodeImageDataUrl } = require('./utils/imageUpload');
 
