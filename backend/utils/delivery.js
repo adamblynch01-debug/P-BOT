@@ -2,6 +2,7 @@ const { query, withTransaction } = require('../db');
 const { notifyBot } = require('./botNotify');
 const { raiseAlert } = require('./alerts');
 const { sendOrderConfirmation } = require('./email');
+const supplier = require('./supplier');
 
 const GUILD_ID = process.env.GUILD_ID;
 
@@ -50,6 +51,12 @@ const FAILURE_MARKERS = new Set([
   // Distinct from OUT_OF_STOCK on purpose: the claim itself errored, so the
   // key may well exist. Restocking is the wrong response — this needs a look.
   'CLAIM_ERROR',
+  // The supplier did not answer. Registering it here is the whole integration
+  // with the existing machinery: it suppresses the customer's confirmation
+  // email, keeps the order out of 'delivered', and raises the alert — no new
+  // code path. SUPPLIER_ERROR is deliberately NOT here: a refusal falls back to
+  // local stock, so it never reaches deliveredGoods as a marker at all.
+  'SUPPLIER_TIMEOUT',
 ]);
 
 // What a receipt needs beyond "here is a box of keys": which subscription term
@@ -161,6 +168,66 @@ async function deliver(order) {
 
       if (tier.delivery_type === 'auto' && tier.stock_type !== 'manual') {
         const claimed = [];
+
+        // ─── supplier-backed tiers ───────────────────────────────────────────
+        // Some tiers are not fulfilled from our pool at all: the key is bought
+        // upstream at this moment. Tried BEFORE the local claim so we do not
+        // burn one of our own keys on a sale the supplier was going to cover.
+        //
+        // linkForTier() already returns null when the link is disabled, when
+        // the global switch is on, or when GANDY_API_KEY is unset — so all
+        // three of those fall through to the loop below and the shop sells from
+        // its own stock exactly as it always has. That fallback IS the feature:
+        // it is what makes a drained supplier balance survivable.
+        const link = await supplier.linkForTier(tier.id);
+        if (link) {
+          const bought = await supplier.purchase(link, {
+            qty: item.qty || 1,
+            orderId: order.id,
+            // Their only order-reference hook, and the one string that ties a
+            // charge on their invoice to an order here — there is no history
+            // endpoint to ask afterwards.
+            //
+            // invoice_no, deliberately NOT public_ref. public_ref is the
+            // unguessable handle that lets its holder read the order without a
+            // session (GET /api/orders/:id?ref=), so sending it to a third
+            // party hands them that capability. invoice_no is the reference
+            // already printed on the customer's receipt — public by design.
+            buyerRef: order.invoice_no || String(order.id),
+          });
+
+          if (bought.status === 'ok') {
+            deliveredGoods.push({
+              product: tier.product_name, game: tier.game_name || null,
+              items: bought.lines, ...lineDetail(item),
+              tier_label: item.tier_label || tier.label || null,
+              source: 'supplier',
+            });
+            continue;
+          }
+
+          if (bought.status === 'timeout') {
+            // AMBIGUOUS. They may have charged us and issued a key we never
+            // read. Falling back would hand out a second key for one sale and
+            // there is no way to hand the first one back, so this line stops
+            // here and a human settles it against their panel.
+            deliveredGoods.push({
+              product: tier.product_name, game: tier.game_name || null,
+              items: [supplier.SUPPLIER_TIMEOUT], ...lineDetail(item),
+              tier_label: item.tier_label || tier.label || null,
+              source: 'supplier',
+            });
+            continue;
+          }
+
+          // status === 'error': they answered and refused, which means nothing
+          // was charged and nothing consumed on their side. Our own pool is a
+          // safe second try, and a customer served from local stock is a
+          // customer served. Only if that is empty too does the order fail —
+          // and it then fails as OUT_OF_STOCK, which is the truth.
+          console.error(`[Delivery] supplier refused tier ${tier.id} on order ${order.id}; falling back to local stock`);
+        }
+
         for (let i = 0; i < (item.qty || 1); i++) {
           // Claim straight from the DB.
           //

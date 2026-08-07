@@ -153,6 +153,7 @@ app.use('/api/downloads', require('./routes/downloads'));
 app.use('/api/coupons', require('./routes/coupons'));
 app.use('/api/game-tiles', require('./routes/gameTiles'));
 app.use('/api/unsplash', require('./routes/unsplash'));
+app.use('/api/supplier', require('./routes/supplier'));
 
 // ─── Health ─────────────────────────────────────────────
 app.get('/health', (req, res) => res.json({ status: 'ok', store: process.env.STORE_NAME || 'H8ED Shop' }));

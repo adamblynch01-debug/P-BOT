@@ -1,6 +1,6 @@
 const express = require('express');
 const router = express.Router();
-const { query } = require('../db');
+const { query, withTransaction } = require('../db');
 const { requireAdmin, getSessionUser, bearerToken, botAuthorized } = require('../utils/auth');
 
 const GUILD_ID = process.env.GUILD_ID;
@@ -254,17 +254,145 @@ router.delete('/product/:id', async (req, res) => {
   }
 });
 
+// ─── POST /api/products/reorder ──────────────────────────
+// Reorders the products inside ONE game_name, from a list of ids in the order
+// the admin dragged them into. First in the list renders first.
+//
+// It is a PERMUTATION, not a renumber, and that is the whole design:
+// `products.sort_order` is **global across the guild, not per-category** — every
+// product in every category draws from one number line, and POST /new hands out
+// MAX+1. So writing 0..N-1 over one category would drop the whole category
+// underneath every other one. Instead the values those rows already hold are
+// collected, sorted descending (CATALOG_SELECT reads DESC), and dealt back out
+// in the new order. The multiset of numbers is unchanged, so nothing outside
+// this category can move — provable, rather than hoped for.
+//
+// ⚠ For a TABBED category the sub-tab bar is first-appearance order over this
+// same sort, so the tab that opens by default is whichever tab owns the top
+// product. Moving a FiveM product to the top of GTA V makes FiveM the default
+// tab. That is what "put this first" means, but the panel warns before saving.
+router.post('/reorder', async (req, res) => {
+  try {
+    if (!(await isAuthorizedOrAdmin(req))) return res.status(401).json({ error: 'Unauthorized' });
+    const gameName = String(req.body.game_name || '').trim();
+    const ids = Array.isArray(req.body.ids) ? req.body.ids.map(Number) : null;
+    if (!gameName) return res.status(400).json({ error: 'game_name is required' });
+    if (!ids || !ids.length) return res.status(400).json({ error: 'ids must be a non-empty array' });
+    if (ids.some(n => !Number.isFinite(n))) return res.status(400).json({ error: 'ids must all be numbers' });
+    if (new Set(ids).size !== ids.length) return res.status(400).json({ error: 'ids contains a duplicate' });
+
+    const out = await withTransaction(async (client) => {
+      // Locked for the read: two admins dragging at once would otherwise each
+      // compute a permutation of the values they saw and the second would write
+      // a set of numbers that no longer matches the rows.
+      const { rows } = await client.query(
+        `SELECT id, sort_order FROM products
+          WHERE guild_id = $1 AND game_name = $2
+          FOR UPDATE`,
+        [GUILD_ID, gameName]
+      );
+      // A partial list is how a category ends up scrambled — half permuted and
+      // half where it was. Refuse it rather than guess what the admin meant.
+      const have = new Set(rows.map(r => Number(r.id)));
+      const missing = rows.filter(r => !ids.includes(Number(r.id))).map(r => Number(r.id));
+      const foreign = ids.filter(id => !have.has(id));
+      if (foreign.length) return { error: `Not in "${gameName}": ${foreign.join(', ')}` };
+      if (missing.length) return { error: `Missing from the new order: ${missing.join(', ')}` };
+
+      const slots = rows.map(r => Number(r.sort_order)).sort((a, b) => b - a);
+      for (let i = 0; i < ids.length; i++) {
+        await client.query(
+          'UPDATE products SET sort_order = $1, updated_at = now() WHERE id = $2 AND guild_id = $3',
+          [slots[i], ids[i], GUILD_ID]
+        );
+      }
+      return { order: ids.map((id, i) => ({ id, sort_order: slots[i] })) };
+    });
+
+    if (out.error) return res.status(400).json({ error: out.error });
+    res.json({ success: true, ...out });
+  } catch (err) {
+    console.error('[Products] Reorder error:', err);
+    res.status(500).json({ error: 'Failed to save that order' });
+  }
+});
+
+// ─── POST /api/products/tiers/reorder ────────────────────
+// Same permutation rule one level down: the price buttons inside one product.
+//
+// Tier order reads ASC (CATALOG_SELECT ends `t.sort_order ASC`), so the slots
+// are dealt ascending here — the opposite of the products above, and the reason
+// the two are not one shared helper.
+//
+// Unlike products, tier sort_order is per-product in practice AND almost always
+// all-zero: every tier created through the panel or an importer lands on 0,
+// which is why an imported product renders Lifetime above Day. When the values
+// collide like that a permutation cannot express anything, so this route
+// renumbers 0..N-1 instead. Safe here precisely because the column is scoped to
+// the parent product and nothing else reads it.
+router.post('/tiers/reorder', async (req, res) => {
+  try {
+    if (!(await isAuthorizedOrAdmin(req))) return res.status(401).json({ error: 'Unauthorized' });
+    const productId = Number(req.body.product_id);
+    const ids = Array.isArray(req.body.ids) ? req.body.ids.map(Number) : null;
+    if (!Number.isFinite(productId)) return res.status(400).json({ error: 'product_id is required' });
+    if (!ids || !ids.length) return res.status(400).json({ error: 'ids must be a non-empty array' });
+    if (ids.some(n => !Number.isFinite(n))) return res.status(400).json({ error: 'ids must all be numbers' });
+    if (new Set(ids).size !== ids.length) return res.status(400).json({ error: 'ids contains a duplicate' });
+
+    const out = await withTransaction(async (client) => {
+      const { rows } = await client.query(
+        `SELECT id FROM product_tiers
+          WHERE guild_id = $1 AND product_id = $2
+          FOR UPDATE`,
+        [GUILD_ID, productId]
+      );
+      const have = new Set(rows.map(r => Number(r.id)));
+      const foreign = ids.filter(id => !have.has(id));
+      const missing = rows.filter(r => !ids.includes(Number(r.id))).map(r => Number(r.id));
+      if (foreign.length) return { error: `Not tiers of product ${productId}: ${foreign.join(', ')}` };
+      if (missing.length) return { error: `Missing from the new order: ${missing.join(', ')}` };
+
+      for (let i = 0; i < ids.length; i++) {
+        await client.query(
+          'UPDATE product_tiers SET sort_order = $1 WHERE id = $2 AND guild_id = $3',
+          [i, ids[i], GUILD_ID]
+        );
+      }
+      return { order: ids.map((id, i) => ({ id, sort_order: i })) };
+    });
+
+    if (out.error) return res.status(400).json({ error: out.error });
+    res.json({ success: true, ...out });
+  } catch (err) {
+    console.error('[Products] Tier reorder error:', err);
+    res.status(500).json({ error: 'Failed to save that tier order' });
+  }
+});
+
 // Creates a pricing tier under an existing product — create the parent
 // product row (in the `products` table) first; this endpoint only manages
 // tiers/pricing, matching what p-bot's flat model called a "product".
 router.post('/', async (req, res) => {
   try {
-    const { secret, product_id, name, price, period, stock_type, delivery_type } = req.body;
+    const { secret, product_id, name, price, period, stock_type, delivery_type, sort_order } = req.body;
     if (!(await isAuthorizedOrAdmin(req))) return res.status(401).json({ error: 'Unauthorized' });
+    // Explicit, or the next free slot under this product. It used to be the
+    // column default — 0 for every tier — so the storefront's
+    // `ORDER BY t.sort_order ASC` had nothing to order by and the price buttons
+    // came out in whatever order Postgres felt like. Flagged 31 July.
+    let order = sort_order != null && Number.isFinite(Number(sort_order)) ? Number(sort_order) : null;
+    if (order == null) {
+      const { rows: mx } = await query(
+        'SELECT COALESCE(MAX(sort_order), -1) + 1 AS next FROM product_tiers WHERE guild_id = $1 AND product_id = $2',
+        [GUILD_ID, product_id]
+      );
+      order = Number(mx[0].next);
+    }
     const { rows } = await query(
-      `INSERT INTO product_tiers (product_id, guild_id, label, price_cents, period, stock_type, delivery_type)
-       VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING *`,
-      [product_id, GUILD_ID, name, Math.round(parseFloat(price) * 100), period || null, stock_type || 'auto', delivery_type || 'auto']
+      `INSERT INTO product_tiers (product_id, guild_id, label, price_cents, period, stock_type, delivery_type, sort_order)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8) RETURNING *`,
+      [product_id, GUILD_ID, name, Math.round(parseFloat(price) * 100), period || null, stock_type || 'auto', delivery_type || 'auto', order]
     );
     res.json({ success: true, product: rows[0] });
   } catch (err) {
@@ -278,7 +406,7 @@ router.post('/', async (req, res) => {
 
 router.patch('/:id', async (req, res) => {
   try {
-    const { secret, name, price, period, stock_type, delivery_type } = req.body;
+    const { secret, name, price, period, stock_type, delivery_type, sort_order } = req.body;
     if (!(await isAuthorizedOrAdmin(req))) return res.status(401).json({ error: 'Unauthorized' });
     const { rows } = await query(
       `UPDATE product_tiers SET
@@ -286,7 +414,8 @@ router.patch('/:id', async (req, res) => {
          price_cents = COALESCE($2, price_cents),
          period = COALESCE($3, period),
          stock_type = COALESCE($4, stock_type),
-         delivery_type = COALESCE($5, delivery_type)
+         delivery_type = COALESCE($5, delivery_type),
+         sort_order = COALESCE($8, sort_order)
        WHERE id = $6 AND guild_id = $7
        RETURNING *`,
       [
@@ -295,6 +424,9 @@ router.patch('/:id', async (req, res) => {
         period || null,
         stock_type || null, delivery_type || null,
         req.params.id, GUILD_ID,
+        // COALESCE, so omitting it keeps the row's order. A caller that only
+        // means to reprice must not silently reshuffle the price buttons.
+        sort_order != null && Number.isFinite(Number(sort_order)) ? Number(sort_order) : null,
       ]
     );
     if (!rows.length) return res.status(404).json({ error: 'Product not found' });

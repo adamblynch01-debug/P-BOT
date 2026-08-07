@@ -105,6 +105,10 @@ const ctx = vm.createContext({
 // Source, verbatim.
 const SRC = [
   'getSteamBanner', 'gxLoadGameTiles', 'gxTile', 'gxTileLabel', 'gxTileImage',
+  // The ordering rule is now ONE comparator shared by the storefront grid and
+  // the admin grid — two copies of it are how the two came to disagree. Lifting
+  // it here rather than letting the storefront keep a private sort is the point.
+  'gxOrderRank', 'gxCmpOrdered',
   'gxApplyTileOverrides', 'syncMainSiteGameBanners',
 ].map(n => extractFn(html, n)).join('\n');
 

@@ -147,6 +147,58 @@ router.patch('/:gameName', async (req, res) => {
   }
 });
 
+// ─── POST /api/game-tiles/reorder ────────────────────────
+// The whole grid, in the order the admin dragged it into.
+//
+// Kept above POST /:gameName/banner deliberately. Nothing shadows it today —
+// there is no single-segment POST on this router — but a literal path and a
+// wildcard on the same method is exactly the pair that starts matching each
+// other the moment somebody adds `POST /:gameName`, and Express resolves that
+// in declaration order.
+//
+// Unlike products, tile order is 0..N-1 outright rather than a permutation of
+// existing values. Most tiles have `sort_order NULL` (= "sort me
+// alphabetically"), so there is no set of numbers to permute, and the first
+// drag has to materialise a full explicit order or the moved tile would jump
+// ahead of the alphabetical block while every other tile stayed where it was.
+//
+// One request and one transaction, not N PATCHes: a half-applied order is a
+// visibly scrambled shop window, and this route is what the public front page
+// reads on every load.
+router.post('/reorder', async (req, res) => {
+  try {
+    if (!(await isAuthorizedOrAdmin(req))) return res.status(401).json({ error: 'Unauthorized' });
+    const order = Array.isArray(req.body.order) ? req.body.order.map(n => String(n || '').trim()) : null;
+    if (!order || !order.length) return res.status(400).json({ error: 'order must be a non-empty array of game names' });
+    if (order.some(n => !n)) return res.status(400).json({ error: 'order contains an empty game name' });
+    if (new Set(order).size !== order.length) return res.status(400).json({ error: 'order contains a duplicate game name' });
+
+    const tiles = await withTransaction(async (client) => {
+      const out = [];
+      for (let i = 0; i < order.length; i++) {
+        // Upsert, same as PATCH: most games have never been edited and so have
+        // no row at all. Only sort_order is touched — a tile's name, badge and
+        // artwork are somebody else's edit and must survive a drag.
+        const { rows } = await client.query(
+          `INSERT INTO game_tiles (guild_id, game_name, sort_order)
+           VALUES ($1, $2, $3)
+           ON CONFLICT (guild_id, game_name)
+           DO UPDATE SET sort_order = EXCLUDED.sort_order, updated_at = now()
+           RETURNING *`,
+          [GUILD_ID, order[i], i]
+        );
+        out.push(rows[0]);
+      }
+      return out;
+    });
+
+    res.json({ success: true, tiles: tiles.map(publicTile) });
+  } catch (err) {
+    console.error('[GameTiles] reorder error:', err);
+    res.status(500).json({ error: 'Failed to save that order' });
+  }
+});
+
 // ─── DELETE /api/game-tiles/:gameName ────────────────────
 // Reverts a tile to whatever the static file says. Admin only, not staff: it
 // throws away every override on the tile at once, including the banner.

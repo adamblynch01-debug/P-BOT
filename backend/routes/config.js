@@ -24,7 +24,12 @@ const secretLimiter = failureLimiter({ windowMs: 15 * 60 * 1000, max: 30, global
 // notice — a stale config row would silently redirect the entire order feed to
 // a dead or wrong channel at boot, and the symptom (orders "not logging") looks
 // identical to the bug that started this whole audit.
-const ENV_ONLY_KEYS = ['PANEL_PASSWORD', 'VAULT_PASSWORD', 'ORDER_LOG_CHANNEL_ID'];
+//
+// GANDY_API_KEY is on the list for the same reason as the two passwords, plus a
+// worse one: it spends real money. A key in a `config` row is a key readable by
+// anything holding API_SECRET, and one that boot would restore over a rotation
+// made after the old one leaked. Railway only.
+const ENV_ONLY_KEYS = ['PANEL_PASSWORD', 'VAULT_PASSWORD', 'ORDER_LOG_CHANNEL_ID', 'GANDY_API_KEY'];
 
 router.get('/', (req, res) => {
   res.json({
@@ -97,6 +102,11 @@ router.post('/update', async (req, res) => {
       // Railway: closing a payment method is something you do in the middle of
       // a busy day, and a Railway variable costs a redeploy to change.
       'PAYMENT_METHODS_OFF', 'PAYPAL_ME',
+      // The supplier kill switch. Same reasoning: switching off an upstream
+      // that has stopped delivering is something you do mid-incident, and a
+      // Railway variable costs a redeploy. The KEY it gates (GANDY_API_KEY) is
+      // env-only and listed above — this is the switch, not the credential.
+      'SUPPLIER_OFF',
     ];
 
     // Rejected by name so the error explains itself instead of looking like a
