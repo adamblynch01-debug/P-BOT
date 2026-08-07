@@ -37,9 +37,88 @@ const PLACEHOLDERS = new Set([
 
 const clean = (s) => String(s == null ? '' : s).trim();
 
+// The four methods, in the order they are shown at checkout. Anything that
+// needs to iterate every method reads this rather than writing its own list —
+// the reseller-status bug taught us what happens when an exhaustive list is
+// spelled out in five places and a sixth is added later.
+const ALL_METHODS = ['cashapp', 'paypal', 'btc', 'ltc'];
+
+/**
+ * Methods the owner has deliberately switched OFF, as a Set.
+ *
+ * This is the piece that did not exist until now: availability used to be
+ * derived ONLY from whether the address parsed, so "off" and "misconfigured"
+ * were the same state, and the only way to close a method was to delete its
+ * address and type it back in later. Now the address stays put and this list
+ * decides.
+ *
+ * Stored as a comma-separated string because it rides the existing `config`
+ * table, which is TEXT — one key, four flags, no migration.
+ */
+function disabledMethods(env = process.env) {
+  return new Set(
+    String(env.PAYMENT_METHODS_OFF || '')
+      .split(',')
+      .map(s => s.trim().toLowerCase())
+      .filter(s => ALL_METHODS.includes(s))
+  );
+}
+
 function isPayableCashtag(value) {
   const v = clean(value);
   return CASHTAG_RE.test(v) && !PLACEHOLDERS.has(v.toLowerCase());
+}
+
+// ─── PayPal.Me ───────────────────────────────────────────────────────────────
+//
+// The pay screen has always built its PayPal QR out of the EMAIL ADDRESS:
+//
+//     https://www.paypal.com/paypalme/<PAYPAL_EMAIL>
+//
+// That is not a PayPal.Me link. PayPal.Me takes a handle — the name you picked
+// at paypal.me/… — and an email address is not one, so the URL behind every
+// PayPal QR this store has ever printed resolves to a "page not found". It
+// scanned perfectly; it just led nowhere, which is why it read as "QR not
+// working" rather than as an outage. Cash App's equivalent has always worked
+// because `https://cash.app/$tag` genuinely IS the address format.
+//
+// A PayPal.Me handle is 1-20 letters and digits. The owner will reasonably
+// paste any of `handle`, `@handle`, `paypal.me/handle`, or the full https URL,
+// so all four are accepted and reduced to the bare handle.
+const PAYPALME_RE = /^[A-Za-z0-9]{1,20}$/;
+
+function normalisePaypalMe(value) {
+  let v = clean(value);
+  if (!v) return null;
+  v = v.replace(/^https?:\/\//i, '')
+       .replace(/^www\./i, '')
+       .replace(/^paypal\.me\//i, '')
+       .replace(/^paypal\.com\/paypalme\//i, '')
+       .replace(/^@/, '')
+       .replace(/\/+$/, '')
+       .trim();
+  if (!PAYPALME_RE.test(v)) return null;
+  if (PLACEHOLDERS.has(v.toLowerCase())) return null;
+  return v;
+}
+
+/**
+ * The link a PayPal QR should actually encode. PayPal.Me accepts the amount in
+ * the path, so scanning this opens PayPal with the total already filled in —
+ * one fewer number for the buyer to mistype, and a mistyped total is an
+ * underpaid order somebody has to settle by hand.
+ *
+ * Returns null when no handle is configured, and the caller must then render
+ * NO QR at all. A QR that leads to a dead page is worse than no QR: it looks
+ * like the store is broken, and the buyer has no reason to read the address
+ * printed underneath it.
+ */
+function paypalMeLink(value, amount) {
+  const handle = normalisePaypalMe(value);
+  if (!handle) return null;
+  const amt = Number(amount);
+  const suffix = Number.isFinite(amt) && amt > 0 ? `/${amt.toFixed(2)}` : '';
+  return `https://www.paypal.com/paypalme/${handle}${suffix}`;
 }
 
 function isPayableEmail(value) {
@@ -53,12 +132,69 @@ function isPayableEmail(value) {
  * own, so those two keep the non-empty test.
  */
 function payableMethods(env = process.env) {
+  const off = disabledMethods(env);
   return {
+    cashapp: !off.has('cashapp') && isPayableCashtag(env.CASHAPP_CASHTAG),
+    paypal: !off.has('paypal') && isPayableEmail(env.PAYPAL_EMAIL),
+    btc: !off.has('btc') && !!env.BTC_XPUB,
+    ltc: !off.has('ltc') && !!env.LTC_XPUB,
+  };
+}
+
+/**
+ * Per-method state with the REASON, for the admin panel, the bot's
+ * `/config methods` and the 503 a refused order gets back.
+ *
+ * The reason matters more than the boolean. "PayPal is unavailable" reads the
+ * same whether the owner turned it off on purpose or the address is a typo,
+ * and those two want opposite responses from whoever is looking. `off` means
+ * somebody chose this; `unconfigured` means something is broken.
+ */
+function methodStates(env = process.env) {
+  const off = disabledMethods(env);
+  const configured = {
     cashapp: isPayableCashtag(env.CASHAPP_CASHTAG),
     paypal: isPayableEmail(env.PAYPAL_EMAIL),
     btc: !!env.BTC_XPUB,
     ltc: !!env.LTC_XPUB,
   };
+  const missing = {
+    cashapp: 'CASHAPP_CASHTAG is not a usable cashtag',
+    paypal: 'PAYPAL_EMAIL is not a usable email address',
+    btc: 'BTC_XPUB is not set',
+    ltc: 'LTC_XPUB is not set',
+  };
+  const out = {};
+  for (const m of ALL_METHODS) {
+    // Reported ahead of the address check on purpose. A method the owner has
+    // switched off should say so even if its address is ALSO broken, or
+    // turning it back on later looks like it silently failed.
+    if (off.has(m)) out[m] = { available: false, state: 'off', reason: 'Switched off by staff' };
+    else if (!configured[m]) out[m] = { available: false, state: 'unconfigured', reason: missing[m] };
+    else out[m] = { available: true, state: 'on', reason: null };
+  }
+  return out;
+}
+
+/**
+ * The `PAYMENT_METHODS_OFF` string that results from flipping one method,
+ * normalised and de-duplicated. Returned rather than written so the caller
+ * decides where it goes — the panel and the bot both POST it to
+ * /api/config/update, and neither should be assembling this by hand.
+ *
+ * Throws on an unknown method rather than silently dropping it: a typo that
+ * quietly no-ops would read as "the switch does not work".
+ */
+function toggleMethod(method, enabled, env = process.env) {
+  const m = String(method || '').trim().toLowerCase();
+  if (!ALL_METHODS.includes(m)) {
+    throw new Error(`Unknown payment method "${method}" — expected one of ${ALL_METHODS.join(', ')}`);
+  }
+  const off = disabledMethods(env);
+  if (enabled) off.delete(m); else off.add(m);
+  // Sorted so the stored value is stable: the same set of switches always
+  // produces the same string, and a config-row diff means a real change.
+  return ALL_METHODS.filter(x => off.has(x)).join(',');
 }
 
 /**
@@ -77,10 +213,20 @@ function addressProblems(env = process.env) {
     out.push(`PAYPAL_EMAIL is set to ${JSON.stringify(clean(env.PAYPAL_EMAIL))}, which is not an email address. `
       + 'PayPal is switched OFF until it is.');
   }
+  // Set-but-unusable, the same failure class as the two above. An unset
+  // PAYPAL_ME is fine — PayPal still works, it just shows no QR — but a
+  // handle that does not parse would silently fall back to no QR while the
+  // owner believes they configured one.
+  if (clean(env.PAYPAL_ME) && !normalisePaypalMe(env.PAYPAL_ME)) {
+    out.push(`PAYPAL_ME is set to ${JSON.stringify(clean(env.PAYPAL_ME))}, which is not a PayPal.Me handle `
+      + '(1-20 letters or digits, e.g. uhservices). The PayPal QR stays hidden until it is.');
+  }
   return out;
 }
 
 module.exports = {
   isPayableCashtag, isPayableEmail, payableMethods, addressProblems,
-  CASHTAG_RE, EMAIL_RE,
+  disabledMethods, methodStates, toggleMethod, ALL_METHODS,
+  normalisePaypalMe, paypalMeLink,
+  CASHTAG_RE, EMAIL_RE, PAYPALME_RE,
 };

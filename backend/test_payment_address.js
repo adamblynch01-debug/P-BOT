@@ -95,13 +95,32 @@ check('POST /api/config/update refuses to SAVE one', () => {
   assert.ok(/'PAYPAL_EMAIL' && String\(value \|\| ''\)\.trim\(\) && !isPayableEmail\(value\)/.test(s));
 });
 
+// Repinned 2026-08-06. This used to assert the two literal calls
+// `isPayableCashtag(process.env.CASHAPP_CASHTAG)` and `isPayableEmail(...)`
+// inside createOrderPriced — the implementation, not the rule. The guard has
+// since been generalised to methodStates(), which covers all FOUR methods
+// (btc and ltc had no guard at all) and also honours the on/off switch, so the
+// old assertions failed on a change that made the thing they protect stricter.
+//
+// What must stay true is the rule: an order for a method that cannot be paid
+// is refused BEFORE the row is written, with a status the buyer can act on.
+// So that is what this checks now — the behaviour through payableMethods, plus
+// the one structural fact a source test can actually establish, which is that
+// the refusal sits ahead of the pricing.
 check('an order is refused before the row is written, not after', () => {
   const s = src('routes/orders.js');
   const fn = s.slice(s.indexOf('async function createOrderPriced'), s.indexOf('const subtotalCents = subtotalCentsOf(items)'));
-  assert.ok(/isPayableCashtag\(process\.env\.CASHAPP_CASHTAG\)/.test(fn),
-    'a Cash App order is still created against a placeholder');
-  assert.ok(/isPayableEmail\(process\.env\.PAYPAL_EMAIL\)/.test(fn));
+  assert.ok(/methodStates\(\)\[payment_method\]/.test(fn),
+    'the guard no longer consults the per-method state');
+  assert.ok(/!state\.available/.test(fn), 'nothing refuses an unpayable method');
   assert.ok(/statusCode = 503/.test(fn), 'the buyer gets a 500 they cannot act on');
+
+  // And the rule itself, exercised rather than pattern-matched: the placeholder
+  // that started all this is still not payable, so the guard above still fires.
+  const { methodStates } = require('./utils/paymentAddress');
+  const st = methodStates({ CASHAPP_CASHTAG: ' your $cashtag', PAYPAL_EMAIL: 'your@paypal.com' });
+  assert.strictEqual(st.cashapp.available, false, 'a placeholder cashtag is payable again');
+  assert.strictEqual(st.paypal.available, false, 'a placeholder PayPal address is payable again');
 });
 
 check('the placeholder FALLBACKS are gone from the pay screen', () => {

@@ -3,7 +3,9 @@ const router = express.Router();
 const { query } = require('../db');
 const { failureLimiter, safeCompare } = require('../utils/rateLimit');
 const EXPIRY = require('../utils/expiry');
-const { payableMethods, isPayableCashtag, isPayableEmail } = require('../utils/paymentAddress');
+const { payableMethods, isPayableCashtag, isPayableEmail,
+        methodStates, normalisePaypalMe, toggleMethod, ALL_METHODS } = require('../utils/paymentAddress');
+const { requireOwnerAdmin } = require('../utils/auth');
 
 const GUILD_ID = process.env.GUILD_ID;
 
@@ -53,6 +55,11 @@ router.get('/', (req, res) => {
     // `!!process.env.CASHAPP_CASHTAG`, which is true of a placeholder, so
     // checkout offered Cash App and then showed the placeholder as the address.
     payment_methods: payableMethods(),
+    // The same four booleans with the REASON attached. `payment_methods` stays
+    // exactly as it was so nothing reading it has to change; this is what the
+    // admin panel renders, because "off" and "misconfigured" want opposite
+    // reactions from whoever is looking at the switch.
+    payment_method_states: methodStates(),
   });
 });
 
@@ -85,6 +92,11 @@ router.post('/update', async (req, res) => {
       'DISCORD_GUILD_ID', 'CASHAPP_FEE_PERCENT', 'PAYPAL_FEE_PERCENT',
       'CRYPTO_DISCOUNT_PERCENT', 'STORE_NAME', 'BTC_XPUB', 'LTC_XPUB',
       'ORDER_LOG_CHANNEL_ID',
+      // Which methods are switched off, and the PayPal.Me handle the pay
+      // screen's QR is built from. Both belong in the DB rather than in
+      // Railway: closing a payment method is something you do in the middle of
+      // a busy day, and a Railway variable costs a redeploy to change.
+      'PAYMENT_METHODS_OFF', 'PAYPAL_ME',
     ];
 
     // Rejected by name so the error explains itself instead of looking like a
@@ -116,17 +128,137 @@ router.post('/update', async (req, res) => {
       });
     }
 
+    // What actually gets stored. Two keys are normalised rather than taken
+    // verbatim, so the stored form is the canonical one and every reader gets
+    // the same answer without re-parsing.
+    let stored = value;
+
+    // A typo here must be LOUD. "payapl" would otherwise be filtered out as an
+    // unknown method, stored, and report success while PayPal stayed on — the
+    // owner would believe they had closed a payment method during whatever
+    // incident made them want to.
+    if (key.toUpperCase() === 'PAYMENT_METHODS_OFF') {
+      const parts = String(value || '').split(',').map(s => s.trim().toLowerCase()).filter(Boolean);
+      const unknown = parts.filter(p => !ALL_METHODS.includes(p));
+      if (unknown.length) {
+        return res.status(400).json({
+          error: `Not a payment method: ${unknown.join(', ')}. Valid values are ${ALL_METHODS.join(', ')} `
+               + '— send an empty value to switch every method back on.',
+        });
+      }
+      // De-duplicated and in a fixed order, so the same set of switches always
+      // stores the same string.
+      stored = ALL_METHODS.filter(m => parts.includes(m)).join(',');
+    }
+
+    // Accepts a bare handle, @handle, paypal.me/handle or the full URL, and
+    // stores the handle. Refuses anything that is not one, because the
+    // alternative is a QR that silently does not render.
+    if (key.toUpperCase() === 'PAYPAL_ME' && String(value || '').trim()) {
+      const handle = normalisePaypalMe(value);
+      if (!handle) {
+        return res.status(400).json({
+          error: `"${String(value).trim()}" is not a PayPal.Me handle. It is 1-20 letters or digits — the name `
+               + 'at the end of your paypal.me link. Paste the link itself if that is easier.',
+        });
+      }
+      stored = handle;
+    }
+
     await query(
       `INSERT INTO config (guild_id, key, value, updated_at) VALUES ($1,$2,$3, now())
        ON CONFLICT (guild_id, key) DO UPDATE SET value = EXCLUDED.value, updated_at = now()`,
-      [GUILD_ID, key.toUpperCase(), value]
+      [GUILD_ID, key.toUpperCase(), stored]
     );
 
-    process.env[key.toUpperCase()] = value;
-    res.json({ success: true, message: `${key} updated successfully` });
+    process.env[key.toUpperCase()] = stored;
+    res.json({ success: true, message: `${key} updated successfully`, value: stored });
   } catch (err) {
     res.status(500).json({ error: 'Failed to update config' });
   }
+});
+
+// ─── Switching a payment method on and off ───────────────────────────────────
+//
+// A separate route from POST /update for one reason: that one authenticates
+// with API_SECRET, which is a SERVER credential. The admin panel runs in a
+// browser and holds a session token, not the secret — so before this existed
+// the panel had no way to reach config at all, which is why the payment
+// section of the panel was simply missing rather than merely incomplete.
+//
+// Gated on requireOwnerAdmin rather than requireAdmin. requireAdmin accepts
+// 'staff', and closing the store's payment methods is not a moderation
+// action — it decides whether the shop can take money. Same reasoning that
+// split /admin/set-role off from the rest.
+router.post('/payment-methods', requireOwnerAdmin, async (req, res) => {
+  try {
+    const { method, enabled } = req.body || {};
+    let next;
+    try {
+      next = toggleMethod(method, !!enabled);
+    } catch (e) {
+      return res.status(400).json({ error: e.message });
+    }
+
+    await query(
+      `INSERT INTO config (guild_id, key, value, updated_at) VALUES ($1,'PAYMENT_METHODS_OFF',$2, now())
+       ON CONFLICT (guild_id, key) DO UPDATE SET value = EXCLUDED.value, updated_at = now()`,
+      [GUILD_ID, next]
+    );
+    process.env.PAYMENT_METHODS_OFF = next;
+
+    const m = String(method).trim().toLowerCase();
+    console.log(`[Config] ${m} payment switched ${enabled ? 'ON' : 'OFF'} by ${req.user.username || req.user.id}`);
+
+    // The full state goes back, not just the method that moved. The panel
+    // re-renders from this, so a second admin toggling something in another
+    // tab cannot leave one browser showing a switch that is no longer true.
+    res.json({ success: true, payment_method_states: methodStates(), payment_methods: payableMethods() });
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to update payment methods' });
+  }
+});
+
+// The PayPal.Me handle, from the panel. Same owner-only gate: it decides what
+// a buyer's phone opens when they scan the QR on the pay screen, so it is a
+// payment address in everything but name.
+router.post('/paypal-me', requireOwnerAdmin, async (req, res) => {
+  try {
+    const raw = String((req.body || {}).handle || '').trim();
+    // An empty value is a deliberate CLEAR, not a mistake — it hides the QR
+    // and leaves PayPal working by email, which is exactly the state the store
+    // has been in all along.
+    let stored = '';
+    if (raw) {
+      stored = normalisePaypalMe(raw);
+      if (!stored) {
+        return res.status(400).json({
+          error: `"${raw}" is not a PayPal.Me handle. It is the 1-20 letters or digits at the end of your `
+               + 'paypal.me link — paste the whole link if that is easier. Leave this empty to show no QR.',
+        });
+      }
+    }
+    await query(
+      `INSERT INTO config (guild_id, key, value, updated_at) VALUES ($1,'PAYPAL_ME',$2, now())
+       ON CONFLICT (guild_id, key) DO UPDATE SET value = EXCLUDED.value, updated_at = now()`,
+      [GUILD_ID, stored]
+    );
+    process.env.PAYPAL_ME = stored;
+    res.json({ success: true, paypal_me: stored || null });
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to save the PayPal.Me handle' });
+  }
+});
+
+// Read side for the panel. GET / is public and deliberately says only whether
+// a method is available; this says WHY, and whether the address behind a
+// switched-off method is still intact — which is the question the owner will
+// actually have when they come back to turn it on again.
+router.get('/payment-methods', requireOwnerAdmin, (req, res) => {
+  res.json({
+    payment_method_states: methodStates(),
+    paypal_me: normalisePaypalMe(process.env.PAYPAL_ME),
+  });
 });
 
 // Restores any config previously set via POST /update back into process.env.

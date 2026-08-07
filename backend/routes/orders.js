@@ -16,7 +16,7 @@ const {
   normalizeCode, previewCoupon, reserveCoupon, attachRedemptionOrder, releaseCoupon, publicView,
 } = require('../utils/coupons');
 // A payment method whose address cannot be paid must not take an order.
-const { isPayableCashtag, isPayableEmail } = require('../utils/paymentAddress');
+const { isPayableCashtag, isPayableEmail, methodStates, paypalMeLink } = require('../utils/paymentAddress');
 
 const GUILD_ID = process.env.GUILD_ID;
 
@@ -268,16 +268,25 @@ async function createOrderPriced({ items, email, discord_id, payment_method, web
   // order and shown an address that does not exist, and it sat unpaid until
   // the sweeper expired it. An order nobody can pay is worse than a refusal:
   // the refusal is visible.
-  if (payment_method === 'cashapp' && !isPayableCashtag(process.env.CASHAPP_CASHTAG)) {
-    const err = new Error('Cash App is not available right now. Please choose another payment method.');
+  //
+  // Now covers all four external methods rather than the two that had been
+  // caught misbehaving. BTC and LTC had no guard at all: with no xpub,
+  // generateCryptoAddress returns null and the buyer got a pay screen with an
+  // empty address on it — the identical silent failure this block exists to
+  // prevent, sitting one branch away the whole time.
+  //
+  // It also honours PAYMENT_METHODS_OFF, so a method the owner switched off
+  // cannot be ordered by a stale browser tab or a direct API call. The
+  // storefront hides it, but hiding a button is decoration, not a control.
+  const METHOD_LABEL = { cashapp: 'Cash App', paypal: 'PayPal', btc: 'Bitcoin', ltc: 'Litecoin' };
+  const state = methodStates()[payment_method];
+  if (state && !state.available) {
+    const label = METHOD_LABEL[payment_method] || payment_method;
+    const err = new Error(state.state === 'off'
+      ? `${label} is not being accepted right now. Please choose another payment method.`
+      : `${label} is not available right now. Please choose another payment method.`);
     err.statusCode = 503;
-    console.error('[Orders] refused a Cash App order — CASHAPP_CASHTAG is not a cashtag');
-    throw err;
-  }
-  if (payment_method === 'paypal' && !isPayableEmail(process.env.PAYPAL_EMAIL)) {
-    const err = new Error('PayPal is not available right now. Please choose another payment method.');
-    err.statusCode = 503;
-    console.error('[Orders] refused a PayPal order — PAYPAL_EMAIL is not an email address');
+    console.error(`[Orders] refused a ${label} order — ${state.reason}`);
     throw err;
   }
 
@@ -383,7 +392,17 @@ async function createOrderPriced({ items, email, discord_id, payment_method, web
     // way to put an unpayable address on a pay screen.
     payment_info = { cashtag: String(process.env.CASHAPP_CASHTAG).trim(), note: order.payment_note, amount: total };
   } else if (payment_method === 'paypal') {
-    payment_info = { email: String(process.env.PAYPAL_EMAIL).trim(), note: order.payment_note, amount: total };
+    // `pay_link` is the ONLY thing a PayPal QR may encode, and it is null
+    // unless PAYPAL_ME holds a real handle. The pay screen used to build its
+    // own out of the email address, which is not a PayPal.Me handle and never
+    // resolved — see normalisePaypalMe() for the full story. Computing it here
+    // means the storefront cannot invent a broken one again.
+    payment_info = {
+      email: String(process.env.PAYPAL_EMAIL).trim(),
+      pay_link: paypalMeLink(process.env.PAYPAL_ME, total),
+      note: order.payment_note,
+      amount: total,
+    };
   } else if (payment_method === 'btc' || payment_method === 'ltc') {
     // Lock the USD→coin rate at order time. The customer is quoted dollars but
     // pays satoshis, so without a stored quote there is nothing to validate the
