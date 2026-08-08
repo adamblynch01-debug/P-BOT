@@ -145,6 +145,23 @@ function supplierGloballyOff() {
 // must fall back to local stock, while links pointing at the configured one keep
 // working. A single global check would have one missing key silently switch off
 // the supplier that is working fine.
+//
+// Split out of linkForTier() because a SECOND caller now needs the identical
+// question answered: the storefront's stock badge. A tier bought upstream has
+// no local keys and never will, so counting product_stock rows told a customer
+// SOLD OUT about a product that sells perfectly well. Two copies of this rule
+// would drift, and the drift is invisible — one copy would gate the buy button
+// while the other happily charged the supplier.
+//
+// An unknown supplier name (a typo, or a row left by a build that knew a
+// provider this one does not) resolves to no provider, so it falls back to the
+// local pool. Fail closed towards the thing that still delivers.
+function linkIsLive(link) {
+  if (!link || !link.enabled) return false;
+  if (supplierGloballyOff()) return false;
+  return !!providerFor(link.supplier) && hasApiKey(link.supplier);
+}
+
 async function linkForTier(tierId) {
   if (supplierGloballyOff()) return null;
   try {
@@ -153,11 +170,7 @@ async function linkForTier(tierId) {
       [GUILD_ID, tierId]
     );
     const link = rows[0] || null;
-    if (!link) return null;
-    // An unknown supplier name (a typo, or a row left by a build that knew a
-    // provider this one does not) resolves to no provider, so it falls back to
-    // the local pool. Fail closed towards the thing that still delivers.
-    if (!providerFor(link.supplier) || !hasApiKey(link.supplier)) return null;
+    if (!linkIsLive(link)) return null;
     return link;
   } catch (err) {
     // The table may not exist yet on an instance that has not run the
@@ -165,6 +178,32 @@ async function linkForTier(tierId) {
     // which is the state the shop ran in for its whole life until now.
     if (err.code !== '42P01') console.error('[Supplier] link lookup failed:', redact(err.message));
     return null;
+  }
+}
+
+// The same question asked about many tiers at once, for the storefront's one
+// bulk stock call. Returns a Set of tier ids that will be bought upstream —
+// never a count, because there is no endpoint that reports their stock and
+// inventing a number would be a lie a customer could hit.
+//
+// Every rejection reason is linkIsLive()'s, so a link that stops delivering
+// stops badging as available in the same breath.
+async function liveLinkTierIds(tierIds) {
+  const ids = (tierIds || []).map(Number).filter(Number.isInteger);
+  if (!ids.length || supplierGloballyOff()) return new Set();
+  try {
+    const { rows } = await query(
+      `SELECT tier_id, supplier, enabled FROM supplier_links
+       WHERE guild_id = $1 AND enabled = TRUE AND tier_id = ANY($2::int[])`,
+      [GUILD_ID, ids]
+    );
+    return new Set(rows.filter(linkIsLive).map(r => Number(r.tier_id)));
+  } catch (err) {
+    // Same reasoning as linkForTier: no table means no links, which is a shop
+    // that sells from its own pool. A stock badge must never be the thing that
+    // takes the storefront down.
+    if (err.code !== '42P01') console.error('[Supplier] bulk link lookup failed:', redact(err.message));
+    return new Set();
   }
 }
 
@@ -303,5 +342,5 @@ module.exports = {
   SUPPLIER_ERROR, SUPPLIER_TIMEOUT, DEFAULT_SUPPLIER,
   hasApiKey, redact, parseBody, supplierGloballyOff,
   providerNames, providerFor, providerSummary,
-  linkForTier, purchase,
+  linkIsLive, linkForTier, liveLinkTierIds, purchase,
 };

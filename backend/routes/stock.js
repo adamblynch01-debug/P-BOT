@@ -3,6 +3,7 @@ const router = express.Router();
 const { query, withTransaction } = require('../db');
 const { getSessionUser, bearerToken, botAuthorized, botAuthUnavailable } = require('../utils/auth');
 const { queueRestock } = require('../utils/restockNotify');
+const supplier = require('../utils/supplier');
 const GUILD_ID = process.env.GUILD_ID;
 
 // Bot (secret) and admin panel (logged-in admin/staff session) both manage
@@ -58,13 +59,19 @@ async function logStockChange({ tierId, action, before, after, source, actor }) 
 // tier_id → available count (only tiers that HAVE unused rows appear; callers
 // treat a missing id as 0). MUST be declared before '/:product_id' or Express
 // routes "bulk" into the catch-all param.
+//
+// `supplier` is a SEPARATE list, not a count, because a tier bought upstream
+// has no number to report — their panel exposes no stock endpoint, only a
+// purchase. Counting its (always zero) product_stock rows badged a live
+// product SOLD OUT and disabled its buy button, which is what happened to
+// H8ED V2 EXTERNAL the moment it was mapped to AimBetter.
 router.get('/bulk', async (req, res) => {
   try {
     const ids = String(req.query.ids || '')
       .split(',')
       .map(s => parseInt(s.trim(), 10))
       .filter(n => Number.isInteger(n));
-    if (!ids.length) return res.json({ stock: {} });
+    if (!ids.length) return res.json({ stock: {}, supplier: [] });
     const { rows } = await query(
       `SELECT tier_id, COUNT(*)::int AS n FROM product_stock
        WHERE guild_id = $1 AND used = false AND tier_id = ANY($2::int[])
@@ -73,7 +80,8 @@ router.get('/bulk', async (req, res) => {
     );
     const stock = {};
     for (const r of rows) stock[r.tier_id] = r.n;
-    res.json({ stock });
+    const live = await supplier.liveLinkTierIds(ids);
+    res.json({ stock, supplier: Array.from(live) });
   } catch (err) {
     res.status(500).json({ error: 'Failed to fetch bulk stock' });
   }
@@ -125,7 +133,11 @@ router.get('/:product_id', async (req, res) => {
       'SELECT COUNT(*)::int AS n FROM product_stock WHERE guild_id = $1 AND tier_id = $2 AND used = false',
       [GUILD_ID, id]
     );
-    res.json({ product_id: id, available: rows[0].n });
+    // Same answer as /bulk gives, in the singular. `available` stays the honest
+    // local count — nothing should start believing we hold upstream keys — and
+    // `supplier` says the sale does not depend on it.
+    const live = await supplier.liveLinkTierIds([id]);
+    res.json({ product_id: id, available: rows[0].n, supplier: live.has(Number(id)) });
   } catch (err) {
     console.error('[Stock] count error:', err);
     res.status(500).json({ error: 'Failed to fetch stock' });
