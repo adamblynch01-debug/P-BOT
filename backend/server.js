@@ -145,6 +145,7 @@ app.use('/api/auth',     require('./routes/auth'));
 app.use('/api/balance',  require('./routes/balance'));
 app.use('/api/reviews',  require('./routes/reviews'));
 app.use('/api/status',   require('./routes/status'));
+app.use('/api/updates',  require('./routes/updates'));
 app.use('/api/state',    require('./routes/state'));
 app.use('/api/reseller', require('./routes/reseller'));
 app.use('/api/tickets',  require('./routes/tickets'));

@@ -207,6 +207,32 @@ async function liveLinkTierIds(tierIds) {
   }
 }
 
+// Admin display only: which tiers have ANY supplier link row at all, regardless
+// of whether that link is currently live (enabled flag or API key status).
+//
+// The admin PRODUCT KEYS tab shows ∞ to mean "this tier is mapped to an upstream
+// supplier — no local keys needed." That is a property of the ROW, not of the
+// current runtime state. A link that is temporarily disabled still means the
+// mapping exists, and showing OUT OF STOCK instead of ∞ just confuses the admin
+// into thinking the product is broken.
+//
+// The live status (enabled AND keyed) remains liveLinkTierIds()'s job. The two
+// are deliberately separate so neither can hide the other's answer.
+async function anyLinkTierIds(tierIds) {
+  const ids = (tierIds || []).map(Number).filter(Number.isInteger);
+  if (!ids.length) return new Set();
+  try {
+    const { rows } = await query(
+      `SELECT DISTINCT tier_id FROM supplier_links WHERE guild_id = $1 AND tier_id = ANY($2::int[])`,
+      [GUILD_ID, ids]
+    );
+    return new Set(rows.map(r => Number(r.tier_id)));
+  } catch (err) {
+    if (err.code !== '42P01') console.error('[Supplier] any-link lookup failed:', redact(err.message));
+    return new Set();
+  }
+}
+
 // ─── the purchase ────────────────────────────────────────────────────────────
 // Returns { status: 'ok'|'error'|'timeout', lines?, error?, deliveryId }.
 // Never throws: a throw here would land in deliver()'s outer catch and abort an
@@ -342,5 +368,5 @@ module.exports = {
   SUPPLIER_ERROR, SUPPLIER_TIMEOUT, DEFAULT_SUPPLIER,
   hasApiKey, redact, parseBody, supplierGloballyOff,
   providerNames, providerFor, providerSummary,
-  linkIsLive, linkForTier, liveLinkTierIds, purchase,
+  linkIsLive, linkForTier, liveLinkTierIds, anyLinkTierIds, purchase,
 };

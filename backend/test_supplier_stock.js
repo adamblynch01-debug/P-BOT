@@ -224,7 +224,7 @@ await checkAsync('an upstream tier is NOT given an invented count', async () => 
 
 await checkAsync('/bulk with no ids still answers in the right shape', async () => {
   const d = await getJson('/api/stock/bulk?ids=');
-  assert.deepStrictEqual(d, { stock: {}, supplier: [] },
+  assert.deepStrictEqual(d, { stock: {}, supplier: [], supplierMapped: [] },
     'the empty answer lost a field, so a caller reading .supplier would throw');
 });
 

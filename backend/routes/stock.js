@@ -71,7 +71,7 @@ router.get('/bulk', async (req, res) => {
       .split(',')
       .map(s => parseInt(s.trim(), 10))
       .filter(n => Number.isInteger(n));
-    if (!ids.length) return res.json({ stock: {}, supplier: [] });
+    if (!ids.length) return res.json({ stock: {}, supplier: [], supplierMapped: [] });
     const { rows } = await query(
       `SELECT tier_id, COUNT(*)::int AS n FROM product_stock
        WHERE guild_id = $1 AND used = false AND tier_id = ANY($2::int[])
@@ -81,7 +81,8 @@ router.get('/bulk', async (req, res) => {
     const stock = {};
     for (const r of rows) stock[r.tier_id] = r.n;
     const live = await supplier.liveLinkTierIds(ids);
-    res.json({ stock, supplier: Array.from(live) });
+    const mapped = await supplier.anyLinkTierIds(ids);
+    res.json({ stock, supplier: Array.from(live), supplierMapped: Array.from(mapped) });
   } catch (err) {
     res.status(500).json({ error: 'Failed to fetch bulk stock' });
   }
