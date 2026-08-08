@@ -8,6 +8,9 @@ const { notifyBot } = require('../utils/botNotify');
 const { invoiceNo, normalizeInvoiceNo } = require('../utils/invoiceNo');
 const { attachUser, requireAuth, requireAdmin, requireDiscordLinked, botAuthorized, botAuthUnavailable } = require('../utils/auth');
 const { safeCompare } = require('../utils/rateLimit');
+// The shop's currency, and the only place it is decided. See utils/money.js for
+// why a `$`-to-`€` sweep is not the same job as changing currency.
+const { CURRENCY, money, moneyCents } = require('../utils/money');
 // Shared with routes/auth.js, which creates the same kind of row when an OAuth
 // consent names a snowflake we have never seen. Two writers of one account
 // shape is how a customer ends up with two half-accounts.
@@ -404,10 +407,17 @@ async function createOrderPriced({ items, email, discord_id, payment_method, web
       amount: total,
     };
   } else if (payment_method === 'btc' || payment_method === 'ltc') {
-    // Lock the USD→coin rate at order time. The customer is quoted dollars but
-    // pays satoshis, so without a stored quote there is nothing to validate the
-    // incoming payment against — which is exactly how a 1-satoshi payment used
-    // to settle any invoice. expected_sats is what the confirm path checks.
+    // Lock the fiat→coin rate at order time. The customer is quoted in the
+    // shop's currency but pays satoshis, so without a stored quote there is
+    // nothing to validate the incoming payment against — which is exactly how a
+    // 1-satoshi payment used to settle any invoice. expected_sats is what the
+    // confirm path checks.
+    //
+    // `rate_currency` rides along because the shop's currency has now changed
+    // once. A bare number on an order is only readable if you know what the
+    // store priced in on the day it was quoted, and that is not a thing a
+    // reconciliation six months from now should have to reconstruct from a
+    // deploy date.
     const coin = payment_method;
     const quote = await quoteCrypto(coin, total);
     payment_info = {
@@ -417,7 +427,8 @@ async function createOrderPriced({ items, email, discord_id, payment_method, web
       ...(quote ? {
         coin_amount: quote.coin_amount,
         expected_sats: quote.expected_sats,
-        rate_usd: quote.rate_usd,
+        rate_fiat: quote.rate_fiat,
+        rate_currency: quote.rate_currency,
         quoted_at: new Date().toISOString(),
       } : {}),
     };
@@ -467,7 +478,7 @@ async function createOrderPriced({ items, email, discord_id, payment_method, web
         );
         const { rows: paidRows } = await exec(
           `UPDATE orders SET status = 'paid', paid_at = now(),
-                  amount_received_cents = $1, amount_received_unit = 'usd'
+                  amount_received_cents = $1, amount_received_unit = 'eur'
             WHERE id = $2 AND status = 'waiting' RETURNING *`,
           [totalCents, order.id]
         );
@@ -1221,31 +1232,41 @@ router.post('/claim', async (req, res) => {
   }
 });
 
-// Converts the figure a payment provider reported into USD cents.
+// Converts the figure a payment provider reported into cents of the shop's
+// currency.
 //
-// `amount_received` arrives in whatever unit the provider speaks: dollars from
-// the email watchers, satoshis from the crypto paths. Storing it raw is what
-// left one column holding three different units, so the native figure is kept
-// beside its unit name and the canonical cents value is derived here.
-function nativeToUsdCents(order, native, method) {
+// `amount_received` arrives in whatever unit the provider speaks: whole
+// currency units from the email watchers, satoshis from the crypto paths.
+// Storing it raw is what left one column holding three different units, so the
+// native figure is kept beside its unit name and the canonical cents value is
+// derived here.
+function nativeToFiatCents(order, native, method) {
   if (native == null || !Number.isFinite(Number(native))) return { cents: null, unit: null };
   const value = Number(native);
 
   if (method === 'btc' || method === 'ltc') {
     // payment_info comes back as an object from a JSONB column but as a string
-    // from a TEXT one. Reading .rate_usd off the string yields undefined, which
-    // fails closed but silently throws away a USD figure we could have derived.
+    // from a TEXT one. Reading the rate off the string yields undefined, which
+    // fails closed but silently throws away a figure we could have derived.
     let info = order.payment_info;
     if (typeof info === 'string') {
       try { info = JSON.parse(info); } catch { info = null; }
     }
-    const rate = Number((info || {}).rate_usd);
-    // No locked rate means no defensible USD figure. Record the satoshis and
+    // `rate_usd` is what orders quoted before the euro switch carry, and an
+    // order in flight at deploy time still has to settle. It is read SECOND and
+    // is not treated as a euro rate — the order was quoted in dollars, the
+    // customer was shown a dollar figure, and the satoshis they send are the
+    // ones that quote produced. Converting those sats at their own locked rate
+    // gives the amount actually paid; relabelling it as euro would overstate the
+    // takings by the whole EUR/USD spread on every order still open right now.
+    const info_ = info || {};
+    const rate = Number(info_.rate_fiat != null ? info_.rate_fiat : info_.rate_usd);
+    // No locked rate means no defensible fiat figure. Record the satoshis and
     // leave cents null rather than inventing a number a report would trust.
     if (!Number.isFinite(rate) || rate <= 0) return { cents: null, unit: 'sats' };
     return { cents: Math.round((value / 1e8) * rate * 100), unit: 'sats' };
   }
-  return { cents: Math.round(value * 100), unit: 'usd' };
+  return { cents: Math.round(value * 100), unit: CURRENCY.toLowerCase() };
 }
 
 // ─── POST /api/orders/confirm ───────────────────────────
@@ -1268,7 +1289,7 @@ router.post('/confirm', async (req, res) => {
     const order = rows[0];
     if (!order) return res.status(404).json({ error: 'Order not found' });
 
-    const { cents, unit } = nativeToUsdCents(order, amount_received, method || order.payment_method);
+    const { cents, unit } = nativeToFiatCents(order, amount_received, method || order.payment_method);
 
     // The status transition IS the lock. This used to be a read, a check, and
     // then an unconditional write: two confirmations arriving within one DB
@@ -1506,7 +1527,7 @@ router.post('/manual', async (req, res) => {
               created_at, paid_at, delivered_at, delivered_goods,
               amount_received_cents, amount_received_unit)
            VALUES ($1,$2,$3,$4,$5,$6,$7,'manual',$8,$9,'manual','delivered',$10,
-                   now(), now(), now(), $11, $6, 'usd')
+                   now(), now(), now(), $11, $6, 'eur')
            RETURNING *`,
           [
             GUILD_ID, webUserId, buyerEmail, discord_id ? String(discord_id) : null,
@@ -1599,4 +1620,4 @@ router.post('/manual', async (req, res) => {
 module.exports = router;
 module.exports.createOrder = createOrder;
 module.exports.formatOrder = formatOrder;
-module.exports.__test__ = { applyFee, nativeToUsdCents, repriceItems, expiryMinutesFor };
+module.exports.__test__ = { applyFee, nativeToFiatCents, repriceItems, expiryMinutesFor };

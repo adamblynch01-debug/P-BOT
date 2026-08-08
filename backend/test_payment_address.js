@@ -64,9 +64,48 @@ check('payableMethods turns Cash App off for the live value', () => {
   assert.deepStrictEqual(m, { cashapp: false, paypal: true, btc: true, ltc: false });
 });
 
-check('and back on the moment a real one is set', () => {
+// Was "and back on the moment a real one is set", and it asserted true. The
+// shop prices in euro now and Cash App settles in USD or GBP only, so a real
+// cashtag no longer brings it back — nothing does, short of the shop changing
+// currency. The check is kept rather than deleted because the two halves it
+// asserts are still the interesting ones, and they have come APART: the address
+// is now fine and the method is still unavailable.
+check('a real cashtag is accepted as an address, but euro still keeps Cash App shut', () => {
+  assert.strictEqual(P.isPayableCashtag('$uhservices'), true, 'a valid cashtag stopped parsing');
   const m = P.payableMethods({ CASHAPP_CASHTAG: '$uhservices' });
-  assert.strictEqual(m.cashapp, true);
+  assert.strictEqual(m.cashapp, false, 'Cash App was offered for a euro-priced shop');
+});
+
+check('and it is the CURRENCY that shuts it, not the address and not the off-switch', () => {
+  // The distinction the panel prints. "Fix the cashtag" and "flip the toggle"
+  // are both wrong advice here, and a state of 'off' or 'unconfigured' would
+  // have sent staff to do one of them.
+  const s = P.methodStates({ CASHAPP_CASHTAG: '$uhservices', PAYPAL_EMAIL: 'a@b.co' });
+  assert.strictEqual(s.cashapp.state, 'currency', JSON.stringify(s.cashapp));
+  assert.ok(/EUR/.test(s.cashapp.reason), 'the reason does not name the shop currency: ' + s.cashapp.reason);
+  assert.ok(/USD|GBP/.test(s.cashapp.reason), 'the reason does not say what it CAN take: ' + s.cashapp.reason);
+  // And the methods that can take any currency are untouched by all this.
+  assert.strictEqual(s.paypal.state, 'on');
+});
+
+check('currency, off and unconfigured are three states, reported in that order', () => {
+  // Cash App switched off AND currency-blocked reports the currency, because
+  // that is the one an operator cannot act on. Getting this backwards would
+  // offer a toggle that changes nothing visible.
+  const s = P.methodStates({ CASHAPP_CASHTAG: '$uhservices', PAYMENT_METHODS_OFF: 'cashapp,paypal', PAYPAL_EMAIL: 'a@b.co' });
+  assert.strictEqual(s.cashapp.state, 'currency');
+  assert.strictEqual(s.paypal.state, 'off', 'a deliberately-closed method must not read as broken');
+});
+
+check('a currency block is a property of the METHOD, not a hardcoded Cash App rule', () => {
+  assert.strictEqual(P.currencyUnsupported('cashapp', 'USD'), false, 'Cash App would not come back in a dollar shop');
+  assert.strictEqual(P.currencyUnsupported('cashapp', 'GBP'), false);
+  assert.strictEqual(P.currencyUnsupported('cashapp', 'EUR'), true);
+  // Crypto is quoted from a live fiat rate and PayPal carries the ISO code in
+  // the link, so neither is ever currency-blocked.
+  for (const m of ['paypal', 'btc', 'ltc']) {
+    assert.strictEqual(P.currencyUnsupported(m, 'EUR'), false, m + ' was blocked for the shop currency');
+  }
 });
 
 check('the problem is explained, naming the variable and the value', () => {

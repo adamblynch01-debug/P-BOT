@@ -1,5 +1,6 @@
 const axios = require('axios');
 const { query } = require('../db');
+const { CURRENCY } = require('./money');
 
 const GUILD_ID = process.env.GUILD_ID;
 
@@ -330,24 +331,38 @@ async function registerWebhook(coin, address, order_id) {
   }
 }
 
-// ─── USD → coin rate ─────────────────────────────────────
-// Checkout quotes crypto orders in DOLLARS (payment_info.amount is the USD
-// total), but the chain reports satoshis. Without a rate the two are
+// ─── fiat → coin rate ────────────────────────────────────
+// Checkout quotes crypto orders in the shop's currency (payment_info.amount is
+// the fiat total), but the chain reports satoshis. Without a rate the two are
 // incomparable, which is why the payment amount went unvalidated for so long.
 // The rate is locked at order time and stored on the order: that is the number
 // the customer was actually quoted, so it — not today's price — is what the
 // payment gets checked against.
+//
+// THE CURRENCY IS READ FROM utils/money.js, not hardcoded. This function used to
+// ask CoinGecko for `vs_currencies=usd` and read `data[id].usd`, and it contains
+// no "$" anywhere, so it is precisely the kind of thing a symbol sweep leaves
+// behind: a euro cart quoted against a dollar rate is out by the EUR/USD spread
+// (~8-15%), and because the wrong rate is then LOCKED onto the order,
+// verifyCryptoPayment confirms the wrong number of satoshis as correct. Wrong,
+// and self-consistently wrong, so nothing downstream can notice.
+//
+// The two halves must move together: the query parameter and the property name
+// are the same string. Changing one alone yields `undefined`, which reads as "no
+// rate" — that fails CLOSED (no auto-confirm) rather than mispricing, but it
+// silently stops every crypto order settling, so it is worth stating.
 const COIN_IDS = { btc: 'bitcoin', ltc: 'litecoin' };
+const VS_CURRENCY = CURRENCY.toLowerCase();
 
-async function getUsdRate(coin) {
+async function getFiatRate(coin) {
   try {
     const id = COIN_IDS[String(coin).toLowerCase()];
     if (!id) return null;
     const { data } = await axios.get(
-      `https://api.coingecko.com/api/v3/simple/price?ids=${id}&vs_currencies=usd`,
+      `https://api.coingecko.com/api/v3/simple/price?ids=${id}&vs_currencies=${VS_CURRENCY}`,
       { timeout: 8000 }
     );
-    const rate = data && data[id] && data[id].usd;
+    const rate = data && data[id] && data[id][VS_CURRENCY];
     return Number.isFinite(rate) && rate > 0 ? rate : null;
   } catch (err) {
     console.error('[Crypto] Rate fetch error:', err.message);
@@ -355,17 +370,22 @@ async function getUsdRate(coin) {
   }
 }
 
-// Returns { coin_amount, expected_sats, rate_usd } or null if the rate is
-// unavailable. Null means "we cannot price this order" — callers must then
-// refuse to auto-confirm rather than guessing.
-async function quoteCrypto(coin, usdTotal) {
-  const rate = await getUsdRate(coin);
+// Returns { coin_amount, expected_sats, rate_fiat, rate_currency } or null if
+// the rate is unavailable. Null means "we cannot price this order" — callers
+// must then refuse to auto-confirm rather than guessing.
+//
+// `rate_currency` is written onto the order beside the number. An order carrying
+// a bare rate is only interpretable by knowing what the shop's currency was on
+// the day it was quoted, and that is now a thing that has changed once.
+async function quoteCrypto(coin, fiatTotal) {
+  const rate = await getFiatRate(coin);
   if (!rate) return null;
-  const coinAmount = usdTotal / rate;
+  const coinAmount = fiatTotal / rate;
   return {
     coin_amount: Number(coinAmount.toFixed(8)),
     expected_sats: Math.round(coinAmount * 1e8),
-    rate_usd: rate,
+    rate_fiat: rate,
+    rate_currency: CURRENCY,
   };
 }
 
@@ -485,7 +505,7 @@ function verifyCryptoPayment(order, receivedSats) {
 module.exports = {
   generateCryptoAddress,
   registerWebhook,
-  getUsdRate,
+  getFiatRate,
   quoteCrypto,
   verifyCryptoPayment,
   fetchTotalReceived,

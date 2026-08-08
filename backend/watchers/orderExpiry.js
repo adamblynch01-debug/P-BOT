@@ -39,6 +39,7 @@
 const cron = require('node-cron');
 const { query } = require('../db');
 const { raiseAlert } = require('../utils/alerts');
+const { moneyCents } = require('../utils/money');
 
 const GUILD_ID = process.env.GUILD_ID;
 
@@ -88,7 +89,7 @@ async function sweep() {
       // written — a log line that spells a status differently from the column
       // is a log line nobody can grep.
       console.log(`[OrderExpiry] Expired ${o.invoice_no || '#' + o.id} — ` +
-        `$${((o.total_cents || 0) / 100).toFixed(2)} ${o.payment_method}, ` +
+        `${moneyCents(o.total_cents)} ${o.payment_method}, ` +
         `unpaid since ${new Date(o.created_at).toISOString()}`);
     }
 

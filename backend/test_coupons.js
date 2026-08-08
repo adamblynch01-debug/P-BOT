@@ -15,6 +15,7 @@
 const assert = require('assert');
 const express = require('express');
 const http = require('http');
+const { moneyCents } = require('./utils/money');
 
 // ─── In-memory stand-ins for the tables ──────────────────
 const TIERS = {
@@ -143,7 +144,7 @@ process.env.GUILD_ID = 'test-guild';
 process.env.CASHAPP_FEE_PERCENT = '10';
 process.env.PAYPAL_FEE_PERCENT = '10';
 process.env.CRYPTO_FEE_PERCENT = '5';
-// The subject here is coupons, and the orders below pay by Cash App. Since
+// The subject here is coupons, and the orders below pay by PayPal. Since
 // round 38 createOrderPriced refuses a cashapp/paypal order when the address is
 // not payable (utils/paymentAddress.js — production ran with " your $cashtag"),
 // so the suite has to give it real ones or every order 503s before pricing.
@@ -203,7 +204,7 @@ function reset() {
 
   reset();
   makeCoupon({ code: 'LIVE', percent_off: 25, starts_at: ago(HOUR), expires_at: ahead(HOUR) });
-  let q = await quote({ items: [PRO], payment_method: 'cashapp', coupon_code: 'LIVE' }, 'tok');
+  let q = await quote({ items: [PRO], payment_method: 'paypal', coupon_code: 'LIVE' }, 'tok');
   await check('a coupon inside its window applies', () => {
     assert.strictEqual(q.status, 200);
     assert.strictEqual(q.body.coupon_discount, 10);   // 25% of $40
@@ -219,7 +220,7 @@ function reset() {
 
   reset();
   makeCoupon({ code: 'SOON', starts_at: ahead(HOUR) });
-  q = await quote({ items: [PRO], payment_method: 'cashapp', coupon_code: 'SOON' }, 'tok');
+  q = await quote({ items: [PRO], payment_method: 'paypal', coupon_code: 'SOON' }, 'tok');
   await check('a coupon that has not opened yet does not apply', () => {
     assert.strictEqual(q.body.coupon_discount, 0);
     assert.ok(/not active/i.test(q.body.coupon_error || ''), q.body.coupon_error);
@@ -231,7 +232,7 @@ function reset() {
 
   reset();
   makeCoupon({ code: 'GONE', expires_at: ago(1000) });
-  q = await quote({ items: [PRO], payment_method: 'cashapp', coupon_code: 'GONE' }, 'tok');
+  q = await quote({ items: [PRO], payment_method: 'paypal', coupon_code: 'GONE' }, 'tok');
   await check('a coupon that lapsed a second ago is dead', () => {
     assert.strictEqual(q.body.coupon_discount, 0);
     assert.ok(/expired/i.test(q.body.coupon_error || ''), q.body.coupon_error);
@@ -239,12 +240,12 @@ function reset() {
 
   reset();
   makeCoupon({ code: 'FOREVER' });
-  q = await quote({ items: [PRO], payment_method: 'cashapp', coupon_code: 'FOREVER' }, 'tok');
+  q = await quote({ items: [PRO], payment_method: 'paypal', coupon_code: 'FOREVER' }, 'tok');
   await check('no window at all means always live', () => assert.strictEqual(q.body.coupon_discount, 10));
 
   reset();
   makeCoupon({ code: 'OFF', active: false });
-  q = await quote({ items: [PRO], payment_method: 'cashapp', coupon_code: 'OFF' }, 'tok');
+  q = await quote({ items: [PRO], payment_method: 'paypal', coupon_code: 'OFF' }, 'tok');
   await check('a deactivated coupon is refused even inside its window', () => {
     assert.strictEqual(q.body.coupon_discount, 0);
     assert.ok(q.body.coupon_error);
@@ -255,7 +256,7 @@ function reset() {
 
   reset();
   makeCoupon({ code: 'TEN', kind: 'fixed', percent_off: null, amount_off_cents: 1500 });
-  q = await quote({ items: [PRO], payment_method: 'cashapp', coupon_code: 'TEN' }, 'tok');
+  q = await quote({ items: [PRO], payment_method: 'paypal', coupon_code: 'TEN' }, 'tok');
   await check('a fixed-amount coupon takes its face value', () => {
     assert.strictEqual(q.body.coupon_discount, 15);
     assert.strictEqual(q.body.total, 27.5);          // ($40-$15) * 1.10
@@ -263,7 +264,7 @@ function reset() {
 
   reset();
   makeCoupon({ code: 'HUGE', kind: 'fixed', percent_off: null, amount_off_cents: 50000 });
-  q = await quote({ items: [PRO], payment_method: 'cashapp', coupon_code: 'HUGE' }, 'tok');
+  q = await quote({ items: [PRO], payment_method: 'paypal', coupon_code: 'HUGE' }, 'tok');
   await check('a fixed coupon larger than the cart is CLAMPED, never negative', () => {
     // An unclamped $500-off on a $40 cart is a -$460 total, and a negative
     // total on the balance path is a wallet credit.
@@ -274,7 +275,7 @@ function reset() {
 
   reset();
   makeCoupon({ code: 'QUARTER', percent_off: 25 });
-  q = await quote({ items: [LITE], payment_method: 'cashapp', coupon_code: 'QUARTER' }, 'tok');
+  q = await quote({ items: [LITE], payment_method: 'paypal', coupon_code: 'QUARTER' }, 'tok');
   await check('a percentage rounds in integer cents, not float dollars', () => {
     // 25% of 1550 = 387.5 → 388. A float path lands on 387.49999… and truncates.
     assert.strictEqual(q.body.coupon_discount, 3.88);
@@ -287,7 +288,7 @@ function reset() {
   reset();
   makeCoupon({ code: 'HALF', percent_off: 50 });
   q = await quote({
-    items: [{ id: 'donation', qty: 1, price: 100 }], payment_method: 'cashapp', coupon_code: 'HALF',
+    items: [{ id: 'donation', qty: 1, price: 100 }], payment_method: 'paypal', coupon_code: 'HALF',
   }, 'tok');
   await check('a cart of only custom payments has nothing to discount', () => {
     assert.strictEqual(q.body.coupon_discount, 0);
@@ -298,7 +299,7 @@ function reset() {
   reset();
   makeCoupon({ code: 'HALF', percent_off: 50 });
   q = await quote({
-    items: [PRO, { id: 'donation', qty: 1, price: 100 }], payment_method: 'cashapp', coupon_code: 'HALF',
+    items: [PRO, { id: 'donation', qty: 1, price: 100 }], payment_method: 'paypal', coupon_code: 'HALF',
   }, 'tok');
   await check('in a mixed cart it applies to the catalog lines only', () => {
     // 50% of the $40 catalog line = $20. The $100 the customer typed is theirs.
@@ -309,17 +310,20 @@ function reset() {
 
   reset();
   makeCoupon({ code: 'BIGONLY', min_subtotal_cents: 10000 });
-  q = await quote({ items: [PRO], payment_method: 'cashapp', coupon_code: 'BIGONLY' }, 'tok');
+  q = await quote({ items: [PRO], payment_method: 'paypal', coupon_code: 'BIGONLY' }, 'tok');
   await check('a minimum subtotal is enforced', () => {
     assert.strictEqual(q.body.coupon_discount, 0);
-    assert.ok(/at least \$100\.00/.test(q.body.coupon_error || ''), q.body.coupon_error);
+    // Built from the money module rather than typed, so the symbol cannot be
+    // asserted here and rendered differently to the customer.
+    assert.ok(q.body.coupon_error && q.body.coupon_error.includes('at least ' + moneyCents(10000)),
+      q.body.coupon_error);
   });
 
   reset();
   makeCoupon({ code: 'STACK', percent_off: 10 });
   currentUser = { id: 7, username: 'r', email: 'r@x.c', role: 'reseller', banned: false, reseller_discount: 25,
                  discord_id: '111', discord_verified: true };
-  q = await quote({ items: [PRO], payment_method: 'cashapp', coupon_code: 'STACK' }, 'tok');
+  q = await quote({ items: [PRO], payment_method: 'paypal', coupon_code: 'STACK' }, 'tok');
   await check('a coupon stacks on top of the reseller discount, in that order', () => {
     // $40 → reseller 25% → $30 → coupon 10% of $30 = $3 → $27 → +10% fee.
     assert.strictEqual(q.body.subtotal, 30);
@@ -331,7 +335,7 @@ function reset() {
   section('the browser types the code, it never states the discount');
 
   reset();
-  q = await quote({ items: [PRO], payment_method: 'cashapp', coupon_code: 'NOSUCHCODE' }, 'tok');
+  q = await quote({ items: [PRO], payment_method: 'paypal', coupon_code: 'NOSUCHCODE' }, 'tok');
   await check('an unknown code is reported, not honoured', () => {
     assert.strictEqual(q.status, 200);
     assert.strictEqual(q.body.coupon_discount, 0);
@@ -343,7 +347,7 @@ function reset() {
   });
 
   await check('a malformed code is rejected without pretending to price it', async () => {
-    const r = await quote({ items: [PRO], payment_method: 'cashapp', coupon_code: 'no spaces $$' }, 'tok');
+    const r = await quote({ items: [PRO], payment_method: 'paypal', coupon_code: 'no spaces $$' }, 'tok');
     assert.strictEqual(r.status, 200);
     assert.ok(r.body.coupon_error);
     assert.strictEqual(r.body.total, 44);
@@ -351,7 +355,7 @@ function reset() {
 
   await check('a client-sent coupon_discount is ignored entirely', async () => {
     const r = await quote({
-      items: [PRO], payment_method: 'cashapp', coupon_discount: 39.99, discount: 39.99, total: 0.01,
+      items: [PRO], payment_method: 'paypal', coupon_discount: 39.99, discount: 39.99, total: 0.01,
     }, 'tok');
     assert.strictEqual(r.body.coupon_discount, 0);
     assert.strictEqual(r.body.total, 44);
@@ -362,7 +366,7 @@ function reset() {
   await check('/create REFUSES an invalid code rather than quietly charging full price', async () => {
     // The failure mode this guards: the overlay showed $33, the code lapsed
     // between quote and submit, and the customer is charged $44 with no notice.
-    const r = await create({ items: [PRO], payment_method: 'cashapp', email: 'u@x.c', coupon_code: 'GONE' }, 'tok');
+    const r = await create({ items: [PRO], payment_method: 'paypal', email: 'u@x.c', coupon_code: 'GONE' }, 'tok');
     assert.strictEqual(r.status, 400);
     assert.ok(/expired/i.test(r.body.error || ''), r.body.error);
     assert.strictEqual(ORDERS.length, 0);
@@ -374,7 +378,7 @@ function reset() {
   reset();
   makeCoupon({ code: 'ONCE', max_uses: 1 });
   await check('the first checkout consumes the only use', async () => {
-    const r = await create({ items: [PRO], payment_method: 'cashapp', email: 'u@x.c', coupon_code: 'ONCE' }, 'tok');
+    const r = await create({ items: [PRO], payment_method: 'paypal', email: 'u@x.c', coupon_code: 'ONCE' }, 'tok');
     assert.strictEqual(r.status, 200);
     assert.strictEqual(r.body.total, 33);
     assert.strictEqual(COUPONS[0].uses, 1);
@@ -398,13 +402,13 @@ function reset() {
     assert.strictEqual(REDEMPTIONS[0].discount_cents, 1000);
   });
   await check('the second checkout is refused', async () => {
-    const r = await create({ items: [PRO], payment_method: 'cashapp', email: 'u@x.c', coupon_code: 'ONCE' }, 'tok');
+    const r = await create({ items: [PRO], payment_method: 'paypal', email: 'u@x.c', coupon_code: 'ONCE' }, 'tok');
     assert.strictEqual(r.status, 400);
     assert.ok(/fully redeemed/i.test(r.body.error || ''), r.body.error);
     assert.strictEqual(COUPONS[0].uses, 1);   // not 2
   });
   await check('and an exhausted coupon stops quoting a discount too', async () => {
-    const r = await quote({ items: [PRO], payment_method: 'cashapp', coupon_code: 'ONCE' }, 'tok');
+    const r = await quote({ items: [PRO], payment_method: 'paypal', coupon_code: 'ONCE' }, 'tok');
     assert.strictEqual(r.body.coupon_discount, 0);
     assert.ok(/fully redeemed/i.test(r.body.coupon_error || ''));
   });
@@ -412,25 +416,25 @@ function reset() {
   reset();
   makeCoupon({ code: 'PERPERSON', max_uses_per_user: 1 });
   await check('a per-user cap lets the first order through', async () => {
-    const r = await create({ items: [PRO], payment_method: 'cashapp', email: 'u@x.c', coupon_code: 'PERPERSON' }, 'tok');
+    const r = await create({ items: [PRO], payment_method: 'paypal', email: 'u@x.c', coupon_code: 'PERPERSON' }, 'tok');
     assert.strictEqual(r.status, 200);
   });
   await check('and blocks the same account the second time', async () => {
-    const r = await create({ items: [PRO], payment_method: 'cashapp', email: 'u@x.c', coupon_code: 'PERPERSON' }, 'tok');
+    const r = await create({ items: [PRO], payment_method: 'paypal', email: 'u@x.c', coupon_code: 'PERPERSON' }, 'tok');
     assert.strictEqual(r.status, 400);
     assert.ok(/already used/i.test(r.body.error || ''), r.body.error);
   });
   await check('but a different account may still use it', async () => {
     currentUser = { id: 99, username: 'other', email: 'o@x.c', role: 'member', banned: false, reseller_discount: 0,
                    discord_id: '222', discord_verified: true };
-    const r = await create({ items: [PRO], payment_method: 'cashapp', email: 'o@x.c', coupon_code: 'PERPERSON' }, 'tok');
+    const r = await create({ items: [PRO], payment_method: 'paypal', email: 'o@x.c', coupon_code: 'PERPERSON' }, 'tok');
     assert.strictEqual(r.status, 200);
   });
   await check('a per-user cap requires a session — a guest cannot replay it', async () => {
     // With no account there is nothing to count against, so "one per customer"
     // would be unenforceable. Say so instead of pretending.
     currentUser = null;
-    const r = await quote({ items: [PRO], payment_method: 'cashapp', coupon_code: 'PERPERSON' });
+    const r = await quote({ items: [PRO], payment_method: 'paypal', coupon_code: 'PERPERSON' });
     assert.ok(/log in/i.test(r.body.coupon_error || ''), r.body.coupon_error);
   });
 

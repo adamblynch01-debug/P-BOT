@@ -57,10 +57,14 @@ function imageFrom(media) {
   return null;
 }
 
+// 'TBD' for a missing or zero price is this file's own rule — a restock
+// announcement for an unpriced tier should say so rather than shout "FREE" —
+// so it wraps the shared formatter instead of replacing it.
+const { moneyCents } = require('./money');
 function money(cents) {
   const n = Number(cents);
   if (!Number.isFinite(n) || n <= 0) return 'TBD';
-  return '$' + (n / 100).toFixed(2);
+  return moneyCents(n);
 }
 
 /**

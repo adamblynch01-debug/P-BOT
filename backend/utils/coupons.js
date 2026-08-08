@@ -29,9 +29,8 @@ function normalizeCode(raw) {
   return CODE_RE.test(code) ? code : false; // false = present but malformed
 }
 
-function money(cents) {
-  return `$${(cents / 100).toFixed(2)}`;
-}
+// See utils/money.js — one formatter, one symbol, one place to change it.
+const { moneyCents: money } = require('./money');
 
 // What a coupon takes off a given eligible subtotal, in integer cents.
 //

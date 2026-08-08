@@ -129,10 +129,10 @@ const alerted = (kind) => ALERTS.some(a => a.kind === kind);
 // Genuine provider bodies now have to name our receiving account, exactly as a
 // real one does ("You received a payment ... to store@ghost.example").
 const paypalBody = (amount, note) =>
-  `Hello store@ghost.example,\n\nYou received $${amount} USD\n\nNote from Buyer\n${note}\n\nThanks`;
+  `Hello store@ghost.example,\n\nYou received €${amount} EUR\n\nNote from Buyer\n${note}\n\nThanks`;
 
 const cashappBody = (amount, note) =>
-  `You received $${amount} to $ghoststore\n\nNote: ${note}\n`;
+  `You received €${amount} to $ghoststore\n\nNote: ${note}\n`;
 
 const ORDER = { id: 42, payment_note: 'ghostwave1234', payment_method: 'paypal', total_cents: 1999, email: 'buyer@x.test' };
 const CASH_ORDER = { ...ORDER, payment_method: 'cashapp' };
@@ -215,7 +215,7 @@ const CASH_ORDER = { ...ORDER, payment_method: 'cashapp' };
   reset([ORDER]);
   await processEmail(email({
     auth: gmailAuth('paypal.com'), subject: 'You received a payment',
-    text: 'Hello attacker@evil.test,\n\nYou received $19.99 USD\n\nNote from Buyer\nghostwave1234\n\nThanks',
+    text: 'Hello attacker@evil.test,\n\nYou received €19.99 EUR\n\nNote from Buyer\nghostwave1234\n\nThanks',
   }));
   check('forwarded genuine receipt for someone ELSE\'s account does not confirm', CONFIRMS.length === 0);
 
@@ -234,7 +234,7 @@ const CASH_ORDER = { ...ORDER, payment_method: 'cashapp' };
   reset([ORDER]);
   await processEmail(email({
     auth: gmailAuth('paypal.com'), subject: 'payment', to: 'store@ghost.example',
-    text: 'Hello,\n\nYou received $19.99 USD\n\nNote from Buyer\nghostwave1234\n',
+    text: 'Hello,\n\nYou received €19.99 EUR\n\nNote from Buyer\nghostwave1234\n',
   }));
   check('an identity in the To header alone does NOT confirm', CONFIRMS.length === 0);
 
@@ -245,7 +245,7 @@ const CASH_ORDER = { ...ORDER, payment_method: 'cashapp' };
   reset([CASH_ORDER]);
   await processEmail(email({
     auth: gmailAuth('cash.app'), subject: 'payment', deliveredTo: `<${process.env.GMAIL_USER}>`,
-    text: 'You received $19.99 to $attackercashtag\n\nNote: ghostwave1234\n',
+    text: 'You received €19.99 to $attackercashtag\n\nNote: ghostwave1234\n',
   }));
   check('Delivered-To our own mailbox is not proof of receipt', CONFIRMS.length === 0);
 
@@ -257,7 +257,7 @@ const CASH_ORDER = { ...ORDER, payment_method: 'cashapp' };
   reset([ORDER]);
   await processEmail(email({
     auth: gmailAuth('paypal.com'), subject: 'You received a payment',
-    text: 'Hello attacker@evil.test,\n\nYou received $19.99 USD\n\nNote from Buyer\nghostwave1234\nstore@ghost.example\n\nThanks',
+    text: 'Hello attacker@evil.test,\n\nYou received €19.99 EUR\n\nNote from Buyer\nghostwave1234\nstore@ghost.example\n\nThanks',
   }));
   check('our address injected via the payer memo does NOT confirm', CONFIRMS.length === 0);
 
@@ -265,7 +265,7 @@ const CASH_ORDER = { ...ORDER, payment_method: 'cashapp' };
   reset([CASH_ORDER]);
   await processEmail(email({
     auth: gmailAuth('cash.app'), subject: 'payment',
-    text: 'You received $19.99 to $someoneelse\n\nNote: ghostwave1234\n',
+    text: 'You received €19.99 to $someoneelse\n\nNote: ghostwave1234\n',
   }));
   check('Cash App receipt naming a different cashtag does not confirm', CONFIRMS.length === 0);
 
@@ -273,7 +273,7 @@ const CASH_ORDER = { ...ORDER, payment_method: 'cashapp' };
   //     var must never mean "accept anything".
   const savedPaypalEmail = process.env.PAYPAL_EMAIL;
   delete process.env.PAYPAL_EMAIL;
-  const noIdentity = addressedToUs({ subject: '' }, 'You received $19.99', 'paypal');
+  const noIdentity = addressedToUs({ subject: '' }, 'You received €19.99', 'paypal');
   check('no configured merchant identity fails closed', noIdentity.ok === false);
   process.env.PAYPAL_EMAIL = savedPaypalEmail;
 
@@ -293,7 +293,7 @@ const CASH_ORDER = { ...ORDER, payment_method: 'cashapp' };
     reset([ORDER]);
     await processEmail(email({
       auth: gmailAuth('paypal.com'), subject: 'payment',
-      text: `Hello store@ghost.example,\n\n${phrase}\n\nYou received $19.99 USD\n\nNote from Buyer\nghostwave1234\n`,
+      text: `Hello store@ghost.example,\n\n${phrase}\n\nYou received €19.99 EUR\n\nNote from Buyer\nghostwave1234\n`,
     }));
     check(`non-final "${label}" does not confirm`, CONFIRMS.length === 0);
   }
@@ -302,7 +302,7 @@ const CASH_ORDER = { ...ORDER, payment_method: 'cashapp' };
   reset([ORDER]);
   await processEmail(email({
     auth: gmailAuth('paypal.com'), subject: 'payment',
-    text: `Hello store@ghost.example,\n\nThis payment is pending\n\nYou received $19.99 USD\n\nNote from Buyer\nghostwave1234\n`,
+    text: `Hello store@ghost.example,\n\nThis payment is pending\n\nYou received €19.99 EUR\n\nNote from Buyer\nghostwave1234\n`,
   }));
   check('non-final payment raises an alert', alerted('email_payment_not_final'));
 
@@ -320,7 +320,7 @@ const CASH_ORDER = { ...ORDER, payment_method: 'cashapp' };
   //      rejected a fully settled payment. Probe before the fix:
   //      "matched non-final pattern /\bdispute[ds]?\b/i".
   const settledWithFooter =
-    'Hello store@ghost.example,\n\nYou received $19.99 USD\n\nNote from Buyer\nghostwave1234\n\n' +
+    'Hello store@ghost.example,\n\nYou received €19.99 EUR\n\nNote from Buyer\nghostwave1234\n\n' +
     'Questions? Visit the Resolution Center to open a dispute.\n' +
     'Refunds are subject to our refund policy. Funds will be available per your account terms.\n' +
     'Please do not reply to this email.\n' +
@@ -340,7 +340,7 @@ const CASH_ORDER = { ...ORDER, payment_method: 'cashapp' };
   reset([ORDER]);
   await processEmail(email({
     auth: gmailAuth('paypal.com'), subject: 'payment',
-    text: 'Hello store@ghost.example,\n\nYour payment is pending\n\nYou received $19.99 USD\n\n' +
+    text: 'Hello store@ghost.example,\n\nYour payment is pending\n\nYou received €19.99 EUR\n\n' +
       'Note from Buyer\nghostwave1234\n\nQuestions? Visit the Resolution Center.\n',
   }));
   check('a pending status above the footer is still caught', CONFIRMS.length === 0);
@@ -353,12 +353,35 @@ const CASH_ORDER = { ...ORDER, payment_method: 'cashapp' };
     auth: gmailAuth('paypal.com'), subject: 'payment',
     text: 'Hello store@ghost.example,\n\nYou received $19.99 MXN\n\nNote from Buyer\nghostwave1234\n',
   }));
-  check('$19.99 MXN does not settle a $19.99 USD order', CONFIRMS.length === 0);
+  check('$19.99 MXN does not settle a €19.99 order', CONFIRMS.length === 0);
   check('foreign currency raises an alert', alerted('email_payment_foreign_currency'));
 
+  // ── The list is INVERTED, not edited ────────────────────────────────────────
+  // This guard used to name EUR as hostile and let USD through, because the shop
+  // priced in dollars. The shop prices in euro now (utils/money.js), so those
+  // two checks below assert the exact opposite of what they asserted before —
+  // which is the point. A guard whose list was merely *extended* would have gone
+  // on accepting dollars, and a dollar receipt against a euro invoice is a real
+  // underpayment of the whole EUR/USD spread that auto-confirms as if it were
+  // exact.
+  check('USD is flagged', !!foreignCurrencyReason('You received $19.99 USD'));
   check('CAD is flagged', !!foreignCurrencyReason('You received $19.99 CAD'));
-  check('EUR is flagged', !!foreignCurrencyReason('You received $19.99 EUR'));
-  check('plain USD is not flagged', foreignCurrencyReason('You received $19.99 USD') === null);
+  check('the shop currency is NOT flagged', foreignCurrencyReason('You received €19.99 EUR') === null);
+  // Every currency name is derived from the one in money.js, so a shop that
+  // moves currency again cannot leave its own money on the hostile list.
+  check('the flagged list never contains the shop currency',
+    foreignCurrencyReason('You received 19.99 ' + require('./utils/money').CURRENCY) === null);
+
+  // ── and a SYMBOL with no ISO code is caught too ─────────────────────────────
+  // PayPal writes "$1.10 USD" but Cash App writes only "$1.10". A guard that
+  // matched on three-letter codes alone would have read a dollar Cash App
+  // receipt as an unlabelled euro payment and settled it at par.
+  check('a bare foreign symbol is flagged even with no ISO code',
+    !!foreignCurrencyReason('You received $19.99 to $ghoststore'));
+  check('the reason says which symbol it saw',
+    /\$/.test(foreignCurrencyReason('You received $19.99') || ''));
+  check('a bare euro symbol is not flagged',
+    foreignCurrencyReason('You received €19.99 to $ghoststore') === null);
 
   console.log('\n=== message-level idempotency ===');
 
@@ -405,7 +428,7 @@ const CASH_ORDER = { ...ORDER, payment_method: 'cashapp' };
   reset([ORDER]);
   const pendingMail = email({
     auth: gmailAuth('paypal.com'), subject: 'payment', messageId: '<recoverable@paypal.com>',
-    text: 'Hello store@ghost.example,\n\nYour payment is pending\n\nYou received $19.99 USD\n\nNote from Buyer\nghostwave1234\n',
+    text: 'Hello store@ghost.example,\n\nYour payment is pending\n\nYou received €19.99 EUR\n\nNote from Buyer\nghostwave1234\n',
   });
   await processEmail(pendingMail);
   check('a non-final rejection releases its claim', RELEASED.includes('<recoverable@paypal.com>'));
@@ -432,14 +455,14 @@ const CASH_ORDER = { ...ORDER, payment_method: 'cashapp' };
   reset([ORDER]);
   await processEmail(email({
     auth: gmailAuth('paypal.com'), subject: 'payment', messageId: '<nonote@paypal.com>',
-    text: 'Hello store@ghost.example,\n\nYou received $19.99 USD\n\nThanks',
+    text: 'Hello store@ghost.example,\n\nYou received €19.99 EUR\n\nThanks',
   }));
   check('an unparseable PayPal note releases its claim', RELEASED.includes('<nonote@paypal.com>'));
 
   reset([CASH_ORDER]);
   await processEmail(email({
     auth: gmailAuth('cash.app'), subject: 'payment', messageId: '<nonote@cash.app>',
-    text: 'You received $19.99 to $ghoststore\n',
+    text: 'You received €19.99 to $ghoststore\n',
   }));
   check('an unparseable Cash App note releases its claim', RELEASED.includes('<nonote@cash.app>'));
 
@@ -470,7 +493,7 @@ const CASH_ORDER = { ...ORDER, payment_method: 'cashapp' };
   check('$0.01 against a $19.99 order is rejected', CONFIRMS.length === 0);
   check('underpaid order is flagged for review', UPDATES.length === 1);
   check('underpaid raises an alert', alerted('order_underpaid'));
-  check('underpaid records the native unit', /amount_received_unit = 'usd'/.test(UPDATES[0].sql));
+  check('underpaid records the native unit', /amount_received_unit = 'eur'/.test(UPDATES[0].sql));
 
   // 31. The old +/-$1.00 window let $19.00 through on a $19.99 order.
   reset([ORDER]);
@@ -494,16 +517,43 @@ const CASH_ORDER = { ...ORDER, payment_method: 'cashapp' };
   check('overpayment confirms', CONFIRMS.length === 1);
   check('overpayment raises an alert', alerted('order_overpaid'));
 
+  // The SHIPPED patterns, not a hand-typed copy. The old version of these two
+  // checks wrote its own /you received \$(...)/ and would have gone on passing
+  // after the real patterns moved to the euro — a green test proving nothing
+  // about the code that reads a real receipt.
+  const PP = watcher.__test__.AMOUNT_PATTERNS.paypal;
+  const CA = watcher.__test__.AMOUNT_PATTERNS.cashapp;
+
   // 34. Thousands separators. `.replace(/,/)` without the global flag stripped
-  //     only the first, so "$1,234,567.89" parsed as 1234.
+  //     only the first, so "€1,234,567.89" parsed as 1234.
   check('thousands separators parse fully',
-    parseAmount('You received $1,234,567.89 USD', [/you received \$([\d,]+\.?\d*)/i]) === 1234567.89);
+    parseAmount('You received €1,234,567.89 EUR', PP) === 1234567.89);
+
+  // ── the same amount, written the way half of Europe writes it ──────────────
+  // "€1.234,56" and "€1,234.56" are the same money in two locales and nothing in
+  // the message says which. The old parser stripped commas and kept dots, so the
+  // first of those read back as 1.234 — a thousandfold UNDERREAD, which lands as
+  // status='underpaid' on an order that was in fact paid in full. We do not
+  // choose the format of an inbound receipt; PayPal follows the payer's locale.
+  check('a comma decimal is read as a decimal', parseAmount('You received €19,99 EUR', PP) === 19.99);
+  check('a dot decimal still is too', parseAmount('You received €19.99 EUR', PP) === 19.99);
+  check('the European grouping form is not underread by 1000x',
+    parseAmount('You received €1.234,56 EUR', PP) === 1234.56);
+  check('the Anglo grouping form reads the same',
+    parseAmount('You received €1,234.56 EUR', PP) === 1234.56);
+  // A lone separator with exactly three digits behind it is grouping, never a
+  // price quoted to three decimals.
+  check('"1,100" is eleven hundred, not one point one', parseAmount('You received €1,100 EUR', PP) === 1100);
+
+  // Both shapes a provider might use — symbol in front, or ISO code behind.
+  check('the ISO-code-after form parses too', parseAmount('You received 19,99 EUR', PP) === 19.99);
+  check('a Cash App body parses on its own patterns',
+    parseAmount('You received €19.99 to $ghoststore', CA) === 19.99);
 
   // 35. A payer controls their display name and the memo, so a free-floating
   //     figure must not outrank the provider's own receipt wording.
-  check('free-floating dollar figure is not used as the amount',
-    parseAmount('From: Big Spender $99999.99\n\nYou received $19.99 USD',
-      [/you received \$([\d,]+\.?\d*)/i]) === 19.99);
+  check('free-floating figure is not used as the amount',
+    parseAmount('From: Big Spender €99999.99\n\nYou received €19.99 EUR', PP) === 19.99);
 
   console.log('\n=== note matching ===');
 
@@ -519,7 +569,7 @@ const CASH_ORDER = { ...ORDER, payment_method: 'cashapp' };
   reset([ORDER]);
   await processEmail(email({
     auth: gmailAuth('paypal.com'), subject: 'payment',
-    text: 'store@ghost.example\n\nYou received $19.99 USD\n\nghostwave1234 aaaa1111 bbbb2222\n',
+    text: 'store@ghost.example\n\nYou received €19.99 EUR\n\nghostwave1234 aaaa1111 bbbb2222\n',
   }));
   check('note sprayed in the body without the "Note from" marker is ignored', CONFIRMS.length === 0);
 
@@ -579,7 +629,7 @@ const CASH_ORDER = { ...ORDER, payment_method: 'cashapp' };
     /deriveWithRetry/.test(cryptoSrc));
 
   console.log('\n=== money arithmetic ===');
-  const { applyFee, nativeToUsdCents } = require(path.join(BACKEND, 'routes', 'orders.js')).__test__;
+  const { applyFee, nativeToFiatCents } = require(path.join(BACKEND, 'routes', 'orders.js')).__test__;
 
   // Integer basis points. The old float form undercharged whenever the product
   // landed a hair under the half-cent — systematically, never the other way.
@@ -595,19 +645,19 @@ const CASH_ORDER = { ...ORDER, payment_method: 'cashapp' };
 
   // Satoshis are not cents. Writing 4,000,000 sats into amount_received_cents
   // claimed the customer had paid $40,000.00.
-  const satOrder = { payment_info: { rate_usd: 50000 } };
-  check('satoshis convert via the LOCKED rate', nativeToUsdCents(satOrder, 100000, 'btc').cents === 5000);
-  check('satoshi conversion is labelled sats', nativeToUsdCents(satOrder, 100000, 'btc').unit === 'sats');
-  // No locked rate means no defensible USD figure — record null, do not invent.
+  const satOrder = { payment_info: { rate_fiat: 50000, rate_currency: 'EUR' } };
+  check('satoshis convert via the LOCKED rate', nativeToFiatCents(satOrder, 100000, 'btc').cents === 5000);
+  check('satoshi conversion is labelled sats', nativeToFiatCents(satOrder, 100000, 'btc').unit === 'sats');
+  // No locked rate means no defensible fiat figure — record null, do not invent.
   check('no locked rate yields null cents, not a guess',
-    nativeToUsdCents({ payment_info: {} }, 100000, 'btc').cents === null);
+    nativeToFiatCents({ payment_info: {} }, 100000, 'btc').cents === null);
   check('no locked rate still records the sats unit',
-    nativeToUsdCents({ payment_info: {} }, 100000, 'btc').unit === 'sats');
-  check('dollar amounts convert straight to cents', nativeToUsdCents({}, 19.99, 'paypal').cents === 1999);
-  check('a null amount yields null cents', nativeToUsdCents({}, null, 'paypal').cents === null);
+    nativeToFiatCents({ payment_info: {} }, 100000, 'btc').unit === 'sats');
+  check('fiat amounts convert straight to cents', nativeToFiatCents({}, 19.99, 'paypal').cents === 1999);
+  check('a null amount yields null cents', nativeToFiatCents({}, null, 'paypal').cents === null);
   // payment_info arrives as a string from a TEXT column, an object from JSONB.
   check('a stringified payment_info still yields a rate',
-    nativeToUsdCents({ payment_info: JSON.stringify({ rate_usd: 50000 }) }, 100000, 'btc').cents === 5000);
+    nativeToFiatCents({ payment_info: JSON.stringify({ rate_fiat: 50000 }) }, 100000, 'btc').cents === 5000);
 
   console.log('\n=== ledger integrity (source assertions) ===');
   const balanceSrc = require('fs').readFileSync(path.join(BACKEND, 'routes', 'balance.js'), 'utf8');
@@ -700,9 +750,14 @@ const CASH_ORDER = { ...ORDER, payment_method: 'cashapp' };
   // in its own footer: "Emails from PayPal will always contain your full name."
   console.log('\n=== a genuine PayPal receipt (the 2026-08-06 outage) ===');
 
-  const REAL_PAYPAL = [
+  // The body exactly as it arrived, down to the currency: this one was in USD,
+  // because the shop priced in dollars in August 2026. It is kept verbatim
+  // rather than edited, and it now serves TWO purposes — the shapes it taught us
+  // (no merchant address, "Note from <sender>" on the line above the note), and
+  // the fact that the same receipt must no longer settle a euro invoice.
+  const realBody = (amount) => [
     'SNAYDER VELASQUEZ, HERE ARE THE DETAILS.', '', 'Hello, Snayder Velasquez', '',
-    'PayPal', '', 'Keylin Velasquez sent you $1.10 USD', '', 'Amount', '', '$1.10 USD', '',
+    'PayPal', '', `Keylin Velasquez sent you ${amount}`, '', 'Amount', '', amount, '',
     'Note from Keylin Velasquez', '', 'steelmark9647', '',
     'Transaction date', '', 'August 6, 2026', '',
     'Transaction ID', '', '7X931707HM502973X', '',
@@ -712,10 +767,13 @@ const CASH_ORDER = { ...ORDER, payment_method: 'cashapp' };
     'Copyright (c) 1999-2026 PayPal, Inc. All rights reserved.',
   ].join('\n');
 
+  const REAL_PAYPAL_USD = realBody('$1.10 USD');   // the capture, unaltered
+  const REAL_PAYPAL = realBody('€1.10 EUR');       // the same receipt, euro shop
+
   const REAL_ORDER = { ...ORDER, payment_note: 'steelmark9647', total_cents: 110 };
   const realMail = () => email({
     auth: gmailAuth('paypal.com'),
-    subject: 'Keylin Velasquez sent you $1.10 USD',
+    subject: 'Keylin Velasquez sent you €1.10 EUR',
     text: REAL_PAYPAL,
   });
 
@@ -770,6 +828,26 @@ const CASH_ORDER = { ...ORDER, payment_method: 'cashapp' };
     check('the name match tolerates case and stray whitespace', CONFIRMS.length === 1);
   });
 
+  // ── the same receipt, in the currency it actually arrived in ───────────────
+  // Everything about this message is right: DKIM passes, the merchant name
+  // matches, the note names a real waiting order, and the figure equals the
+  // invoice to the cent. It must still be refused, because 1.10 USD is not 1.10
+  // EUR and settling it at par writes off the whole spread on every order. This
+  // is the check that would have failed if the euro switch had merely DELETED
+  // EUR from the foreign list instead of inverting it.
+  await withEnv({ PAYPAL_EMAIL: null, PAYPAL_MERCHANT_NAME: 'Snayder Velasquez' }, async () => {
+    reset([REAL_ORDER]);
+    await processEmail(email({
+      auth: gmailAuth('paypal.com'),
+      subject: 'Keylin Velasquez sent you $1.10 USD',
+      text: REAL_PAYPAL_USD,
+    }));
+    check('a dollar receipt does not settle a euro invoice at par', CONFIRMS.length === 0);
+    // And loudly: money did arrive, it just cannot be applied automatically.
+    check('the dollar receipt raises the foreign-currency alert',
+      alerted('email_payment_foreign_currency'));
+  });
+
   // The other half of "loud". PayPal sends marketing to the same inbox and it
   // greets you by the same name, so it now passes the recipient check — it must
   // not become an unparseable-email alarm every time.
@@ -788,8 +866,8 @@ const CASH_ORDER = { ...ORDER, payment_method: 'cashapp' };
     reset([REAL_ORDER]);
     await processEmail(email({
       auth: gmailAuth('paypal.com'),
-      subject: 'Brandon Speaks sent you $34.50 USD',
-      text: 'Hello, Snayder Velasquez\n\nBrandon Speaks sent you $34.50 USD\n\nAmount\n\n$34.50 USD\n',
+      subject: 'Brandon Speaks sent you €34.50 EUR',
+      text: 'Hello, Snayder Velasquez\n\nBrandon Speaks sent you €34.50 EUR\n\nAmount\n\n€34.50 EUR\n',
     }));
     check('an amount with no note still raises the unparseable alarm',
       CONFIRMS.length === 0 && alerted('email_unparseable'));

@@ -22,6 +22,8 @@
 // side that takes the money.
 'use strict';
 
+const { CURRENCY } = require('./money');
+
 // $ followed by a handle. Cash App allows letters, digits and underscores, 1-20
 // of them. A leading space, a space anywhere, or the word "your" in front all
 // fail — which is the whole point.
@@ -42,6 +44,39 @@ const clean = (s) => String(s == null ? '' : s).trim();
 // the reseller-status bug taught us what happens when an exhaustive list is
 // spelled out in five places and a sixth is added later.
 const ALL_METHODS = ['cashapp', 'paypal', 'btc', 'ltc'];
+
+// ─── Methods that cannot take the shop's currency ────────────────────────────
+//
+// Cash App settles in USD in the US and GBP in the UK. There is no euro Cash
+// App, and no amount of configuration makes one — so with the shop priced in
+// euro (utils/money.js) this method is not "off" and not "misconfigured", it is
+// impossible.
+//
+// It is NOT deleted, for the reason this whole file exists: this codebase has
+// three ways for a payment method to be unavailable and they want opposite
+// responses from whoever is looking. `off` means somebody chose it and can
+// un-choose it. `unconfigured` means something is broken and wants fixing.
+// Deleting Cash App would have made it a fourth thing — absent — which reads
+// from the panel as "it used to be here and now it isn't", i.e. as a bug. This
+// state says why, the panel prints the reason, and the method comes back on its
+// own if the shop's currency ever changes again.
+//
+// Note the `$` in CASHTAG_RE above is a Cash App HANDLE SIGIL, not a currency
+// symbol. A blanket `$`→`€` sweep would have rewritten it to /^€.../, failing
+// every real cashtag and switching Cash App off with the reason "CASHAPP_CASHTAG
+// is not a usable cashtag" — the right outcome for entirely the wrong reason,
+// and unrecoverable by anyone who believed the message.
+const METHOD_CURRENCIES = {
+  cashapp: ['USD', 'GBP'],
+  paypal: null,  // multi-currency; the amount carries its ISO code in the link
+  btc: null,     // quoted from a live fiat rate, so any currency works
+  ltc: null,
+};
+
+function currencyUnsupported(method, currency = CURRENCY) {
+  const allowed = METHOD_CURRENCIES[method];
+  return Array.isArray(allowed) && !allowed.includes(currency);
+}
 
 /**
  * Methods the owner has deliberately switched OFF, as a Set.
@@ -113,11 +148,25 @@ function normalisePaypalMe(value) {
  * like the store is broken, and the buyer has no reason to read the address
  * printed underneath it.
  */
+// ── THE CURRENCY GOES IN THE PATH, and it is not optional ────────────────────
+// PayPal.Me reads `/12.34` as "12.34 of whatever currency this account is
+// denominated in". That was invisible while the shop priced in dollars and the
+// account was a dollar account — the two agreed by accident, and nothing in this
+// function ever mentioned a currency, so a `$`-to-`€` sweep would not have
+// touched it.
+//
+// With the shop on euro that silence becomes a real charge in the wrong
+// currency: the site quotes €12.34, PayPal collects 12.34 USD, and the receipt
+// that comes back then trips the watcher's foreign-currency guard on the way in,
+// so the order does not even auto-confirm. Two failures, one omission.
+//
+// PayPal.Me accepts a 3-letter ISO code appended to the amount — `/12.34EUR` —
+// and honours it whatever the account's default is.
 function paypalMeLink(value, amount) {
   const handle = normalisePaypalMe(value);
   if (!handle) return null;
   const amt = Number(amount);
-  const suffix = Number.isFinite(amt) && amt > 0 ? `/${amt.toFixed(2)}` : '';
+  const suffix = Number.isFinite(amt) && amt > 0 ? `/${amt.toFixed(2)}${CURRENCY}` : '';
   return `https://www.paypal.com/paypalme/${handle}${suffix}`;
 }
 
@@ -133,11 +182,12 @@ function isPayableEmail(value) {
  */
 function payableMethods(env = process.env) {
   const off = disabledMethods(env);
+  const ok = (m, configured) => !currencyUnsupported(m) && !off.has(m) && configured;
   return {
-    cashapp: !off.has('cashapp') && isPayableCashtag(env.CASHAPP_CASHTAG),
-    paypal: !off.has('paypal') && isPayableEmail(env.PAYPAL_EMAIL),
-    btc: !off.has('btc') && !!env.BTC_XPUB,
-    ltc: !off.has('ltc') && !!env.LTC_XPUB,
+    cashapp: ok('cashapp', isPayableCashtag(env.CASHAPP_CASHTAG)),
+    paypal: ok('paypal', isPayableEmail(env.PAYPAL_EMAIL)),
+    btc: ok('btc', !!env.BTC_XPUB),
+    ltc: ok('ltc', !!env.LTC_XPUB),
   };
 }
 
@@ -166,10 +216,22 @@ function methodStates(env = process.env) {
   };
   const out = {};
   for (const m of ALL_METHODS) {
+    // Currency first, ahead of even the off-switch. This is the one state
+    // nobody can act on: flipping the toggle will not help, fixing the address
+    // will not help, and a panel that offered either as the remedy would be
+    // sending staff to do something that cannot work.
+    if (currencyUnsupported(m)) {
+      out[m] = {
+        available: false,
+        state: 'currency',
+        reason: `${m === 'cashapp' ? 'Cash App' : m} cannot take ${CURRENCY} — it settles in `
+          + `${METHOD_CURRENCIES[m].join(' or ')} only, and this shop prices in ${CURRENCY}`,
+      };
+    }
     // Reported ahead of the address check on purpose. A method the owner has
     // switched off should say so even if its address is ALSO broken, or
     // turning it back on later looks like it silently failed.
-    if (off.has(m)) out[m] = { available: false, state: 'off', reason: 'Switched off by staff' };
+    else if (off.has(m)) out[m] = { available: false, state: 'off', reason: 'Switched off by staff' };
     else if (!configured[m]) out[m] = { available: false, state: 'unconfigured', reason: missing[m] };
     else out[m] = { available: true, state: 'on', reason: null };
   }
@@ -228,5 +290,6 @@ module.exports = {
   isPayableCashtag, isPayableEmail, payableMethods, addressProblems,
   disabledMethods, methodStates, toggleMethod, ALL_METHODS,
   normalisePaypalMe, paypalMeLink,
+  currencyUnsupported, METHOD_CURRENCIES,
   CASHTAG_RE, EMAIL_RE, PAYPALME_RE,
 };

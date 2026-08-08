@@ -20,11 +20,12 @@
 'use strict';
 
 const { query, pool } = require('./db');
+const { moneyCents } = require('./utils/money');
 
 const GUILD_ID = process.env.GUILD_ID;
 const APPLY = process.argv.includes('--apply');
 
-const money = c => `$${((Number(c) || 0) / 100).toFixed(2)}`;
+const money = moneyCents;
 const when = d => (d ? new Date(d).toISOString().replace('T', ' ').slice(0, 16) : '—');
 
 (async () => {

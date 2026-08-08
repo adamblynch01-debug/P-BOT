@@ -130,7 +130,15 @@ check('the panel never calls the supplier directly, and has no test button', () 
 const SUP_STATE_LINE = (html.match(/^var supState = .*$/m) || [])[0];
 assert.ok(SUP_STATE_LINE, 'supState declaration not found in index.html');
 
-const SRC = [SUP_STATE_LINE].concat([
+// The currency declarations, lifted for the same reason. supMoney renders a
+// price with GX_SYMBOL rather than a symbol of its own, so a sandbox that did
+// not carry them would throw — and a sandbox that DEFINED its own '$' would
+// have gone on printing dollars here long after the shop moved to euro.
+const GX_CURRENCY_LINES = (html.match(/^var GX_(?:CURRENCY|SYMBOL) = .*$/mg) || []);
+assert.strictEqual(GX_CURRENCY_LINES.length, 2, 'the GX_CURRENCY/GX_SYMBOL declarations were not found in index.html');
+
+const SRC = GX_CURRENCY_LINES.concat([SUP_STATE_LINE]).concat([
+  'gxMoney', 'gxParseMoney',
   'supEsc', 'supMoney', 'supWhen', 'supMsg',
   // Per-supplier state. These three are what keep "this build knows two
   // upstreams" from collapsing back into one global "is a key set" flag.

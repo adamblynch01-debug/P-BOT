@@ -97,7 +97,10 @@ function fromHeader(storeName) {
   return addr.includes('<') ? addr : `${storeName} <${addr}>`;
 }
 
-function money(n) { return '$' + (Number(n) || 0).toFixed(2); }
+// Delegated, not re-typed. Four files had their own one-line money formatter
+// and each carried its own hardcoded symbol, so "change the currency" meant
+// finding all four — which is exactly the kind of thing that gets three of four.
+const { money } = require('./money');
 
 // One place for the customer-facing name, and one fallback. It used to default
 // to 'Ghost Store' here while /health and routes/config.js defaulted to 'H8ED

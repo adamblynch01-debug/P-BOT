@@ -119,8 +119,12 @@ server.listen(0, '127.0.0.1', async () => {
   r = await req('GET', '/api/config/payment-methods', { token: 'tok-owner' });
   check('the owner can read them', () => {
     assert.strictEqual(r.status, 200);
-    assert.strictEqual(r.body.payment_method_states.cashapp.state, 'on');
+    assert.strictEqual(r.body.payment_method_states.paypal.state, 'on');
     assert.strictEqual(r.body.payment_method_states.ltc.state, 'unconfigured');
+    // The third state. Cash App settles in USD or GBP and the shop prices in
+    // euro, so it is not off and not misconfigured — it is impossible, and the
+    // panel has to say so or staff go looking for a switch that would not help.
+    assert.strictEqual(r.body.payment_method_states.cashapp.state, 'currency');
   });
 
   console.log('\nturning a method off');
@@ -140,8 +144,11 @@ server.listen(0, '127.0.0.1', async () => {
     assert.strictEqual(process.env.PAYPAL_EMAIL, 'shop@uhservices.xyz');
   });
   check('the other methods are unaffected', () => {
-    assert.strictEqual(r.body.payment_methods.cashapp, true);
     assert.strictEqual(r.body.payment_methods.btc, true);
+    assert.strictEqual(r.body.payment_methods.ltc, false, 'ltc has no xpub here');
+    // Not 'unaffected by the switch' in the sense of 'true' — Cash App is shut
+    // by the shop currency, and closing PayPal must not change that either way.
+    assert.strictEqual(r.body.payment_methods.cashapp, false);
   });
 
   // The public route is what the storefront and the Discord panel read.

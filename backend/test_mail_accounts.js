@@ -236,7 +236,7 @@ function run() {
     messageId: '<split-1@paypal.com>',
     subject: 'You received a payment',
     headerLines: [{ key: 'authentication-results', line: gmailStamp }],
-    text: 'Hello store@ghost.example,\n\nYou received $19.99 USD\n\nNote from Buyer\nredfox1234\n\nThanks',
+    text: 'Hello store@ghost.example,\n\nYou received €19.99 EUR\n\nNote from Buyer\nredfox1234\n\nThanks',
   };
   return (async () => {
     setEnv({});

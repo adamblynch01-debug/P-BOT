@@ -82,9 +82,9 @@ function section(s) { console.log('\n' + s); }
     assert.deepStrictEqual(p.variants.map(v => v.label), ['1 DAY', '1 WEEK', '1 MONTH']);
   });
   check('prices are rendered from cents', () => {
-    assert.deepStrictEqual(p.variants.map(v => v.price), ['$9.99', '$29.99', '$49.99']);
+    assert.deepStrictEqual(p.variants.map(v => v.price), ['€9.99', '€29.99', '€49.99']);
   });
-  check('a zero price reads TBD rather than $0.00', () => {
+  check('a zero price reads TBD rather than €0.00', () => {
     assert.strictEqual(__test__.money(0), 'TBD');
     assert.strictEqual(__test__.money(null), 'TBD');
   });

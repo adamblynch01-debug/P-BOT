@@ -3,6 +3,7 @@ const { notifyBot } = require('./botNotify');
 const { raiseAlert } = require('./alerts');
 const { sendOrderConfirmation } = require('./email');
 const supplier = require('./supplier');
+const { moneyCents, money } = require('./money');
 
 const GUILD_ID = process.env.GUILD_ID;
 
@@ -131,14 +132,14 @@ async function deliver(order) {
             }
             if (err && err.noWallet) {
               await raiseAlert('topup_credit_lost',
-                `Order ${order.id} could not be credited $${(credit / 100).toFixed(2)} — no balances row for that user; the credit was rolled back`,
+                `Order ${order.id} could not be credited ${moneyCents(credit)} — no balances row for that user; the credit was rolled back`,
                 { severity: 'error', order_id: order.id, context: { web_user_id: order.web_user_id, credit_cents: credit } });
               deliveredGoods.push({ product: 'Balance Top-Up', items: ['CREDIT_FAILED'], ...lineDetail(item) });
               continue;
             }
             throw err;
           }
-          deliveredGoods.push({ product: 'Balance Top-Up', items: [`+$${(credit / 100).toFixed(2)} credited`], ...lineDetail(item) });
+          deliveredGoods.push({ product: 'Balance Top-Up', items: [`+${moneyCents(credit)} credited`], ...lineDetail(item) });
         } else {
           deliveredGoods.push({ product: 'Balance Top-Up', items: ['NO_ACCOUNT_LINKED'], ...lineDetail(item) });
         }
@@ -152,7 +153,7 @@ async function deliver(order) {
       if (item.id === 'donation' || item.id === 'custom-amount') {
         deliveredGoods.push({
           product: item.name || 'Custom Payment',
-          items: [`$${(item.price || 0).toFixed(2)} received — manual fulfillment`],
+          items: [`${money(item.price)} received — manual fulfillment`],
           ...lineDetail(item),
         });
         continue;

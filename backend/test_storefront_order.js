@@ -164,6 +164,11 @@ check('the reorder layer lifts out of index.html and compiles', () => {
   assert.ok(SRC.length > 4000, 'suspiciously small extraction — a lift probably truncated');
   vm.runInContext(
     'var _gxGameTiles = {}; var gameProducts = {}; var _gtDrag = null; var _gtCurrentGame = null;\n' +
+    // The once-only guard on the admin product hydrate. Declared here rather
+    // than in the sandbox object because it is a `var` in the page and the
+    // functions assign to it — a missing declaration only surfaces on the path
+    // that reads it, which is exactly how this went unnoticed.
+    'var _gtAdminIdxTried = false;\n' +
     NON_PRODUCT_LINE + '\n' + SRC,
     ctx);
   assert.strictEqual(typeof ctx.renderAdminGameTiles, 'function');

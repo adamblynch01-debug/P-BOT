@@ -35,37 +35,44 @@ const LIVE = {
 };
 const env = (over) => Object.assign({}, LIVE, over || {});
 
+// ── Cash App is no longer one of the four ────────────────────────────────────
+// The shop prices in euro (utils/money.js) and Cash App settles in USD or GBP
+// only, so it is unavailable for a reason no switch and no address can change.
+// Every check below that used to use Cash App as its "untouched control" now
+// uses one that is genuinely untouchable, because a control that is false for
+// its OWN reason proves nothing about the switch under test.
+const PAYABLE_HERE = { cashapp: false, paypal: true, btc: true, ltc: true };
+const allBut = (...off) => {
+  const m = Object.assign({}, PAYABLE_HERE);
+  for (const k of off) m[k] = false;
+  return m;
+};
+
 console.log('\nthe kill switch closes a method without touching its address');
 
-check('with nothing switched off, all four are payable', () => {
-  assert.deepStrictEqual(P.payableMethods(env()),
-    { cashapp: true, paypal: true, btc: true, ltc: true });
+check('with nothing switched off, everything the shop currency allows is payable', () => {
+  assert.deepStrictEqual(P.payableMethods(env()), PAYABLE_HERE);
 });
 
 check('PAYMENT_METHODS_OFF closes exactly the named method', () => {
   const m = P.payableMethods(env({ PAYMENT_METHODS_OFF: 'paypal' }));
-  assert.strictEqual(m.paypal, false, 'paypal should be closed');
-  assert.strictEqual(m.cashapp, true, 'cashapp must be untouched');
-  assert.strictEqual(m.btc, true);
-  assert.strictEqual(m.ltc, true);
+  assert.deepStrictEqual(m, allBut('paypal'));
 });
 
 check('several methods can be closed at once', () => {
   const m = P.payableMethods(env({ PAYMENT_METHODS_OFF: 'btc,ltc' }));
-  assert.strictEqual(m.btc, false);
-  assert.strictEqual(m.ltc, false);
-  assert.strictEqual(m.cashapp, true);
+  assert.deepStrictEqual(m, allBut('btc', 'ltc'));
 });
 
 // The whole point of the feature. Blanking the address was the old "off
 // switch", and it meant coming back meant retyping a cashtag from memory.
 check('switching a method off leaves its address intact', () => {
-  const e = env({ PAYMENT_METHODS_OFF: 'cashapp' });
-  assert.strictEqual(P.payableMethods(e).cashapp, false);
-  assert.strictEqual(e.CASHAPP_CASHTAG, '$uhservices', 'the address must survive');
+  const e = env({ PAYMENT_METHODS_OFF: 'paypal' });
+  assert.strictEqual(P.payableMethods(e).paypal, false);
+  assert.strictEqual(e.PAYPAL_EMAIL, 'shop@uhservices.xyz', 'the address must survive');
   // ...and turning it back on needs nothing else.
   delete e.PAYMENT_METHODS_OFF;
-  assert.strictEqual(P.payableMethods(e).cashapp, true);
+  assert.strictEqual(P.payableMethods(e).paypal, true);
 });
 
 check('whitespace and case in the stored list are tolerated', () => {
@@ -75,8 +82,7 @@ check('whitespace and case in the stored list are tolerated', () => {
 });
 
 check('an empty PAYMENT_METHODS_OFF closes nothing', () => {
-  assert.deepStrictEqual(P.payableMethods(env({ PAYMENT_METHODS_OFF: '' })),
-    { cashapp: true, paypal: true, btc: true, ltc: true });
+  assert.deepStrictEqual(P.payableMethods(env({ PAYMENT_METHODS_OFF: '' })), PAYABLE_HERE);
 });
 
 console.log('\n"switched off" and "misconfigured" are told apart');
@@ -98,9 +104,28 @@ check('a method with no address reports state "unconfigured"', () => {
   assert.match(s.reason, /LTC_XPUB/);
 });
 
-check('a placeholder cashtag is unconfigured, not off', () => {
-  const s = P.methodStates(env({ CASHAPP_CASHTAG: ' your $cashtag' })).cashapp;
+// Was asserted on Cash App, whose answer is now 'currency' whatever its address
+// says. Moved to PayPal, which has the same two states and can still reach both.
+check('a placeholder address is unconfigured, not off', () => {
+  const s = P.methodStates(env({ PAYPAL_EMAIL: 'your@paypal.com' })).paypal;
   assert.strictEqual(s.state, 'unconfigured');
+  assert.match(s.reason, /PAYPAL_EMAIL/);
+});
+
+// The third state, added with the euro switch. It is reported AHEAD of both of
+// the others because it is the one nobody can act on: flipping the toggle will
+// not help and fixing the address will not help, and a panel that offered
+// either as the remedy would be sending staff to do something that cannot work.
+check('a method that cannot take the shop currency reports state "currency"', () => {
+  const s = P.methodStates(env()).cashapp;
+  assert.strictEqual(s.available, false);
+  assert.strictEqual(s.state, 'currency');
+  assert.match(s.reason, /EUR/);
+});
+
+check('currency beats both off and unconfigured', () => {
+  const s = P.methodStates(env({ PAYMENT_METHODS_OFF: 'cashapp', CASHAPP_CASHTAG: ' your $cashtag' })).cashapp;
+  assert.strictEqual(s.state, 'currency', 'staff would be sent to fix a cashtag that is not the problem');
 });
 
 // If both are true, "off" must win. Reporting the address fault instead would
@@ -111,7 +136,7 @@ check('off beats unconfigured when both apply', () => {
 });
 
 check('a working method reports state "on" with no reason', () => {
-  const s = P.methodStates(env()).cashapp;
+  const s = P.methodStates(env()).paypal;
   assert.strictEqual(s.available, true);
   assert.strictEqual(s.state, 'on');
   assert.strictEqual(s.reason, null);
@@ -163,9 +188,24 @@ check('a handle with a space is refused', () => {
 // a mistyped total is an underpaid order somebody settles by hand.
 check('the amount is carried in the link, to the cent', () => {
   assert.strictEqual(P.paypalMeLink('uhservices', 1.1),
-    'https://www.paypal.com/paypalme/uhservices/1.10');
+    'https://www.paypal.com/paypalme/uhservices/1.10EUR');
   assert.strictEqual(P.paypalMeLink('uhservices', 12),
-    'https://www.paypal.com/paypalme/uhservices/12.00');
+    'https://www.paypal.com/paypalme/uhservices/12.00EUR');
+});
+
+// ── and the CURRENCY is carried with it, which is not decoration ─────────────
+// A bare `/12.34` means "12.34 of whatever this PayPal account is denominated
+// in". That agreed with the shop by accident while both were in dollars, and
+// the day the shop moved to euro it became a real charge in the wrong currency:
+// the site quotes €12.34, PayPal collects 12.34 USD, and the receipt then trips
+// the email watcher's foreign-currency guard on the way back in, so the order
+// does not even auto-confirm. Two failures, one omission — and nothing in this
+// function mentioned a currency, so a symbol sweep would never have found it.
+check('the link names the currency, so the account default cannot decide it', () => {
+  const link = P.paypalMeLink('uhservices', 12.34);
+  assert.ok(/\/12\.34[A-Z]{3}$/.test(link), 'no ISO currency code on the amount: ' + link);
+  assert.strictEqual(link.slice(-3), require('./utils/money').CURRENCY,
+    'the link charges in a different currency from the one the shop prices in');
 });
 check('a missing or nonsense amount still yields a usable link', () => {
   assert.strictEqual(P.paypalMeLink('uhservices'), 'https://www.paypal.com/paypalme/uhservices');

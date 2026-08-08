@@ -296,8 +296,8 @@ async function run() {
       assert.ok(h.includes('Ancient'), 'product name');
       assert.ok(h.includes('Day') && h.includes('Month'), 'subscription term');
       assert.ok(/>4</.test(h), 'quantity');
-      assert.ok(h.includes('$2.50'), 'unit price');
-      assert.ok(h.includes('$10.00'), 'line total for the 4× line');
+      assert.ok(h.includes('€2.50'), 'unit price');
+      assert.ok(h.includes('€10.00'), 'line total for the 4× line');
     });
     check('the apostrophe in a product name is escaped, not rendered as markup', () =>
       assert.ok(LAST.body.html.includes('HEAVEN&#39;S BLINDSPOT')));
@@ -309,10 +309,10 @@ async function run() {
       assert.ok(LAST.body.subject.includes('K7QM-3XR9')));
     check('subtotal, coupon, fee and total are all shown', () => {
       const h = LAST.body.html;
-      assert.ok(h.includes('$20.00'), 'subtotal');
-      assert.ok(h.includes('-$2.00'), 'coupon line');
-      assert.ok(h.includes('$1.80'), 'the cashapp fee, as the gap between the two');
-      assert.ok(h.includes('$19.80'), 'total');
+      assert.ok(h.includes('€20.00'), 'subtotal');
+      assert.ok(h.includes('-€2.00'), 'coupon line');
+      assert.ok(h.includes('€1.80'), 'the cashapp fee, as the gap between the two');
+      assert.ok(h.includes('€19.80'), 'total');
     });
     check('there is a Discord button, pointing at the configured invite', () =>
       assert.ok(/<a href="https:\/\/discord\.gg\/example"[^>]*>Join our Discord<\/a>/.test(LAST.body.html)));
@@ -332,7 +332,7 @@ async function run() {
     });
     await checkAsync('a JSON string items_snapshot is parsed, not printed', async () => {
       await sendOrderConfirmation({ ...order, items_snapshot: JSON.stringify(order.items_snapshot) }, goods);
-      assert.ok(LAST.body.html.includes('$2.50') && !LAST.body.html.includes('items_snapshot'));
+      assert.ok(LAST.body.html.includes('€2.50') && !LAST.body.html.includes('items_snapshot'));
     });
     delete process.env.DISCORD_INVITE_URL;
   }
