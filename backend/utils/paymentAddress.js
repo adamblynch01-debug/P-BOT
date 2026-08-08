@@ -23,6 +23,7 @@
 'use strict';
 
 const { CURRENCY } = require('./money');
+const { canQuote } = require('./fx');
 
 // $ followed by a handle. Cash App allows letters, digits and underscores, 1-20
 // of them. A leading space, a space anywhere, or the word "your" in front all
@@ -76,6 +77,46 @@ const METHOD_CURRENCIES = {
 function currencyUnsupported(method, currency = CURRENCY) {
   const allowed = METHOD_CURRENCIES[method];
   return Array.isArray(allowed) && !allowed.includes(currency);
+}
+
+// ─── The third option: price in euro, settle in something it can carry ───────
+//
+// The paragraph above was written when there were two answers — the method
+// takes our currency, or the method is impossible. There is a third, and it is
+// what the shop actually wants: the order stays PRICED in euro (total_cents,
+// the receipt, the books) and the customer is asked to send the equivalent in a
+// currency the method can move, at a rate locked onto the order at checkout.
+//
+// So `currencyUnsupported` keeps meaning exactly what it says — it is the raw
+// fact about the method — and the new question layered on top is whether that
+// fact can be worked around. Two separate predicates on purpose: the pay screen
+// needs to know the settlement currency is DIFFERENT (it has to print "send
+// $21.60, which is your €19.99 total"), and merging the two would lose that.
+//
+// The FIRST entry in METHOD_CURRENCIES is the settlement currency. Cash App
+// lists ['USD','GBP'] and it settles USD unless the account is a UK one — this
+// deployment's is not, and a GBP quote sent to a US cashtag would be converted
+// again by Cash App at their rate, which is not the rate we locked. If that ever
+// changes it is a one-word edit here rather than a hunt through the callers.
+function settlementCurrency(method, currency = CURRENCY) {
+  if (!currencyUnsupported(method, currency)) return currency;
+  const allowed = METHOD_CURRENCIES[method];
+  return allowed[0];
+}
+
+// Can the gap be bridged? Not a guess — utils/fx.js answers it from the ECB's
+// published set, synchronously, so this stays usable from methodStates() and
+// everything that calls it (the panel, the bot, the checkout guard) without any
+// of them becoming async to ask about an exchange rate.
+//
+// A false here is honest and reachable: a shop priced in a currency the ECB does
+// not publish gets the old `currency` state back, with the old reason. Whether
+// a rate can be FETCHED right now is a different question with a different
+// answer, and it is asked at order time where a failure can refuse one order
+// instead of taking the whole method down.
+function currencyBridged(method, currency = CURRENCY) {
+  if (!currencyUnsupported(method, currency)) return false;
+  return canQuote(currency, settlementCurrency(method, currency));
 }
 
 /**
@@ -180,9 +221,12 @@ function isPayableEmail(value) {
  * Crypto is derived from an xpub, which the address generator validates on its
  * own, so those two keep the non-empty test.
  */
-function payableMethods(env = process.env) {
+// `currency` threads through for the same reason it does in methodStates: so
+// the "this method is impossible" path can be exercised rather than assumed.
+function payableMethods(env = process.env, currency = CURRENCY) {
   const off = disabledMethods(env);
-  const ok = (m, configured) => !currencyUnsupported(m) && !off.has(m) && configured;
+  const ok = (m, configured) =>
+    (!currencyUnsupported(m, currency) || currencyBridged(m, currency)) && !off.has(m) && configured;
   return {
     cashapp: ok('cashapp', isPayableCashtag(env.CASHAPP_CASHTAG)),
     paypal: ok('paypal', isPayableEmail(env.PAYPAL_EMAIL)),
@@ -200,7 +244,13 @@ function payableMethods(env = process.env) {
  * and those two want opposite responses from whoever is looking. `off` means
  * somebody chose this; `unconfigured` means something is broken.
  */
-function methodStates(env = process.env) {
+// `currency` is the shop's, and is a parameter only so the `state:'currency'`
+// branch below stays exercisable. That branch is now unreachable for every
+// method this shop actually has — Cash App's dollar gap is bridged — and a
+// branch that no test can enter is a branch the next reader deletes as dead.
+// It is not dead: it is what a shop priced in something the ECB does not
+// publish would get, and it is the honest answer there.
+function methodStates(env = process.env, currency = CURRENCY) {
   const off = disabledMethods(env);
   const configured = {
     cashapp: isPayableCashtag(env.CASHAPP_CASHTAG),
@@ -220,12 +270,12 @@ function methodStates(env = process.env) {
     // nobody can act on: flipping the toggle will not help, fixing the address
     // will not help, and a panel that offered either as the remedy would be
     // sending staff to do something that cannot work.
-    if (currencyUnsupported(m)) {
+    if (currencyUnsupported(m, currency) && !currencyBridged(m, currency)) {
       out[m] = {
         available: false,
         state: 'currency',
-        reason: `${m === 'cashapp' ? 'Cash App' : m} cannot take ${CURRENCY} — it settles in `
-          + `${METHOD_CURRENCIES[m].join(' or ')} only, and this shop prices in ${CURRENCY}`,
+        reason: `${m === 'cashapp' ? 'Cash App' : m} cannot take ${currency} — it settles in `
+          + `${METHOD_CURRENCIES[m].join(' or ')} only, and this shop prices in ${currency}`,
       };
     }
     // Reported ahead of the address check on purpose. A method the owner has
@@ -233,6 +283,23 @@ function methodStates(env = process.env) {
     // turning it back on later looks like it silently failed.
     else if (off.has(m)) out[m] = { available: false, state: 'off', reason: 'Switched off by staff' };
     else if (!configured[m]) out[m] = { available: false, state: 'unconfigured', reason: missing[m] };
+    // A bridged method is ON, and says what it will ask the customer to send.
+    // The extra fields ride on the SAME `state:'on'` every other working method
+    // reports, so nothing that switches on the state string has to learn a new
+    // case — adding a status is how an exhaustive list quietly stops being one.
+    // Anything that wants to explain the conversion opts in by reading
+    // `settle_currency`, and everything else keeps treating this as "on".
+    else if (currencyBridged(m, currency)) {
+      out[m] = {
+        available: true,
+        state: 'on',
+        reason: null,
+        settle_currency: settlementCurrency(m, currency),
+        note: `${m === 'cashapp' ? 'Cash App' : m} cannot hold ${currency}, so the buyer is asked for the `
+          + `${settlementCurrency(m, currency)} equivalent, converted at the ECB rate and locked onto the order at checkout. `
+          + `The order is still priced and booked in ${currency}.`,
+      };
+    }
     else out[m] = { available: true, state: 'on', reason: null };
   }
   return out;
@@ -290,6 +357,6 @@ module.exports = {
   isPayableCashtag, isPayableEmail, payableMethods, addressProblems,
   disabledMethods, methodStates, toggleMethod, ALL_METHODS,
   normalisePaypalMe, paypalMeLink,
-  currencyUnsupported, METHOD_CURRENCIES,
+  currencyUnsupported, currencyBridged, settlementCurrency, METHOD_CURRENCIES,
   CASHTAG_RE, EMAIL_RE, PAYPALME_RE,
 };

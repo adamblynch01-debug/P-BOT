@@ -121,10 +121,16 @@ server.listen(0, '127.0.0.1', async () => {
     assert.strictEqual(r.status, 200);
     assert.strictEqual(r.body.payment_method_states.paypal.state, 'on');
     assert.strictEqual(r.body.payment_method_states.ltc.state, 'unconfigured');
-    // The third state. Cash App settles in USD or GBP and the shop prices in
-    // euro, so it is not off and not misconfigured — it is impossible, and the
-    // panel has to say so or staff go looking for a switch that would not help.
-    assert.strictEqual(r.body.payment_method_states.cashapp.state, 'currency');
+    // Cash App settles USD or GBP and the shop prices in euro. That used to
+    // make it a third state — not off, not misconfigured, impossible. It is
+    // bridged now (utils/fx.js): the order stays priced in euro and the buyer
+    // is asked for the dollar equivalent at a locked rate. So it reports the
+    // SAME 'on' every working method reports, and carries the extra field that
+    // says what it will actually collect. The panel reads that field to explain
+    // the conversion; everything that only switches on the state string needed
+    // no new case, which is the reason it is not a fourth status.
+    assert.strictEqual(r.body.payment_method_states.cashapp.state, 'on');
+    assert.strictEqual(r.body.payment_method_states.cashapp.settle_currency, 'USD');
   });
 
   console.log('\nturning a method off');
@@ -146,9 +152,11 @@ server.listen(0, '127.0.0.1', async () => {
   check('the other methods are unaffected', () => {
     assert.strictEqual(r.body.payment_methods.btc, true);
     assert.strictEqual(r.body.payment_methods.ltc, false, 'ltc has no xpub here');
-    // Not 'unaffected by the switch' in the sense of 'true' — Cash App is shut
-    // by the shop currency, and closing PayPal must not change that either way.
-    assert.strictEqual(r.body.payment_methods.cashapp, false);
+    // A real control again: Cash App is payable on its own merits here, so
+    // closing PayPal leaving it true actually says something. While it was shut
+    // by the shop currency this assertion was false for its own reason and
+    // would have passed no matter what the switch did.
+    assert.strictEqual(r.body.payment_methods.cashapp, true);
   });
 
   // The public route is what the storefront and the Discord panel read.

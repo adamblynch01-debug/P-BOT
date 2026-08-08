@@ -83,19 +83,38 @@ check('EUR is not treated as a foreign currency, and USD and GBP are', () => {
   // symbol PayPal prints for a dollar receipt is shared with CAD, AUD, MXN and
   // SGD, so a store that stops rejecting "$" stops being able to tell a US
   // dollar receipt from four other currencies.
-  const { FOREIGN_CURRENCY } = require('./watchers/emailWatcher').__test__;
-  assert.ok(!FOREIGN_CURRENCY.test('You received 19,99 EUR'), 'EUR rejected as foreign');
-  assert.ok(FOREIGN_CURRENCY.test('You received $19.99 USD'), 'USD accepted as ours');
-  assert.ok(FOREIGN_CURRENCY.test('You received £19.99 GBP'), 'GBP accepted as ours');
+  //
+  // The list is no longer a constant: it is built from the currency the METHOD
+  // accepts, because Cash App settles in dollars while the shop prices in euro.
+  // Asserting against the builder rather than a snapshot is what keeps the
+  // derivation itself under test — a hardcoded list here would go on agreeing
+  // with itself after the real one was rewritten.
+  const { foreignPatterns } = require('./watchers/emailWatcher').__test__;
+  const pp = foreignPatterns('EUR');            // what PayPal collects
+  assert.ok(!pp.code.test('You received 19,99 EUR'), 'EUR rejected as foreign');
+  assert.ok(pp.code.test('You received $19.99 USD'), 'USD accepted as ours');
+  assert.ok(pp.code.test('You received £19.99 GBP'), 'GBP accepted as ours');
+  assert.ok(pp.symbol.test('You received $19.99'), 'a bare "$" accepted as ours');
+  assert.ok(!pp.symbol.test('You received €19.99'), '"€" rejected as foreign');
+
+  // And the same builder, asked the other question. If one edit could make both
+  // of these pass with USD acceptable, the guard would be a single global list
+  // again and PayPal would be taking dollars at par.
+  const ca = foreignPatterns('USD');            // what Cash App collects
+  assert.ok(!ca.code.test('You received 19.99 USD'), 'USD foreign to a USD account');
+  assert.ok(ca.code.test('You received 19,99 EUR'), 'EUR is not what Cash App holds');
 });
 
 check('a Cash App handle is a sigil, not a currency', () => {
   // "You received €19.99 to $ghoststore" — every Cash App receipt names a
   // cashtag, and a symbol scan that did not drop them would reject every Cash
   // App payment with a reason quoting a "$" the customer never sent.
+  // Named explicitly rather than left to the default, so this asserts something
+  // about PayPal rather than about whatever an omitted argument happens to
+  // resolve to today.
   const { foreignCurrencyReason } = require('./watchers/emailWatcher').__test__;
-  assert.strictEqual(foreignCurrencyReason('You received €19.99 to $ghoststore'), null);
-  assert.ok(foreignCurrencyReason('You received $19.99 to $ghoststore'),
+  assert.strictEqual(foreignCurrencyReason('You received €19.99 to $ghoststore', 'paypal'), null);
+  assert.ok(foreignCurrencyReason('You received $19.99 to $ghoststore', 'paypal'),
     'a real dollar amount alongside a cashtag must still be caught');
 });
 

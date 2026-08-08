@@ -131,11 +131,24 @@ const alerted = (kind) => ALERTS.some(a => a.kind === kind);
 const paypalBody = (amount, note) =>
   `Hello store@ghost.example,\n\nYou received €${amount} EUR\n\nNote from Buyer\n${note}\n\nThanks`;
 
+// In DOLLARS, because that is what a Cash App account holds. This fixture used
+// to write a euro figure, which was never a receipt Cash App could send — a
+// fixture arranged the way we wished the world were, quietly asserting that the
+// watcher handled a message that does not exist.
 const cashappBody = (amount, note) =>
-  `You received €${amount} to $ghoststore\n\nNote: ${note}\n`;
+  `You received $${amount} to $ghoststore\n\nNote: ${note}\n`;
 
 const ORDER = { id: 42, payment_note: 'ghostwave1234', payment_method: 'paypal', total_cents: 1999, email: 'buyer@x.test' };
-const CASH_ORDER = { ...ORDER, payment_method: 'cashapp' };
+// €19.99 at 1.08 → $21.59 (rounded UP, so we are never asking for a cent less
+// than the euro is worth). The rate is LOCKED onto the order at checkout, and
+// the watcher judges the payment against the figure the buyer was SHOWN — not
+// against whatever the ECB publishes at the moment the mail arrives.
+const CASH_QUOTE = {
+  cashtag: '$ghoststore', note: 'ghostwave1234', amount: 19.99,
+  settle_currency: 'USD', settle_amount: 21.59, settle_symbol: '$',
+  fx_rate: 1.08, fx_from: 'EUR', fx_source: 'ecb/frankfurter',
+};
+const CASH_ORDER = { ...ORDER, payment_method: 'cashapp', payment_info: CASH_QUOTE };
 
 (async () => {
   console.log('\n=== emailWatcher: sender verification ===');
@@ -356,32 +369,53 @@ const CASH_ORDER = { ...ORDER, payment_method: 'cashapp' };
   check('$19.99 MXN does not settle a €19.99 order', CONFIRMS.length === 0);
   check('foreign currency raises an alert', alerted('email_payment_foreign_currency'));
 
-  // ── The list is INVERTED, not edited ────────────────────────────────────────
+  // ── The list is INVERTED, not edited, and it is now PER METHOD ──────────────
   // This guard used to name EUR as hostile and let USD through, because the shop
-  // priced in dollars. The shop prices in euro now (utils/money.js), so those
-  // two checks below assert the exact opposite of what they asserted before —
-  // which is the point. A guard whose list was merely *extended* would have gone
-  // on accepting dollars, and a dollar receipt against a euro invoice is a real
-  // underpayment of the whole EUR/USD spread that auto-confirms as if it were
-  // exact.
-  check('USD is flagged', !!foreignCurrencyReason('You received $19.99 USD'));
-  check('CAD is flagged', !!foreignCurrencyReason('You received $19.99 CAD'));
-  check('the shop currency is NOT flagged', foreignCurrencyReason('You received €19.99 EUR') === null);
+  // priced in dollars. Then the shop moved to euro and the list flipped. Then
+  // Cash App came back settling in USD — and *that* is the change these checks
+  // exist to survive, because the obvious way to make Cash App work is to delete
+  // USD from a shared hostile list, which silently re-opens the hole for PayPal.
+  //
+  // So the list is derived from the currency the METHOD accepts, and the two
+  // methods are asserted to disagree. That disagreement is the property: no
+  // single edit can make dollars acceptable everywhere.
+  check('USD is flagged for PayPal, which collects euro',
+    !!foreignCurrencyReason('You received $19.99 USD', 'paypal'));
+  check('USD is NOT flagged for Cash App, which collects dollars',
+    foreignCurrencyReason('You received $19.99 USD', 'cashapp') === null);
+  check('CAD is flagged for PayPal', !!foreignCurrencyReason('You received $19.99 CAD', 'paypal'));
+  // The same "$" that Cash App is now allowed to write is still four other
+  // currencies at PayPal, and a dollar-shaped receipt for one of them must not
+  // ride in on Cash App's exemption either.
+  check('CAD is flagged for Cash App too, despite the shared "$"',
+    !!foreignCurrencyReason('You received $19.99 CAD', 'cashapp'));
+  check('the shop currency is NOT flagged for PayPal',
+    foreignCurrencyReason('You received €19.99 EUR', 'paypal') === null);
+  // …and the mirror image: euro is FOREIGN on a Cash App receipt. Cash App
+  // cannot hold euro at all, so a euro figure in one of its emails is a
+  // misparse, not a payment.
+  check('the shop currency IS flagged for Cash App, which cannot hold it',
+    !!foreignCurrencyReason('You received €19.99 EUR', 'cashapp'));
   // Every currency name is derived from the one in money.js, so a shop that
   // moves currency again cannot leave its own money on the hostile list.
   check('the flagged list never contains the shop currency',
-    foreignCurrencyReason('You received 19.99 ' + require('./utils/money').CURRENCY) === null);
+    foreignCurrencyReason('You received 19.99 ' + require('./utils/money').CURRENCY, 'paypal') === null);
 
   // ── and a SYMBOL with no ISO code is caught too ─────────────────────────────
   // PayPal writes "$1.10 USD" but Cash App writes only "$1.10". A guard that
-  // matched on three-letter codes alone would have read a dollar Cash App
-  // receipt as an unlabelled euro payment and settled it at par.
+  // matched on three-letter codes alone would have read a dollar PayPal receipt
+  // as an unlabelled euro payment and settled it at par.
   check('a bare foreign symbol is flagged even with no ISO code',
-    !!foreignCurrencyReason('You received $19.99 to $ghoststore'));
+    !!foreignCurrencyReason('You received $19.99 to $ghoststore', 'paypal'));
   check('the reason says which symbol it saw',
-    /\$/.test(foreignCurrencyReason('You received $19.99') || ''));
+    /\$/.test(foreignCurrencyReason('You received $19.99', 'paypal') || ''));
   check('a bare euro symbol is not flagged',
-    foreignCurrencyReason('You received €19.99 to $ghoststore') === null);
+    foreignCurrencyReason('You received €19.99 to $ghoststore', 'paypal') === null);
+  // The cashtag is stripped before the scan on BOTH sides. It mattered when the
+  // dollar was hostile; it still matters now that it isn't, because a euro
+  // amount sent to "$ghoststore" must not read as a dollar payment.
+  check('a cashtag is not read as a euro symbol on a Cash App receipt',
+    foreignCurrencyReason('You received $19.99 to $ghoststore', 'cashapp') === null);
 
   console.log('\n=== message-level idempotency ===');
 
@@ -493,7 +527,13 @@ const CASH_ORDER = { ...ORDER, payment_method: 'cashapp' };
   check('$0.01 against a $19.99 order is rejected', CONFIRMS.length === 0);
   check('underpaid order is flagged for review', UPDATES.length === 1);
   check('underpaid raises an alert', alerted('order_underpaid'));
-  check('underpaid records the native unit', /amount_received_unit = 'eur'/.test(UPDATES[0].sql));
+  // The unit is a bound parameter now rather than a literal in the SQL, because
+  // a Cash App order records dollars. Reading it out of the params is the same
+  // assertion against the value that actually reaches Postgres.
+  check('underpaid records the native unit', UPDATES[0].params.includes('eur'));
+  // And the euro column stays in euro. This order was never bridged, so the
+  // received figure passes through unconverted — 0.01 → 1 cent.
+  check('the euro column is written in euro', UPDATES[0].params[0] === 1);
 
   // 31. The old +/-$1.00 window let $19.00 through on a $19.99 order.
   reset([ORDER]);
@@ -521,8 +561,11 @@ const CASH_ORDER = { ...ORDER, payment_method: 'cashapp' };
   // checks wrote its own /you received \$(...)/ and would have gone on passing
   // after the real patterns moved to the euro — a green test proving nothing
   // about the code that reads a real receipt.
-  const PP = watcher.__test__.AMOUNT_PATTERNS.paypal;
-  const CA = watcher.__test__.AMOUNT_PATTERNS.cashapp;
+  // They are built per method now rather than looked up, because the shape of an
+  // amount depends on the currency the method settles in — Cash App's "$19.99"
+  // and PayPal's "€19.99" are both correct, for different methods.
+  const PP = watcher.__test__.amountPatterns('paypal');
+  const CA = watcher.__test__.amountPatterns('cashapp');
 
   // 34. Thousands separators. `.replace(/,/)` without the global flag stripped
   //     only the first, so "€1,234,567.89" parsed as 1234.
@@ -547,8 +590,15 @@ const CASH_ORDER = { ...ORDER, payment_method: 'cashapp' };
 
   // Both shapes a provider might use — symbol in front, or ISO code behind.
   check('the ISO-code-after form parses too', parseAmount('You received 19,99 EUR', PP) === 19.99);
+  // Cash App's patterns are built around the dollar, because that is what a
+  // Cash App account holds. Both of these are the same assertion from opposite
+  // sides: the patterns are the METHOD's, not the shop's.
   check('a Cash App body parses on its own patterns',
-    parseAmount('You received €19.99 to $ghoststore', CA) === 19.99);
+    parseAmount('You received $19.99 to $ghoststore', CA) === 19.99);
+  check('the ISO-code-after form works for Cash App too',
+    parseAmount('You received 19.99 USD', CA) === 19.99);
+  check('a euro figure is not read off a Cash App receipt',
+    parseAmount('You received €19.99 to $ghoststore', CA) === null);
 
   // 35. A payer controls their display name and the memo, so a free-floating
   //     figure must not outrank the provider's own receipt wording.
@@ -573,12 +623,39 @@ const CASH_ORDER = { ...ORDER, payment_method: 'cashapp' };
   }));
   check('note sprayed in the body without the "Note from" marker is ignored', CONFIRMS.length === 0);
 
-  // 38. Cash App happy path.
+  // 38. Cash App happy path — the buyer sends the DOLLAR figure they were shown.
+  reset([CASH_ORDER]);
+  await processEmail(email({
+    auth: gmailAuth('cash.app'), subject: 'payment', text: cashappBody('21.59', 'ghostwave1234'),
+  }));
+  check('Cash App exact payment confirms', CONFIRMS.length === 1);
+
+  // 38b. The euro total is NOT what the buyer owes on this method, and paying it
+  //      is a $1.60 shortfall. If the watcher compared against total_cents it
+  //      would settle this as exact and the order would be short every time.
   reset([CASH_ORDER]);
   await processEmail(email({
     auth: gmailAuth('cash.app'), subject: 'payment', text: cashappBody('19.99', 'ghostwave1234'),
   }));
-  check('Cash App exact payment confirms', CONFIRMS.length === 1);
+  check('paying the euro figure in dollars does not settle a bridged order', CONFIRMS.length === 0);
+  check('and it is recorded as underpaid, not ignored', alerted('order_underpaid'));
+  // The euro column stays in euro: $19.99 back through the locked 1.08 is
+  // €18.50. Writing 1999 there would read as an exact payment in every report
+  // ever run afterwards, and nothing downstream could notice it was dollars.
+  check('the euro column is converted back at the LOCKED rate',
+    UPDATES[0].params[0] === Math.round((19.99 / 1.08) * 100));
+  check('and the native unit says which currency actually arrived',
+    UPDATES[0].params.includes('usd'));
+
+  // 38c. Fail closed. A Cash App order with no locked quote cannot be judged at
+  //      all — we do not know what the buyer was asked for. Re-deriving a rate
+  //      here would settle it against a number nobody ever saw.
+  reset([{ ...CASH_ORDER, payment_info: null }]);
+  await processEmail(email({
+    auth: gmailAuth('cash.app'), subject: 'payment', text: cashappBody('21.59', 'ghostwave1234'),
+  }));
+  check('a bridged order with no locked quote does NOT confirm', CONFIRMS.length === 0);
+  check('and it pages a human rather than failing silently', alerted('email_payment_no_quote'));
 
   // 39. Cash App underpay.
   reset([CASH_ORDER]);

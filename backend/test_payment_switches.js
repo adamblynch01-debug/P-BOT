@@ -35,13 +35,15 @@ const LIVE = {
 };
 const env = (over) => Object.assign({}, LIVE, over || {});
 
-// ── Cash App is no longer one of the four ────────────────────────────────────
-// The shop prices in euro (utils/money.js) and Cash App settles in USD or GBP
-// only, so it is unavailable for a reason no switch and no address can change.
-// Every check below that used to use Cash App as its "untouched control" now
-// uses one that is genuinely untouchable, because a control that is false for
-// its OWN reason proves nothing about the switch under test.
-const PAYABLE_HERE = { cashapp: false, paypal: true, btc: true, ltc: true };
+// ── Cash App is one of the four again ────────────────────────────────────────
+// It was briefly not. The shop prices in euro and Cash App settles USD or GBP
+// only, which made it unavailable for a reason no switch and no address could
+// change. The bridge (utils/fx.js) is the way around that: the order stays
+// priced in euro and the buyer is asked for the dollar equivalent at a rate
+// locked onto the order. So it is payable here, and it is back to being a
+// legitimate control for the checks below — a control that is false for its own
+// unrelated reason proves nothing about the switch under test.
+const PAYABLE_HERE = { cashapp: true, paypal: true, btc: true, ltc: true };
 const allBut = (...off) => {
   const m = Object.assign({}, PAYABLE_HERE);
   for (const k of off) m[k] = false;
@@ -116,16 +118,33 @@ check('a placeholder address is unconfigured, not off', () => {
 // the others because it is the one nobody can act on: flipping the toggle will
 // not help and fixing the address will not help, and a panel that offered
 // either as the remedy would be sending staff to do something that cannot work.
+//
+// No method this shop has can reach it now that the euro/dollar gap is bridged,
+// so it is driven through methodStates' currency parameter. Exercising it
+// matters more than it looks: an unreachable branch is one nobody notices has
+// rotted, and this is the branch a shop priced outside the ECB's published set
+// would depend on entirely.
 check('a method that cannot take the shop currency reports state "currency"', () => {
-  const s = P.methodStates(env()).cashapp;
+  const s = P.methodStates(env(), 'XBT').cashapp;
   assert.strictEqual(s.available, false);
   assert.strictEqual(s.state, 'currency');
-  assert.match(s.reason, /EUR/);
+  assert.match(s.reason, /XBT/);
 });
 
 check('currency beats both off and unconfigured', () => {
-  const s = P.methodStates(env({ PAYMENT_METHODS_OFF: 'cashapp', CASHAPP_CASHTAG: ' your $cashtag' })).cashapp;
+  const s = P.methodStates(
+    env({ PAYMENT_METHODS_OFF: 'cashapp', CASHAPP_CASHTAG: ' your $cashtag' }), 'XBT').cashapp;
   assert.strictEqual(s.state, 'currency', 'staff would be sent to fix a cashtag that is not the problem');
+});
+
+// …and the ordinary case, which is what the shop actually runs: bridged, on,
+// and saying what it will collect. This is the check that would have caught the
+// bridge silently reverting to the dead state.
+check('a bridged method is ON and names its settlement currency', () => {
+  const s = P.methodStates(env()).cashapp;
+  assert.strictEqual(s.available, true);
+  assert.strictEqual(s.state, 'on', 'a bridged method must report the SAME state as every other working one');
+  assert.strictEqual(s.settle_currency, 'USD');
 });
 
 // If both are true, "off" must win. Reporting the address fault instead would

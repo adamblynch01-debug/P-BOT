@@ -19,7 +19,9 @@ const {
   normalizeCode, previewCoupon, reserveCoupon, attachRedemptionOrder, releaseCoupon, publicView,
 } = require('../utils/coupons');
 // A payment method whose address cannot be paid must not take an order.
-const { isPayableCashtag, isPayableEmail, methodStates, paypalMeLink } = require('../utils/paymentAddress');
+const { isPayableCashtag, isPayableEmail, methodStates, paypalMeLink,
+        currencyBridged, settlementCurrency } = require('../utils/paymentAddress');
+const { quoteSettlement } = require('../utils/fx');
 
 const GUILD_ID = process.env.GUILD_ID;
 
@@ -303,6 +305,32 @@ async function createOrderPriced({ items, email, discord_id, payment_method, web
 
   const total = totalCents / 100;
 
+  // ─── The settlement quote, fetched BEFORE the row exists ───────────────────
+  //
+  // Cash App cannot hold euro, so a euro-priced order is quoted to the buyer in
+  // dollars at the ECB rate and that rate is locked onto the order — the number
+  // on the screen is the number the email watcher judges the payment against.
+  // See utils/fx.js for why it is locked rather than re-derived on the way in.
+  //
+  // Deliberately ahead of the INSERT. Every other quote in this function
+  // (crypto) happens after, and can afford to: a missing crypto rate leaves a
+  // payable address on a payable order and only costs us the AUTO-confirm. A
+  // missing FX rate is different in kind — without it there is no amount to put
+  // on the pay screen at all, so continuing would write an order whose only
+  // possible pay screen is a blank one. Asking first means the customer gets a
+  // 503 and another method, instead of an order to abandon.
+  let settleQuote = null;
+  if (currencyBridged(payment_method)) {
+    settleQuote = await quoteSettlement(total, settlementCurrency(payment_method));
+    if (!settleQuote) {
+      const label = METHOD_LABEL[payment_method] || payment_method;
+      console.error(`[Orders] refused a ${label} order — no ${settlementCurrency(payment_method)} rate available`);
+      const err = new Error(`${label} is not available right now. Please choose another payment method.`);
+      err.statusCode = 503;
+      throw err;
+    }
+  }
+
   // The payment note is drawn from a 5.76M-value space and constrained by the
   // partial unique index uniq_orders_open_note (one open order per note). A
   // collision is rare but not impossible, and the crypto-address path already
@@ -393,7 +421,18 @@ async function createOrderPriced({ items, email, discord_id, payment_method, web
     // No placeholder fallback. The guard at the top of this function means we
     // cannot get here without a real cashtag, and a fallback would be a second
     // way to put an unpayable address on a pay screen.
-    payment_info = { cashtag: String(process.env.CASHAPP_CASHTAG).trim(), note: order.payment_note, amount: total };
+    // `amount` stays the EURO total, in every method's payment_info, because it
+    // is what the order costs and what the books say. The settlement fields are
+    // additive and only appear when the method could not carry the shop's
+    // currency — so a pay screen that ignores them shows a correct price in the
+    // wrong currency, rather than a wrong price. That is the safe direction for
+    // a hand-uploaded page that may be a version behind the backend.
+    payment_info = {
+      cashtag: String(process.env.CASHAPP_CASHTAG).trim(),
+      note: order.payment_note,
+      amount: total,
+      ...(settleQuote || {}),
+    };
   } else if (payment_method === 'paypal') {
     // `pay_link` is the ONLY thing a PayPal QR may encode, and it is null
     // unless PAYPAL_ME holds a real handle. The pay screen used to build its
@@ -1244,14 +1283,16 @@ function nativeToFiatCents(order, native, method) {
   if (native == null || !Number.isFinite(Number(native))) return { cents: null, unit: null };
   const value = Number(native);
 
+  // payment_info comes back as an object from a JSONB column but as a string
+  // from a TEXT one. Reading a rate off the string yields undefined, which
+  // fails closed but silently throws away a figure we could have derived.
+  let parsed = order.payment_info;
+  if (typeof parsed === 'string') {
+    try { parsed = JSON.parse(parsed); } catch { parsed = null; }
+  }
+
   if (method === 'btc' || method === 'ltc') {
-    // payment_info comes back as an object from a JSONB column but as a string
-    // from a TEXT one. Reading the rate off the string yields undefined, which
-    // fails closed but silently throws away a figure we could have derived.
-    let info = order.payment_info;
-    if (typeof info === 'string') {
-      try { info = JSON.parse(info); } catch { info = null; }
-    }
+    const info = parsed;
     // `rate_usd` is what orders quoted before the euro switch carry, and an
     // order in flight at deploy time still has to settle. It is read SECOND and
     // is not treated as a euro rate — the order was quoted in dollars, the
@@ -1266,6 +1307,31 @@ function nativeToFiatCents(order, native, method) {
     if (!Number.isFinite(rate) || rate <= 0) return { cents: null, unit: 'sats' };
     return { cents: Math.round((value / 1e8) * rate * 100), unit: 'sats' };
   }
+
+  // ─── The method could not carry euro, so it was quoted in something else ───
+  //
+  // Cash App settles USD. The order is still PRICED in euro — total_cents, the
+  // receipt, the books — but the buyer was shown a dollar figure and sent
+  // dollars, so `native` here is dollars. Multiplying it by 100 into
+  // amount_received_cents would be a units error of exactly the kind this
+  // function exists to stop, and a quiet one: $21.61 filed as €21.61 turns a
+  // correct payment into a permanent €1.62 overpayment in every report that
+  // reads the column.
+  //
+  // Converted back at the rate LOCKED on the order, not today's — that rate is
+  // what the customer was quoted at, so it is the only one under which their
+  // payment is exactly right.
+  const settle = parsed && parsed.settle_currency;
+  if (settle && String(settle).toUpperCase() !== CURRENCY) {
+    const rate = Number(parsed.fx_rate);
+    // No usable locked rate means no defensible euro figure. Record the native
+    // amount and its unit, leave cents null rather than inventing a number a
+    // reconciliation would trust. Same failure shape as a crypto order with no
+    // locked quote, one branch up.
+    if (!Number.isFinite(rate) || rate <= 0) return { cents: null, unit: String(settle).toLowerCase() };
+    return { cents: Math.round((value / rate) * 100), unit: String(settle).toLowerCase() };
+  }
+
   return { cents: Math.round(value * 100), unit: CURRENCY.toLowerCase() };
 }
 

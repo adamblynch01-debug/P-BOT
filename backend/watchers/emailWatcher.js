@@ -5,6 +5,17 @@ const { query } = require('../db');
 const { raiseAlert } = require('../utils/alerts');
 const { inboundAccounts } = require('../utils/mailAccounts');
 const { CURRENCY, SYMBOL, money, moneyCents, parseMoneyText, FOREIGN_SYMBOLS } = require('../utils/money');
+const { settlementCurrency, currencyBridged } = require('../utils/paymentAddress');
+const { settleSymbol, backToShopCurrency } = require('../utils/fx');
+
+// Printing an amount in a currency this shop does not price in. money() is the
+// SHOP's formatter and knows one symbol, correctly — but a Cash App receipt is
+// in dollars, and an alert reading "expected €21.61, received €21.61" about a
+// payment that was neither is worse than no alert: it sends whoever reads it
+// looking for a rounding bug that does not exist.
+const inCurrency = (amount, currency) =>
+  (currency === CURRENCY ? SYMBOL : (settleSymbol(currency) || currency + ' '))
+  + (Number(amount) || 0).toFixed(2);
 
 const GUILD_ID = process.env.GUILD_ID;
 
@@ -510,41 +521,80 @@ function nonFinalReason(email, text) {
   return hit ? `matched non-final pattern ${hit}` : null;
 }
 
-// EUR only. This list used to be the same rule pointed the other way — it named
-// every currency EXCEPT the dollar, and EUR was on it. That was right while the
-// shop priced in dollars: PayPal renders CAD, AUD, MXN and SGD with the same
-// "$", so "sent you $19.99 MXN" (about one US dollar) settled a $19.99 invoice
-// at face value until this check existed.
+// ─── "Foreign" is relative to what THIS METHOD was told to collect ───────────
 //
-// The shop now prices in euro (utils/money.js), so the rule INVERTS rather than
-// relaxes. Deleting EUR from the old list and stopping there would have been the
-// expensive half-fix: it re-opens the exact hole this was built to close, and it
-// re-opens it against the dollar, which is the one currency whose receipts we
-// know how to parse and whose symbol PayPal shares with four others.
+// This guard exists because PayPal renders CAD, AUD, MXN and SGD with the same
+// "$": "sent you $19.99 MXN" is about one US dollar, and it settled a $19.99
+// invoice at face value until something checked. It was a hardcoded list of
+// every currency except the shop's, rewritten once when the shop moved to euro.
 //
-// So USD is now on the list, and every symbol that is not "€" counts too. The
-// amount patterns below already require a euro figure, but a receipt reading
-// "You received €0.00 ... $19.99 USD" would satisfy both, and the symbol check
-// is what stops it.
+// A hardcoded list cannot survive what came next. Cash App cannot hold euro, so
+// a euro order paid by Cash App is quoted and paid in DOLLARS (utils/fx.js) —
+// and USD is the single most important entry on the reject list. The accepted
+// currency is now a property of the METHOD, not of the shop, so the list has to
+// be derived from it rather than typed out.
+//
+// Deriving it is also the only way this stays safe. The tempting fix was to
+// delete USD from the list so Cash App receipts get through, which re-opens the
+// hole against the four currencies that share the dollar sign — the exact bug
+// this was built for. Inverted, the same edit is impossible: naming USD as
+// accepted for Cash App leaves MXN, CAD, AUD and SGD on the reject list
+// automatically, and drops EUR onto it, which is right — a euro figure in a
+// Cash App receipt means something has gone wrong upstream, not that we got
+// lucky.
 //
 // Scoped to the status text for the same reason as the non-final patterns: a
-// currency-conversion footnote, or a localized footer mentioning USD, must not
-// reject a payment that really was in euro.
-const FOREIGN_CURRENCY = /\b(?:USD|CAD|AUD|NZD|MXN|SGD|HKD|GBP|JPY|CHF|SEK|NOK|DKK|PLN|BRL|ILS|PHP|TWD|THB|CZK|HUF|RUB|INR|CNY|ZAR)\b/;
+// currency-conversion footnote, or a localized footer, must not reject a
+// payment that really was in the currency we asked for.
+const KNOWN_CURRENCIES = ['EUR', 'USD', 'CAD', 'AUD', 'NZD', 'MXN', 'SGD', 'HKD', 'GBP',
+  'JPY', 'CHF', 'SEK', 'NOK', 'DKK', 'PLN', 'BRL', 'ILS', 'PHP', 'TWD', 'THB',
+  'CZK', 'HUF', 'RUB', 'INR', 'CNY', 'ZAR'];
+
+// Every symbol we can recognise, keyed by the currency it belongs to. money.js
+// owns FOREIGN_SYMBOLS as a flat "not ours" set, which was right while there was
+// one accepted currency; this table is the same information with the ownership
+// kept, so the set can be rebuilt around whichever currency is accepted here.
+const CURRENCY_SYMBOLS = { EUR: '€', USD: '$', GBP: '£', JPY: '¥', INR: '₹', RUB: '₽', KRW: '₩' };
+
+const foreignCache = new Map();
+function foreignPatterns(accepted) {
+  if (foreignCache.has(accepted)) return foreignCache.get(accepted);
+  const codes = KNOWN_CURRENCIES.filter(c => c !== accepted);
+  const symbols = Object.keys(CURRENCY_SYMBOLS)
+    .filter(c => c !== accepted)
+    .map(c => CURRENCY_SYMBOLS[c])
+    .join('');
+  const built = {
+    code: new RegExp(`\\b(?:${codes.join('|')})\\b`),
+    symbol: new RegExp(`[${symbols}]`),
+  };
+  foreignCache.set(accepted, built);
+  return built;
+}
 
 // A "$" in front of a LETTER is a Cash App handle, not a price. Every Cash App
-// receipt names one — "You received €19.99 to $ghoststore" — so a symbol scan
-// that did not drop them would reject every Cash App payment as a dollar one,
-// with a reason quoting a "$" the customer never sent. Same trap as
-// paymentAddress.js's CASHTAG_RE, one file over: the sigil is not the currency.
+// receipt names one — "You received $19.99 to $ghoststore" — so a symbol scan
+// that did not drop them would read the handle as a currency, with a reason
+// quoting a sigil the customer never sent. Same trap as paymentAddress.js's
+// CASHTAG_RE, one file over: the sigil is not the currency. It still has to be
+// stripped now that dollars ARE accepted on this path — otherwise "$ghoststore"
+// reads as a dollar AMOUNT to anything scanning for one.
 const CASHTAG_TOKEN = /\$[A-Za-z_][A-Za-z0-9_]*/g;
 
-function foreignCurrencyReason(text) {
+// The currency a receipt for this method must be written in. Not the shop's
+// currency — the one the pay screen actually asked the buyer to send.
+const acceptedCurrency = (method) => settlementCurrency(method);
+
+function foreignCurrencyReason(text, method) {
+  const accepted = acceptedCurrency(method);
+  const pat = foreignPatterns(accepted);
   const status = statusPortion(text).replace(CASHTAG_TOKEN, '');
-  const m = status.match(FOREIGN_CURRENCY);
-  if (m) return `amount appears to be in ${m[0]}, not ${CURRENCY}`;
-  const sym = status.match(FOREIGN_SYMBOLS);
-  return sym ? `amount is written in "${sym[0]}", not ${SYMBOL}` : null;
+  const m = status.match(pat.code);
+  if (m) return `amount appears to be in ${m[0]}, not ${accepted}`;
+  const sym = status.match(pat.symbol);
+  return sym
+    ? `amount is written in "${sym[0]}", not ${CURRENCY_SYMBOLS[accepted] || accepted}`
+    : null;
 }
 
 // A message must be considered at most once. Claimed by INSERT before any
@@ -654,7 +704,7 @@ async function processEmail(email, account) {
     // Marketing mail has neither, so this cannot become noise.
     if (Number.isFinite(signals.amount) && signals.note) {
       await raiseAlert('email_payment_identity_refused',
-        `A verified ${method} payment of ${money(signals.amount)} quoting note "${signals.note}" was REFUSED because ${recipient.reason}. `
+        `A verified ${method} payment of ${inCurrency(signals.amount, acceptedCurrency(method))} quoting note "${signals.note}" was REFUSED because ${recipient.reason}. `
         + (method === 'paypal'
           ? 'PayPal receipts identify the recipient by full name, not by email address — set PAYPAL_MERCHANT_NAME to the name on the PayPal account.'
           : 'Set CASHAPP_CASHTAG (and optionally CASHAPP_DISPLAY_NAME) to the account the money was sent to.'),
@@ -673,13 +723,14 @@ async function processEmail(email, account) {
     return;
   }
 
-  const foreign = foreignCurrencyReason(text);
+  const foreign = foreignCurrencyReason(text, method);
   if (foreign) {
     console.warn(`[EmailWatcher] Ignored "${subject}" — ${foreign}`);
     await releaseClaim(claim.messageId);
     await raiseAlert('email_payment_foreign_currency',
-      `A ${method} payment arrived in a non-${CURRENCY} currency and needs manual handling: "${subject}"`,
-      { severity: 'warn', context: { method, reason: foreign } }).catch(() => {});
+      `A ${method} payment arrived in a currency other than the ${acceptedCurrency(method)} it was quoted in, `
+      + `and needs manual handling: "${subject}"`,
+      { severity: 'warn', context: { method, accepted: acceptedCurrency(method), reason: foreign } }).catch(() => {});
     return;
   }
 
@@ -711,23 +762,47 @@ function parseAmount(text, patterns) {
 // Only ever an INBOUND receipt. "You sent a €34.50 EUR payment" is a payment we
 // made and must not match, which is why there is no bare /€([\d.,]+)/ here.
 //
-// Two shapes per wording, because PayPal puts the euro sign in front for some
+// Two shapes per wording, because a provider puts the sign in front for some
 // locales and the ISO code behind for others — "€19.99" and "19,99 EUR" are the
 // same receipt seen from Dublin and from Berlin. Matching only the first would
 // have half of Europe's payments land in the no-amount-parsed branch, which
 // refuses to confirm and pages a human: safe, but it is an outage.
+//
+// Built from the method's ACCEPTED currency rather than the shop's, for the same
+// reason the foreign-currency guard is: a Cash App receipt is in dollars because
+// that is what the pay screen asked for, and a euro-only pattern would fail to
+// read an amount out of every correct Cash App payment we ever take. The two
+// have to agree — a receipt the guard lets through and the parser cannot read is
+// an order that waits for a human, which is the outage-shaped failure.
 const AMT = '([\\d.,]+)';
-const EUR_BEFORE = `€\\s*${AMT}`;
-const EUR_AFTER = `${AMT}\\s*EUR\\b`;
-const receivedIn = (lead) => [
-  new RegExp(`${lead}\\s*${EUR_BEFORE}`, 'i'),
-  new RegExp(`${lead}\\s*${EUR_AFTER}`, 'i'),
-];
-const AMOUNT_PATTERNS = {
-  cashapp: [...receivedIn('you received'), ...receivedIn('\\bpaid you')],
-  paypal: [...receivedIn('you received'), ...receivedIn('sent you'),
-           ...receivedIn('\\bamount received[:\\s]+')],
+const escapeRe = (s) => String(s).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+const receivedIn = (lead, code, symbol) => {
+  const out = [new RegExp(`${lead}\\s*${AMT}\\s*${code}\\b`, 'i')];
+  // A currency we have no symbol for is quoted by its code alone, which is what
+  // every provider does in that case anyway. Interpolating an empty string here
+  // would build `/lead\s*\s*([\d.,]+)/` — a pattern that matches a bare number
+  // in any currency at all, and it would sit at the FRONT of the list where it
+  // wins. Guarding it is the difference between "we cannot read this receipt"
+  // and "we read the wrong number confidently".
+  if (symbol) out.unshift(new RegExp(`${lead}\\s*${escapeRe(symbol)}\\s*${AMT}`, 'i'));
+  return out;
 };
+
+const LEADS = {
+  cashapp: ['you received', '\\bpaid you'],
+  paypal: ['you received', 'sent you', '\\bamount received[:\\s]+'],
+};
+
+const patternCache = new Map();
+function amountPatterns(method) {
+  const accepted = acceptedCurrency(method);
+  const key = `${method}|${accepted}`;
+  if (patternCache.has(key)) return patternCache.get(key);
+  const symbol = CURRENCY_SYMBOLS[accepted] || '';
+  const built = (LEADS[method] || []).flatMap(lead => receivedIn(lead, accepted, symbol));
+  patternCache.set(key, built);
+  return built;
+}
 
 // The note is a single word: letters then the 4-digit suffix generateNote adds.
 function parseNote(method, text) {
@@ -762,7 +837,7 @@ function parseNote(method, text) {
 // email that happens to greet the account holder by name.
 function paymentSignals(method, text) {
   return {
-    amount: parseAmount(text, AMOUNT_PATTERNS[method] || []),
+    amount: parseAmount(text, amountPatterns(method)),
     note: parseNote(method, text),
   };
 }
@@ -790,16 +865,62 @@ async function handleProviderEmail(method, email, text, messageId, signals) {
       // A verified provider email we could not read is how format drift shows
       // up. Silence here means a paying customer waits forever.
       await raiseAlert('email_unparseable',
-        `A verified ${label} email states an amount of ${money(amount)} but no note could be read — check for a format change: "${email.subject || ''}"`,
+        `A verified ${label} email states an amount of ${inCurrency(amount, acceptedCurrency(method))} but no note could be read — check for a format change: "${email.subject || ''}"`,
         { severity: 'warn', context: { method, amount } }).catch(() => {});
       return;
     }
 
-    console.log(`[EmailWatcher] ${label} — amount: ${money(amount)}, note: ${note}`);
+    console.log(`[EmailWatcher] ${label} — amount: ${inCurrency(amount, acceptedCurrency(method))}, note: ${note}`);
     await matchAndConfirmOrder(note, amount, method, messageId);
   } catch (err) {
     console.error(`[EmailWatcher] ${label} parse error:`, err.message);
   }
+}
+
+// ─── What was this customer actually told to send? ───────────────────────────
+//
+// For PayPal it is the euro total and always has been. For a method that cannot
+// hold euro it is the dollar figure LOCKED onto the order at checkout
+// (utils/fx.js), and comparing dollars against `total_cents / 100` would read
+// every correct Cash App payment as a ~9% OVERpayment — a case this watcher
+// does not reject, so it would confirm them all while filing an overpaid alert
+// on each. Wrong in the direction that costs money and still looks like it
+// worked, which is the worst combination available.
+//
+// Pulled out of matchAndConfirmOrder so it can be tested without a database.
+// The comparison is the part that decides whether money was paid; everything
+// around it is queries and alerts, and a rule that can only be exercised by
+// standing up Postgres is a rule that gets exercised once.
+//
+// `refuse` is the fail-closed case: a method that should carry a locked quote
+// and does not. Not the same as `locked: null`, which is the ordinary
+// same-currency path.
+function expectedPayment(order, method) {
+  let info = order.payment_info;
+  if (typeof info === 'string') {
+    try { info = JSON.parse(info); } catch { info = null; }
+  }
+  const settleCcy = info && info.settle_currency && String(info.settle_currency).toUpperCase();
+  const settleAmt = info ? Number(info.settle_amount) : NaN;
+  const settleRate = info ? Number(info.fx_rate) : NaN;
+  // Every field is checked, not just the currency name. A half-written quote —
+  // a currency with no amount, an amount with no rate — cannot judge a payment
+  // and must not be treated as though it can.
+  const locked = (settleCcy && settleCcy !== CURRENCY
+                  && Number.isFinite(settleAmt) && settleAmt > 0
+                  && Number.isFinite(settleRate) && settleRate > 0)
+    ? { currency: settleCcy, amount: settleAmt, rate: settleRate }
+    : null;
+
+  if (currencyBridged(method) && !locked) {
+    return { locked: null, refuse: true, currency: acceptedCurrency(method), total: null };
+  }
+  return {
+    locked,
+    refuse: false,
+    currency: locked ? locked.currency : CURRENCY,
+    total: locked ? locked.amount : Number(order.total_cents) / 100,
+  };
 }
 
 async function matchAndConfirmOrder(note, amount, method, messageId) {
@@ -835,7 +956,11 @@ async function matchAndConfirmOrder(note, amount, method, messageId) {
       let late = null;
       try {
         const { rows: hist } = await query(
-          `SELECT id, invoice_no, status, total_cents, expires_at FROM orders
+          // payment_info comes along because a bridged order's locked rate is
+          // the only thing that turns the figure on a Cash App receipt into a
+          // euro number this shop can file. Without it the write below records
+          // dollars in a euro column.
+          `SELECT id, invoice_no, status, total_cents, expires_at, payment_info FROM orders
             WHERE guild_id = $1 AND payment_note = $2 AND payment_method = $3
             ORDER BY created_at DESC LIMIT 1`,
           [GUILD_ID, note, method]
@@ -857,28 +982,50 @@ async function matchAndConfirmOrder(note, amount, method, messageId) {
         late ? late.id : null);
 
       if (unpaidAndClosed) {
+        let lateInfo = late.payment_info;
+        if (typeof lateInfo === 'string') { try { lateInfo = JSON.parse(lateInfo); } catch { lateInfo = null; } }
+        const lateRate = lateInfo && String(lateInfo.settle_currency || '').toUpperCase() !== CURRENCY
+          ? Number(lateInfo.fx_rate) : null;
+        const lateEur = Number.isFinite(lateRate) && lateRate > 0
+          ? backToShopCurrency(amount, lateRate) : amount;
         await query(
           `UPDATE orders SET status = 'expired_paid', amount_received_cents = $1
             WHERE id = $2 AND guild_id = $3 AND status IN ('waiting','expired')`,
-          [Math.round(amount * 100), late.id, GUILD_ID]
+          [Math.round(lateEur * 100), late.id, GUILD_ID]
         ).catch(() => {});
       }
 
       await raiseAlert('email_payment_unmatched',
         late
-          ? `A verified ${method} payment of ${money(amount)} quoted note "${note}", which belongs to order ` +
+          ? `A verified ${method} payment of ${inCurrency(amount, acceptedCurrency(method))} quoted note "${note}", which belongs to order ` +
             `${late.invoice_no || '#' + late.id} — status '${late.status}', deadline ${late.expires_at}, ` +
             `total ${moneyCents(late.total_cents)}. ` +
             (unpaidAndClosed
               ? 'The amount has been recorded and the order flagged expired_paid; confirm it with /order forceconfirm if the payment is good.'
               : 'No change made — check whether it was already settled.')
-          : `A verified ${method} payment of ${money(amount)} quoted note "${note}" but no order has ever used that note`,
+          : `A verified ${method} payment of ${inCurrency(amount, acceptedCurrency(method))} quoted note "${note}" but no order has ever used that note`,
         { severity: 'error', order_id: late ? late.id : undefined,
           context: { method, note, amount, matched_status: late ? late.status : null } }).catch(() => {});
       return;
     }
 
-    const total = order.total_cents / 100;
+    const { locked, refuse, currency: payCurrency, total } = expectedPayment(order, method);
+    const shown = (v) => inCurrency(v, payCurrency);
+
+    // Fail CLOSED on a bridged method with no locked quote — the same rule
+    // verifyCryptoPayment applies to a crypto order that lost its quote. The
+    // amount in hand is in one currency and the total is in another, and with
+    // no rate to join them there is no comparison to make. Guessing that they
+    // are the same unit is precisely the overpayment bug above.
+    if (refuse) {
+      console.warn(`[EmailWatcher] Order ${order.id} NOT confirmed — no locked ${acceptedCurrency(method)} quote on the order`);
+      await recordOutcome(messageId, 'rejected: no locked settlement quote', order.id);
+      await raiseAlert('email_payment_no_quote',
+        `Order ${order.id} matched a ${method} email but carries no locked ${acceptedCurrency(method)} quote, `
+        + `so the payment cannot be checked against what the buyer was shown — needs manual review`,
+        { severity: 'error', order_id: order.id, context: { method, note } }).catch(() => {});
+      return;
+    }
 
     // An unparseable amount used to fall straight through this check (`amount`
     // was null, so the guard was skipped and the order confirmed), which made
@@ -904,26 +1051,35 @@ async function matchAndConfirmOrder(note, amount, method, messageId) {
     const tolerance = parseFloat(
       process.env.EMAIL_UNDERPAY_TOLERANCE || process.env.EMAIL_UNDERPAY_TOLERANCE_USD || '0.01');
     if (amount + tolerance < total) {
-      console.warn(`[EmailWatcher] Order ${order.id} underpaid — expected ${money(total)}, got ${money(amount)}`);
+      console.warn(`[EmailWatcher] Order ${order.id} underpaid — expected ${shown(total)}, got ${shown(amount)}`);
+      // The native figure and its unit are what arrived; the cents column is
+      // the shop's currency, converted at the order's own locked rate. Writing
+      // dollars into a euro column is the units error utils/fx.js's
+      // backToShopCurrency exists to prevent — see nativeToFiatCents in
+      // routes/orders.js, which does the same job on the confirmed path.
+      const eurCents = locked
+        ? Math.round(backToShopCurrency(amount, locked.rate) * 100)
+        : Math.round(amount * 100);
       await query(
         `UPDATE orders SET status = 'underpaid', amount_received_cents = $1,
-                amount_received_native = $2, amount_received_unit = 'eur'
-          WHERE id = $3 AND status = 'waiting'`,
-        [Math.round(amount * 100), amount, order.id]
+                amount_received_native = $2, amount_received_unit = $3
+          WHERE id = $4 AND status = 'waiting'`,
+        [eurCents, amount, payCurrency.toLowerCase(), order.id]
       ).catch(() => {});
       await recordOutcome(messageId, 'underpaid', order.id);
       // An underpaid order is a customer who needs help or someone probing —
       // either way it sat in the database with nobody informed.
       await raiseAlert('order_underpaid',
-        `Order ${order.id} underpaid via ${method}: expected ${money(total)}, received ${money(amount)}`,
-        { severity: 'error', order_id: order.id, context: { method, expected: total, received: amount, email: order.email } }).catch(() => {});
+        `Order ${order.id} underpaid via ${method}: expected ${shown(total)}, received ${shown(amount)}`
+        + (locked ? ` (order is priced ${moneyCents(order.total_cents)}, quoted in ${payCurrency} at ${locked.rate})` : ''),
+        { severity: 'error', order_id: order.id, context: { method, expected: total, received: amount, currency: payCurrency, email: order.email } }).catch(() => {});
       return;
     }
     if (amount > total) {
-      console.warn(`[EmailWatcher] Order ${order.id} overpaid — expected ${money(total)}, got ${money(amount)}`);
+      console.warn(`[EmailWatcher] Order ${order.id} overpaid — expected ${shown(total)}, got ${shown(amount)}`);
       await raiseAlert('order_overpaid',
-        `Order ${order.id} overpaid via ${method}: expected ${money(total)}, received ${money(amount)} — refund the difference`,
-        { severity: 'warn', order_id: order.id, context: { method, expected: total, received: amount } }).catch(() => {});
+        `Order ${order.id} overpaid via ${method}: expected ${shown(total)}, received ${shown(amount)} — refund the difference`,
+        { severity: 'warn', order_id: order.id, context: { method, expected: total, received: amount, currency: payCurrency } }).catch(() => {});
     }
 
     await axios.post(`http://localhost:${process.env.PORT || 3000}/api/orders/confirm`, {
@@ -937,7 +1093,8 @@ async function matchAndConfirmOrder(note, amount, method, messageId) {
     });
 
     await recordOutcome(messageId, 'confirmed', order.id);
-    console.log(`[EmailWatcher] Order ${order.id} confirmed via ${method} — ${money(amount)}`);
+    console.log(`[EmailWatcher] Order ${order.id} confirmed via ${method} — ${shown(amount)}`
+      + (locked ? ` (${moneyCents(order.total_cents)} at ${locked.rate} ${CURRENCY}/${payCurrency})` : ''));
   } catch (err) {
     console.error('[EmailWatcher] Match/confirm error:', err.message);
     await raiseAlert('email_confirm_failed',
@@ -983,9 +1140,15 @@ module.exports.__test__ = {
   // Exported so the tests read the SHIPPED patterns. A test that typed its own
   // `/you received \$(...)/` was testing a copy — and that copy went on passing
   // through the euro switch while the real ones were being rewritten.
-  AMOUNT_PATTERNS,
-  // The guard is defined by what it EXCLUDES, so the list itself is the thing
-  // worth asserting on: dropping EUR from it and stopping there re-opens the
-  // hole against the dollar.
-  FOREIGN_CURRENCY,
+  //
+  // Both are now BUILDERS rather than constants, because what counts as foreign
+  // and what shape an amount takes are both properties of the method's accepted
+  // currency now that one method settles in dollars. Same reason to export
+  // them: a test that rebuilt the derivation by hand would agree with itself
+  // forever.
+  amountPatterns, foreignPatterns, acceptedCurrency,
+  KNOWN_CURRENCIES, CURRENCY_SYMBOLS,
+  // The comparison that decides whether a payment was enough, without a
+  // database in the way.
+  expectedPayment,
 };

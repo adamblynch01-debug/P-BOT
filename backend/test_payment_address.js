@@ -64,37 +64,54 @@ check('payableMethods turns Cash App off for the live value', () => {
   assert.deepStrictEqual(m, { cashapp: false, paypal: true, btc: true, ltc: false });
 });
 
-// Was "and back on the moment a real one is set", and it asserted true. The
-// shop prices in euro now and Cash App settles in USD or GBP only, so a real
-// cashtag no longer brings it back — nothing does, short of the shop changing
-// currency. The check is kept rather than deleted because the two halves it
-// asserts are still the interesting ones, and they have come APART: the address
-// is now fine and the method is still unavailable.
-check('a real cashtag is accepted as an address, but euro still keeps Cash App shut', () => {
+// This check has now been rewritten twice, and the history is the point.
+// Originally: "back on the moment a real cashtag is set" — true. Then the shop
+// moved to euro, Cash App settles USD/GBP only, and it became "a real cashtag
+// no longer brings it back — nothing does". Now there is a bridge: the order is
+// priced in euro and the buyer is asked for the dollar equivalent at a locked
+// rate, so a real cashtag DOES bring it back, and the two halves that came
+// apart have gone back together for a different reason than the first time.
+check('a real cashtag brings Cash App back, on the dollar bridge', () => {
   assert.strictEqual(P.isPayableCashtag('$uhservices'), true, 'a valid cashtag stopped parsing');
   const m = P.payableMethods({ CASHAPP_CASHTAG: '$uhservices' });
-  assert.strictEqual(m.cashapp, false, 'Cash App was offered for a euro-priced shop');
+  assert.strictEqual(m.cashapp, true, 'a configured, unswitched-off Cash App was not offered');
 });
 
-check('and it is the CURRENCY that shuts it, not the address and not the off-switch', () => {
-  // The distinction the panel prints. "Fix the cashtag" and "flip the toggle"
-  // are both wrong advice here, and a state of 'off' or 'unconfigured' would
-  // have sent staff to do one of them.
+check('the raw currency fact is unchanged — only the workaround is new', () => {
+  // currencyUnsupported was NOT relaxed to make this work. It still says what
+  // is true of the method; currencyBridged is a separate question about whether
+  // we have a way around it. Collapsing the two would leave the pay screen with
+  // no reason to tell the buyer they are sending dollars.
+  assert.strictEqual(P.currencyUnsupported('cashapp'), true);
+  assert.strictEqual(P.currencyBridged('cashapp'), true);
   const s = P.methodStates({ CASHAPP_CASHTAG: '$uhservices', PAYPAL_EMAIL: 'a@b.co' });
-  assert.strictEqual(s.cashapp.state, 'currency', JSON.stringify(s.cashapp));
-  assert.ok(/EUR/.test(s.cashapp.reason), 'the reason does not name the shop currency: ' + s.cashapp.reason);
-  assert.ok(/USD|GBP/.test(s.cashapp.reason), 'the reason does not say what it CAN take: ' + s.cashapp.reason);
-  // And the methods that can take any currency are untouched by all this.
+  assert.strictEqual(s.cashapp.state, 'on', JSON.stringify(s.cashapp));
+  assert.strictEqual(s.cashapp.settle_currency, 'USD');
+  assert.ok(/EUR/.test(s.cashapp.note), 'the note does not name the shop currency: ' + s.cashapp.note);
+  assert.ok(/USD/.test(s.cashapp.note), 'the note does not say what it will collect: ' + s.cashapp.note);
+  // And the methods that can take any currency are untouched by all this — no
+  // note, because there is nothing to explain.
   assert.strictEqual(s.paypal.state, 'on');
+  assert.strictEqual(s.paypal.settle_currency, undefined);
 });
 
 check('currency, off and unconfigured are three states, reported in that order', () => {
-  // Cash App switched off AND currency-blocked reports the currency, because
-  // that is the one an operator cannot act on. Getting this backwards would
-  // offer a toggle that changes nothing visible.
-  const s = P.methodStates({ CASHAPP_CASHTAG: '$uhservices', PAYMENT_METHODS_OFF: 'cashapp,paypal', PAYPAL_EMAIL: 'a@b.co' });
-  assert.strictEqual(s.cashapp.state, 'currency');
+  // The `currency` state is unreachable for every method this shop has, now
+  // that the dollar gap is bridged. It is exercised through the currency
+  // parameter rather than deleted: a shop priced in something the ECB does not
+  // publish gets it back, and it is the one state an operator cannot act on —
+  // flipping the toggle will not help and fixing the cashtag will not help.
+  const s = P.methodStates(
+    { CASHAPP_CASHTAG: '$uhservices', PAYMENT_METHODS_OFF: 'cashapp,paypal', PAYPAL_EMAIL: 'a@b.co' },
+    'XBT');
+  assert.strictEqual(s.cashapp.state, 'currency', JSON.stringify(s.cashapp));
+  assert.ok(/XBT/.test(s.cashapp.reason), 'the reason does not name the shop currency: ' + s.cashapp.reason);
+  assert.ok(/USD|GBP/.test(s.cashapp.reason), 'the reason does not say what it CAN take: ' + s.cashapp.reason);
   assert.strictEqual(s.paypal.state, 'off', 'a deliberately-closed method must not read as broken');
+  // Unactionable outranks the off-switch, and the off-switch outranks the
+  // bridge. Cash App here is BOTH switched off and unquotable, and reports the
+  // one nobody can do anything about.
+  assert.strictEqual(P.payableMethods({ CASHAPP_CASHTAG: '$uhservices' }, 'XBT').cashapp, false);
 });
 
 check('a currency block is a property of the METHOD, not a hardcoded Cash App rule', () => {
