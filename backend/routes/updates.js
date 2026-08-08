@@ -14,7 +14,12 @@ const GUILD_ID = process.env.GUILD_ID;
 
 // Valid update types — the storefront picks an emoji per type, so an unknown
 // type falls back to a generic icon rather than erroring.
-const VALID_TYPES = ['restock', 'new', 'maintenance', 'fix', 'announcement', 'removal', 'other'];
+// Includes every key from SUPERBOT's UPDATE_TYPES so /postupdate never 400s.
+const VALID_TYPES = [
+  'restock','new','maintenance','fix','announcement','removal','other',
+  'status_change','update','patch','undetected','detected','disabled','enabled',
+  'new_product','sale','bug_fix','time_extension','new_feature',
+];
 const PAGE_SIZE   = 50;
 
 // ─── GET /api/updates ────────────────────────────────────────────────────────

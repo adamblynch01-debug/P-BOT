@@ -98,6 +98,14 @@ const exec = async (text, params) => {
     const n = stockRows.filter(s => !s.used && s.tier_id === Number(params[1])).length;
     return { rows: [{ n }] };
   }
+  // anyLinkTierIds: all tiers with ANY link row regardless of enabled or key
+  if (/SELECT DISTINCT tier_id FROM supplier_links/.test(t)) {
+    const ids = params[1].map(Number);
+    const seen = new Set();
+    return { rows: links.filter(l =>
+      l.guild_id === params[0] && ids.includes(l.tier_id) && !seen.has(l.tier_id) && seen.add(l.tier_id)
+    ).map(l => ({ tier_id: l.tier_id })) };
+  }
   return { rows: [] };
 };
 
@@ -254,7 +262,7 @@ const BLOCK = (() => {
   return html.slice(a, end + 2);
 })();
 
-let lastReply = { stock: { 404: 2 }, supplier: [401] };
+let lastReply = { stock: { 404: 2 }, supplier: [401], supplierMapped: [401, 402, 403] };
 // A fresh page, as far as this block is concerned: new window, nothing
 // hydrated. Used again at the end, because "does a first load survive an older
 // backend" is a different question from "does a repaint survive one".
@@ -318,8 +326,8 @@ await checkAsync('the admin PRODUCT KEYS tab knows the empty pool is deliberate'
   // product as out, and the "out of stock" filter serves it up — three separate
   // invitations to go and load keys that will never be handed out.
   assert.strictEqual(
-    sandbox.invGroupSupplierTiers({ tiers: [{ key: 'h8ed|day' }, { key: 'h8ed|week' }] }), 1,
-    'the panel cannot tell which of a product\'s tiers are bought upstream');
+    sandbox.invGroupSupplierTiers({ tiers: [{ key: 'h8ed|day' }, { key: 'h8ed|week' }] }), 2,
+    'the panel cannot tell which of a product\'s tiers are bought upstream (any link row counts, not just live ones)');
   assert.strictEqual(sandbox.invGroupSupplierTiers({ tiers: [{ key: 'other|day' }] }), 0,
     'an ordinary product was claimed by the supplier path');
 });
