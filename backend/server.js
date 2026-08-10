@@ -157,7 +157,7 @@ app.use('/api/unsplash', require('./routes/unsplash'));
 app.use('/api/supplier', require('./routes/supplier'));
 
 // ─── Health ─────────────────────────────────────────────
-app.get('/health', (req, res) => res.json({ status: 'ok', store: process.env.STORE_NAME || 'H8ED Shop' }));
+app.get('/health', (req, res) => res.json({ status: 'ok', store: process.env.STORE_NAME || 'ONTOP Shop' }));
 
 // ─── 404 ────────────────────────────────────────────────
 // Without this Express answers an unknown /api path with its HTML default
@@ -200,7 +200,7 @@ if (require.main !== module) return;
 const PORT = process.env.PORT || 3000;
 require('./routes/config').loadConfigFromDB().finally(() => {
   const server = app.listen(PORT, () => {
-    console.log(`[H8ED] Backend running on port ${PORT}`);
+    console.log(`[ONTOP] Backend running on port ${PORT}`);
     require('./watchers/emailWatcher').start();
     require('./watchers/cryptoWatcher').start();
     // Closes orders nobody paid for. Both watchers above already refuse to
@@ -217,14 +217,14 @@ require('./routes/config').loadConfigFromDB().finally(() => {
   const shutdown = (signal) => {
     if (shuttingDown) return;
     shuttingDown = true;
-    console.log(`[H8ED] ${signal} received — finishing in-flight requests…`);
+    console.log(`[ONTOP] ${signal} received — finishing in-flight requests…`);
     server.close(() => {
-      console.log('[H8ED] Closed cleanly.');
+      console.log('[ONTOP] Closed cleanly.');
       process.exit(0);
     });
     // Don't hang forever on a stuck connection.
     setTimeout(() => {
-      console.warn('[H8ED] Forcing exit after shutdown timeout.');
+      console.warn('[ONTOP] Forcing exit after shutdown timeout.');
       process.exit(0);
     }, 15000).unref();
   };

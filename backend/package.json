@@ -1,7 +1,7 @@
 {
-  "name": "h8ed-shop-backend",
+  "name": "ontop-shop-backend",
   "version": "1.0.0",
-  "description": "H8ED Shop Payment Backend API",
+  "description": "ONTOP Shop Payment Backend API",
   "main": "server.js",
   "scripts": {
     "start": "node server.js",

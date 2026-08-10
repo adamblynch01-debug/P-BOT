@@ -1,4 +1,4 @@
-# H8ED Shop — Payment System
+# ONTOP Shop — Payment System
 
 Full payment automation: website checkout → bot confirms → auto-delivers goods.
 
@@ -71,10 +71,10 @@ Update `BACKEND_URL` in `checkout.js` to your Railway backend URL.
 
 To open checkout from your buy button:
 ```javascript
-window._h8edCart = [
+window._ontopCart = [
   { id: 'product-uuid', name: 'Product Name', price: 10.00, qty: 1 }
 ];
-H8EDCheckout.open(window._h8edCart);
+H8EDCheckout.open(window._ontopCart);
 ```
 
 ---

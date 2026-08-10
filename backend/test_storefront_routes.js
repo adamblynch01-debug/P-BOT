@@ -1,6 +1,6 @@
 // Clean URLs and per-product deep links on the storefront.
 //
-// Round 29 item 3: clicking "H8ED Private External (BO7)" in the footer "bugs
+// Round 29 item 3: clicking "ONTOP Private External (BO7)" in the footer "bugs
 // out instead of showing actual product". Two separate faults sat behind that
 // one sentence and this file guards both, because neither can be seen from the
 // backend and the storefront has no build step:
@@ -18,7 +18,7 @@
 //   2. THE LINK OPENED THE GAME, NOT THE PRODUCT. Now every product has
 //      /p/<slug>. The slug is derived from the product NAME at runtime, so the
 //      hand-written footer hrefs are the one place it can drift — and the
-//      labels are not the names ("H8ED Mobile (BO7)" is really "H8ED MOBILE"
+//      labels are not the names ("ONTOP Mobile (BO7)" is really "ONTOP MOBILE"
 //      in the tab "BO7"). The last check resolves the footer hrefs against the
 //      LIVE catalog, so a rename breaks the test instead of the link.
 //
@@ -102,9 +102,9 @@ function footerLinks() {
   console.log('\n── slugs ──');
 
   await check('gxSlug is stable, lowercase and punctuation-free', () => {
-    assert.strictEqual(gxSlug('H8ED Private External'), 'h8ed-private-external');
-    assert.strictEqual(gxSlug('H8ED MOBILE'), 'h8ed-mobile');
-    assert.strictEqual(gxSlug('H8ED RANK TEMPORARY SPOOFER'), 'h8ed-rank-temporary-spoofer');
+    assert.strictEqual(gxSlug('ONTOP Private External'), 'ontop-private-external');
+    assert.strictEqual(gxSlug('ONTOP MOBILE'), 'ontop-mobile');
+    assert.strictEqual(gxSlug('ONTOP RANK TEMPORARY SPOOFER'), 'ontop-rank-temporary-spoofer');
     assert.strictEqual(gxSlug('VERSE — PERMANENT SPOOFER'), 'verse-permanent-spoofer',
       'the em dash is not an ascii hyphen and must not survive into a URL');
     assert.strictEqual(gxSlug('Dark & Darker'), 'dark-and-darker',
@@ -182,7 +182,7 @@ function footerLinks() {
     for (const s of linked) {
       assert.ok(known.has(s),
         `the footer links /p/${s} and no live product slugs to that — the label is not ` +
-        `the name (e.g. "H8ED Mobile (BO7)" is really "H8ED MOBILE" on the BO7 tab)`);
+        `the name (e.g. "ONTOP Mobile (BO7)" is really "ONTOP MOBILE" on the BO7 tab)`);
     }
   });
 

@@ -103,11 +103,11 @@ function fromHeader(storeName) {
 const { money } = require('./money');
 
 // One place for the customer-facing name, and one fallback. It used to default
-// to 'Ghost Store' here while /health and routes/config.js defaulted to 'H8ED
+// to 'Ghost Store' here while /health and routes/config.js defaulted to 'ONTOP
 // Shop', so an unset STORE_NAME would have made the store call itself two
 // different things depending on which file answered.
 function storeName_() {
-  return process.env.STORE_NAME || 'H8ED Shop';
+  return process.env.STORE_NAME || 'ONTOP Shop';
 }
 
 // A delivered line, with the term and count it was bought under. The heading

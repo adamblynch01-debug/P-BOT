@@ -1,4 +1,4 @@
-// ─── H8ED Shop Checkout Integration ─────────────────────
+// ─── ONTOP Shop Checkout Integration ─────────────────────
 // Drop this script into your existing website
 // Set BACKEND_URL to your Railway backend URL
 
@@ -166,7 +166,7 @@ async function renderPaymentPage(container, orderData) {
   const createdDate = new Date();
 
   container.innerHTML = `
-    <div class="h8ed-payment-page">
+    <div class="ontop-payment-page">
       ${paymentHTML}
       <div class="waiting-indicator">
         <span class="dot"></span> Waiting for payment. This page updates automatically.
@@ -213,7 +213,7 @@ async function openCheckout(cart) {
   const config = await loadStoreConfig();
 
   const modal = document.createElement('div');
-  modal.id = 'h8ed-checkout-modal';
+  modal.id = 'ontop-checkout-modal';
   modal.innerHTML = `
     <div class="checkout-overlay" onclick="closeCheckout()"></div>
     <div class="checkout-modal">
@@ -263,7 +263,7 @@ async function openCheckout(cart) {
 
         <label class="tos-check">
           <input type="checkbox" id="checkout-tos">
-          I have read and agree to H8ED's Terms of Service.
+          I have read and agree to ONTOP's Terms of Service.
         </label>
 
         <button class="proceed-btn" onclick="proceedToPayment()">Proceed to Payment →</button>
@@ -297,7 +297,7 @@ async function proceedToPayment() {
   errorEl.textContent = '';
 
   try {
-    const cart = window._h8edCart || [];
+    const cart = window._ontopCart || [];
     const orderData = await createOrder(cart, email, discordId, paymentMethod);
 
     document.getElementById('checkout-step-1').style.display = 'none';
@@ -313,16 +313,16 @@ async function proceedToPayment() {
 }
 
 function closeCheckout() {
-  document.getElementById('h8ed-checkout-modal')?.remove();
+  document.getElementById('ontop-checkout-modal')?.remove();
 }
 
 // ─── Inject Styles ───────────────────────────────────────
 function injectCheckoutStyles() {
-  if (document.getElementById('h8ed-checkout-styles')) return;
+  if (document.getElementById('ontop-checkout-styles')) return;
   const style = document.createElement('style');
-  style.id = 'h8ed-checkout-styles';
+  style.id = 'ontop-checkout-styles';
   style.textContent = `
-    #h8ed-checkout-modal { position:fixed; inset:0; z-index:9999; display:flex; align-items:center; justify-content:center; }
+    #ontop-checkout-modal { position:fixed; inset:0; z-index:9999; display:flex; align-items:center; justify-content:center; }
     .checkout-overlay { position:absolute; inset:0; background:rgba(0,0,0,0.85); }
     .checkout-modal { position:relative; background:#111; color:#fff; border-radius:12px; padding:24px; width:90%; max-width:480px; max-height:90vh; overflow-y:auto; z-index:1; }
     .close-btn { position:absolute; top:12px; right:16px; background:none; border:none; color:#fff; font-size:20px; cursor:pointer; }
@@ -345,7 +345,7 @@ function injectCheckoutStyles() {
     .proceed-btn:disabled { opacity:0.6; cursor:not-allowed; }
     .error-msg { color:#ff4444; font-size:13px; margin-top:8px; text-align:center; }
     /* Payment page styles */
-    .h8ed-payment-page { padding:8px; }
+    .ontop-payment-page { padding:8px; }
     .payment-logo { display:flex; align-items:center; gap:10px; padding:12px; background:#1a1a1a; border-radius:8px; margin-bottom:16px; }
     .payment-amount { margin-left:auto; font-size:20px; font-weight:bold; }
     .qr-code { display:block; margin:16px auto; border-radius:8px; background:#fff; padding:8px; }

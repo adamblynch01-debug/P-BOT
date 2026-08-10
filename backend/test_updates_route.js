@@ -127,7 +127,7 @@ async function main() {
     store.length = 0; nextId = 1;
     const res = makeRes();
     await postRoot(makeReq({ body: { secret: 'test-secret-abc', update_type: 'restock',
-      product_name: 'H8ED V2', title: 'Back in stock', notes: '50 keys' } }), res);
+      product_name: 'ONTOP V2', title: 'Back in stock', notes: '50 keys' } }), res);
     assert.strictEqual(res._status, 200, JSON.stringify(res._body));
     assert.ok(res._body.success); assert.ok(res._body.id); assert.ok(res._body.posted_at);
     assert.strictEqual(store.length, 1); assert.strictEqual(store[0].title, 'Back in stock');

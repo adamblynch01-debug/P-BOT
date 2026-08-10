@@ -195,7 +195,7 @@ const invoices = r => (r.body.orders || []).map(o => o.invoice_no).sort();
   });
 
   insertedManual = null;
-  await manual({ discord_id: '111', product_name: 'H8ED Private External', keys: ['KEY-1'] });
+  await manual({ discord_id: '111', product_name: 'ONTOP Private External', keys: ['KEY-1'] });
   await check('a verified Discord link attaches the order to that account', () => {
     assert.ok(insertedManual, 'no order was inserted');
     assert.strictEqual(String(insertedManual.web_user_id), '7');
@@ -203,7 +203,7 @@ const invoices = r => (r.body.orders || []).map(o => o.invoice_no).sort();
 
   insertedManual = null;
   await manual({ discord_id: '222', email: 'vexy@example.com',
-                 product_name: 'H8ED Private External', keys: ['KEY-2'] });
+                 product_name: 'ONTOP Private External', keys: ['KEY-2'] });
   await check('an UNVERIFIED link falls back to the address staff typed', () => {
     // This is the orphan case. Before, the Discord lookup failed, nothing else
     // was tried, and the row went in with web_user_id NULL — delivered, and
@@ -213,14 +213,14 @@ const invoices = r => (r.body.orders || []).map(o => o.invoice_no).sort();
   });
 
   insertedManual = null;
-  await manual({ email: 'quiet@example.com', product_name: 'H8ED Private External', keys: ['KEY-3'] });
+  await manual({ email: 'quiet@example.com', product_name: 'ONTOP Private External', keys: ['KEY-3'] });
   await check('an account with no Discord at all is still found by email', () => {
     assert.ok(insertedManual, 'no order was inserted');
     assert.strictEqual(String(insertedManual.web_user_id), '11');
   });
 
   insertedManual = null;
-  await manual({ email: 'nobody@example.com', product_name: 'H8ED Private External', keys: ['KEY-4'] });
+  await manual({ email: 'nobody@example.com', product_name: 'ONTOP Private External', keys: ['KEY-4'] });
   await check('an address nobody holds links to nobody, rather than guessing', () => {
     assert.ok(insertedManual, 'no order was inserted');
     assert.strictEqual(insertedManual.web_user_id, null);

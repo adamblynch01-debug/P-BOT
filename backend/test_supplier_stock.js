@@ -1,6 +1,6 @@
 // "Is this sellable?" for a tier we do not hold a single key for.
 //
-// The bug this pins: mapping H8ED V2 EXTERNAL to AimBetter made all four of its
+// The bug this pins: mapping ONTOP V2 EXTERNAL to AimBetter made all four of its
 // price buttons read SOLD OUT and disabled them. Nothing was broken — the
 // product had zero rows in product_stock and always would, because every sale
 // buys a key upstream at the moment of sale. The stock badge was answering a
@@ -64,7 +64,7 @@ function reset() {
     { id: 4, guild_id: 'test-guild', tier_id: 405, supplier: 'notasupplier', enabled: true },
   ];
   // 401 is the interesting one: mapped upstream AND empty, exactly like the
-  // real H8ED V2 tiers. 404 holds keys so a non-supplier count still proves out.
+  // real ONTOP V2 tiers. 404 holds keys so a non-supplier count still proves out.
   stockRows = [{ tier_id: 404, used: false }, { tier_id: 404, used: false }];
   process.env.SUPPLIER_OFF = '';
 }
@@ -280,8 +280,8 @@ function makeSandbox() {
   const s = { window: {}, console, apiFetch: async () => lastReply, backendCatalog: {} };
   vm.createContext(s);
   vm.runInContext(BLOCK, s);
-  // The panel's inv-key → tier-id index, faked. 'h8ed|day' is the mapped tier.
-  s.backendTierIdForInvKey = (k) => ({ 'h8ed|day': 401, 'h8ed|week': 402, 'other|day': 404 }[k] ?? null);
+  // The panel's inv-key → tier-id index, faked. 'ontop|day' is the mapped tier.
+  s.backendTierIdForInvKey = (k) => ({ 'ontop|day': 401, 'ontop|week': 402, 'other|day': 404 }[k] ?? null);
   vm.runInContext(GROUP_FN, s);
   return s;
 }
@@ -326,7 +326,7 @@ await checkAsync('the admin PRODUCT KEYS tab knows the empty pool is deliberate'
   // product as out, and the "out of stock" filter serves it up — three separate
   // invitations to go and load keys that will never be handed out.
   assert.strictEqual(
-    sandbox.invGroupSupplierTiers({ tiers: [{ key: 'h8ed|day' }, { key: 'h8ed|week' }] }), 2,
+    sandbox.invGroupSupplierTiers({ tiers: [{ key: 'ontop|day' }, { key: 'ontop|week' }] }), 2,
     'the panel cannot tell which of a product\'s tiers are bought upstream (any link row counts, not just live ones)');
   assert.strictEqual(sandbox.invGroupSupplierTiers({ tiers: [{ key: 'other|day' }] }), 0,
     'an ordinary product was claimed by the supplier path');

@@ -64,7 +64,7 @@ async function logStockChange({ tierId, action, before, after, source, actor }) 
 // has no number to report — their panel exposes no stock endpoint, only a
 // purchase. Counting its (always zero) product_stock rows badged a live
 // product SOLD OUT and disabled its buy button, which is what happened to
-// H8ED V2 EXTERNAL the moment it was mapped to AimBetter.
+// ONTOP V2 EXTERNAL the moment it was mapped to AimBetter.
 router.get('/bulk', async (req, res) => {
   try {
     const ids = String(req.query.ids || '')

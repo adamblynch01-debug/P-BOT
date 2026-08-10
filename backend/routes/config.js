@@ -38,7 +38,7 @@ const ENV_ONLY_KEYS = ['PANEL_PASSWORD', 'VAULT_PASSWORD', 'ORDER_LOG_CHANNEL_ID
 
 router.get('/', (req, res) => {
   res.json({
-    store_name: process.env.STORE_NAME || 'H8ED Shop',
+    store_name: process.env.STORE_NAME || 'ONTOP Shop',
     // Served as null when it is not an address, so no caller can print it as
     // one. Production had " your $cashtag" here and the storefront was
     // publishing it. See utils/paymentAddress.js.

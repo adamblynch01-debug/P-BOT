@@ -1,6 +1,6 @@
 // Hiding a product must not be a one-way door.
 //
-// The bug this pins: "ACCIDENTLY REMOVED H8ED PRIVATE EXTERNAL, WAS TRYING TO
+// The bug this pins: "ACCIDENTLY REMOVED ONTOP PRIVATE EXTERNAL, WAS TRYING TO
 // HIDE IT." Nothing had been removed. The row, its three tiers and its 300 keys
 // were all still in the database with `hidden = true`. What had gone was the
 // CARD — and with it the 👁 Show button, which is the only way back.
@@ -96,7 +96,7 @@ vm.runInContext(lift('function invCatalog('), sandbox);
 function adminRows() {
   return [
     { id: 900, name: 'VISIBLE PRODUCT', game_name: 'Call of Duty: Warzone', hidden: false, tiers: [] },
-    { id: 179, name: 'H8ED Private External', game_name: 'Call of Duty: Warzone', hidden: true,
+    { id: 179, name: 'ONTOP Private External', game_name: 'Call of Duty: Warzone', hidden: true,
       status: 'updating', specs: 'STEAM / BATTLE.NET / XBOX', spoofer: false, sections: [{ title: 'ESP', features: ['Box'] }],
       tiers: [
         { id: 408, label: 'Day', price_cents: 799, period: '24 hours' },
@@ -119,7 +119,7 @@ console.log('\nwithout the admin index, a hidden product is invisible (the bug)'
 
 check('the panel cannot see it from the catalog alone', () => {
   sandbox.window._gxAdminProductList = null;
-  assert.strictEqual(find('Call of Duty: Warzone', 'H8ED Private External'), undefined,
+  assert.strictEqual(find('Call of Duty: Warzone', 'ONTOP Private External'), undefined,
     'the fixture is wrong — the public catalog is not supposed to contain a hidden product');
   // The visible one still renders, so this is a fixture check, not a pass.
   assert.ok(find('Call of Duty: Warzone', 'VISIBLE PRODUCT'), 'the ordinary case is broken');
@@ -129,14 +129,14 @@ console.log('\nwith it, the card is back and can be un-hidden');
 
 check('a hidden product renders a card', () => {
   sandbox.window._gxAdminProductList = adminRows();
-  const c = find('Call of Duty: Warzone', 'H8ED Private External');
+  const c = find('Call of Duty: Warzone', 'ONTOP Private External');
   assert.ok(c, 'a hidden product still has no card — 👁 Show is unreachable and hiding is a one-way door');
   assert.strictEqual(c._productId, 179, 'the card carries no product id, so Show cannot address the row');
 });
 
 check('it carries its tiers, with tier ids', () => {
   sandbox.window._gxAdminProductList = adminRows();
-  const c = find('Call of Duty: Warzone', 'H8ED Private External');
+  const c = find('Call of Duty: Warzone', 'ONTOP Private External');
   assert.strictEqual(c.pricing.length, 3, 'the tiers were dropped');
   assert.deepStrictEqual(c.pricing.map(t => t.label), ['Day', '2 Weeks', 'Month']);
   // Without tierId a save deletes and recreates the tier — and takes its keys
@@ -148,7 +148,7 @@ check('it carries its tiers, with tier ids', () => {
 
 check('price_cents becomes a price, not a hundredfold number', () => {
   sandbox.window._gxAdminProductList = adminRows();
-  const c = find('Call of Duty: Warzone', 'H8ED Private External');
+  const c = find('Call of Duty: Warzone', 'ONTOP Private External');
   assert.deepStrictEqual(c.pricing.map(t => t.price), [7.99, 17.99, 49.99],
     'the panel would show 799 instead of 7.99 — and a save would write it back');
 });
@@ -183,7 +183,7 @@ check('a VISIBLE product missing from the catalog is not dragged in', () => {
 
 check('the injected card is marked as coming from the admin index', () => {
   sandbox.window._gxAdminProductList = adminRows();
-  assert.strictEqual(find('Call of Duty: Warzone', 'H8ED Private External')._hiddenOnly, true);
+  assert.strictEqual(find('Call of Duty: Warzone', 'ONTOP Private External')._hiddenOnly, true);
   assert.ok(!find('Call of Duty: Warzone', 'VISIBLE PRODUCT')._hiddenOnly,
     'a product that is in the catalog was labelled as hidden-only');
 });

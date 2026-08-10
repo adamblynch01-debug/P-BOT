@@ -89,12 +89,12 @@ const goodsHeading = (g) => emCtx.goodsHeading(g).replace(/<[^>]*>/g, '');
 const CASES = [
   {
     what: 'the ordinary case',
-    goods: { game: 'Call of Duty: Warzone', product: 'H8ED Private External', tier_label: '1 Month', qty: 1 },
+    goods: { game: 'Call of Duty: Warzone', product: 'ONTOP Private External', tier_label: '1 Month', qty: 1 },
     game: 'Call of Duty: Warzone',
   },
   {
     what: 'a game whose name is already inside the product name is not repeated',
-    goods: { game: 'HWID Spoofer', product: 'H8ED PERMANENT SPOOFER', tier_label: 'Lifetime', qty: 1 },
+    goods: { game: 'HWID Spoofer', product: 'ONTOP PERMANENT SPOOFER', tier_label: 'Lifetime', qty: 1 },
     // "Spoofer" alone is not the whole game name, so the guard does NOT fire —
     // the guard matches the FULL game name as a word run, not any word of it.
     game: 'HWID Spoofer',
@@ -111,7 +111,7 @@ const CASES = [
   },
   {
     what: 'an older payload with no game field at all still renders',
-    goods: { product: 'H8ED MOBILE' },
+    goods: { product: 'ONTOP MOBILE' },
     game: '',
   },
   {

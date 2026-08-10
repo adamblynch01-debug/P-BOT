@@ -1,6 +1,6 @@
 // A local flag must not outlive the thing it mirrors.
 //
-// The bug this pins, reported verbatim: "BLITZ AND H8ED PRIVATE EXTERNAL ARE
+// The bug this pins, reported verbatim: "BLITZ AND ONTOP PRIVATE EXTERNAL ARE
 // SHOWING IN WEBSITE ADMIN PANEL. BUT NOT IN THE ACTUAL WEBSITE."
 //
 // Neither product was hidden, deleted, out of stock or filtered by status.
@@ -80,12 +80,12 @@ function makeSandbox(stored, serverAnswered) {
 const COD = 'Call of Duty: Warzone';
 const CHEATS = [
   { name: 'BLITZ EXTERNAL' },
-  { name: 'H8ED Private External' },
+  { name: 'ONTOP Private External' },
   { name: 'Orion External Bo7' },
 ];
 const GHOSTS = {
   'Call of Duty: Warzone||BLITZ EXTERNAL': true,
-  'Call of Duty: Warzone||H8ED Private External': true,
+  'Call of Duty: Warzone||ONTOP Private External': true,
 };
 const names = list => list.map(c => c.name);
 
@@ -95,7 +95,7 @@ check('a stale local flag cannot hide a product the server is publishing', () =>
   const s = makeSandbox(GHOSTS, true);
   const shown = s.gxVisibleCheats(COD, CHEATS);
   assert.deepStrictEqual(names(shown),
-    ['BLITZ EXTERNAL', 'H8ED Private External', 'Orion External Bo7'],
+    ['BLITZ EXTERNAL', 'ONTOP Private External', 'Orion External Bo7'],
     'the storefront is still subtracting from the catalog the server filtered');
 });
 

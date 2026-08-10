@@ -1,4 +1,4 @@
--- ─── H8ED Shop Database Schema ────────────────────────────
+-- ─── ONTOP Shop Database Schema ────────────────────────────
 -- Run this in your Supabase SQL Editor
 
 -- Products table

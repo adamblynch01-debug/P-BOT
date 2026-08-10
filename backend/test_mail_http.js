@@ -236,13 +236,13 @@ async function run() {
   console.log('\n=== the store name the customer reads ===');
   {
     // The confirmation that prompted this carried THREE names: it came from
-    // "Ghost Store", called itself "H8ED SHOP" in the body, and was for a store
+    // "Ghost Store", called itself "ONTOP SHOP" in the body, and was for a store
     // the buyer knows on Discord as ONTOP. A From that disagrees with the
     // content reads as phishing to a person and as a spam signal to a filter.
     // utils/email.js used to default to 'Ghost Store' while /health and
-    // routes/config.js defaulted to 'H8ED Shop', so an unset STORE_NAME made
+    // routes/config.js defaulted to 'ONTOP Shop', so an unset STORE_NAME made
     // the answer depend on which file you asked.
-    setEnv({ RESEND_API_KEY: 'k', MAIL_FROM: 'H8ED Shop <no-reply@ontop.uhservices.xyz>' });
+    setEnv({ RESEND_API_KEY: 'k', MAIL_FROM: 'ONTOP Shop <no-reply@ontop.uhservices.xyz>' });
     // setEnv only clears the mail variables; the point of this block is what
     // happens with NO store name configured at all.
     delete process.env.STORE_NAME;
@@ -251,11 +251,11 @@ async function run() {
     const { sendOrderConfirmation } = require(path.join(BACKEND, 'utils', 'email.js'));
     await checkAsync('with STORE_NAME unset, the body name matches /health\'s fallback', async () => {
       await sendOrderConfirmation({ id: 'o9', email: 'b@x.c', total_cents: 100, payment_method: 'balance' }, []);
-      assert.ok(LAST.body.html.includes('H8ED SHOP'), 'header carries the shared fallback');
+      assert.ok(LAST.body.html.includes('ONTOP SHOP'), 'header carries the shared fallback');
       assert.ok(!/Ghost Store/.test(LAST.body.html), 'the old second default is gone');
     });
     check('and the From the customer sees is the same name', () =>
-      assert.strictEqual(LAST.body.from, 'H8ED Shop <no-reply@ontop.uhservices.xyz>'));
+      assert.strictEqual(LAST.body.from, 'ONTOP Shop <no-reply@ontop.uhservices.xyz>'));
   }
 
   console.log('\n=== what the receipt actually tells the customer ===');
@@ -264,7 +264,7 @@ async function run() {
     // of five bare product names. No duration, no quantity, no unit price, no
     // date, and an order id of "#10" that says how many orders the shop has
     // ever taken.
-    setEnv({ RESEND_API_KEY: 'k', MAIL_FROM: 'H8ED Shop <user@example.com>' });
+    setEnv({ RESEND_API_KEY: 'k', MAIL_FROM: 'ONTOP Shop <user@example.com>' });
     process.env.DISCORD_INVITE_URL = 'https://discord.gg/example';
     const m = fresh();
     redirect(m, 'resend', base);
