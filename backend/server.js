@@ -155,6 +155,7 @@ app.use('/api/coupons', require('./routes/coupons'));
 app.use('/api/game-tiles', require('./routes/gameTiles'));
 app.use('/api/unsplash', require('./routes/unsplash'));
 app.use('/api/supplier', require('./routes/supplier'));
+app.use('/api/vault', require('./routes/vault'));
 
 // ─── Health ─────────────────────────────────────────────
 app.get('/health', (req, res) => res.json({ status: 'ok', store: process.env.STORE_NAME || 'ONTOP Shop' }));

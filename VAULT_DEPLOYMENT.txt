@@ -1,0 +1,329 @@
+╔════════════════════════════════════════════════════════════════════════════╗
+║                 VAULT UNIFIED → P-BOT BACKEND INTEGRATION                  ║
+║                            DEPLOYMENT CHECKLIST                             ║
+╚════════════════════════════════════════════════════════════════════════════╝
+
+✅ COMPLETED WORK
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+1. ✅ Backend API Routes Created
+   Location: C:\Users\VENOM-NODE\Documents\P-BOT-main\P-BOT-main\backend\routes\vault.js
+
+   Endpoints:
+   • GET    /api/vault                     → Get current user's vault data
+   • POST   /api/vault                     → Save all vault data
+   • PATCH  /api/vault/game/:gameKey       → Update specific game data
+   • GET    /api/vault/admin/all           → Admin: get all users' data
+   • GET    /api/vault/admin/user/:userId  → Admin: get specific user
+
+2. ✅ Database Migration Created
+   Location: C:\Users\VENOM-NODE\Documents\P-BOT-main\P-BOT-main\backend\migrations\vault_data.sql
+
+   Creates table: vault_data
+   • id (PK)
+   • user_id (FK → web_users.id)
+   • guild_id
+   • data (JSONB: {cod, arc, sw, pk, personal_keys})
+   • updated_at
+   • UNIQUE(user_id, guild_id)
+
+3. ✅ Route Registered in server.js
+   Added: app.use('/api/vault', require('./routes/vault'));
+
+4. ✅ Vault HTML Patched
+   Original: D:/COMBINE THESE WEBSITES/og/vault_unified_fixed.html (3,162 lines)
+   Output:   D:/COMBINE THESE WEBSITES/og/vault_unified_backend.html
+   Backup:   D:/COMBINE THESE WEBSITES/og/vault_unified_backend_backup.html
+
+   Changes Made:
+   • Removed Supabase config (SB_URL, SB_KEY)
+   • Removed Supabase table setup functions
+   • Replaced localStorage vault data with backend API calls
+   • Replaced localStorage user auth with /api/auth/* endpoints
+   • Added Discord OAuth login button
+   • Added session restore on page load
+   • Added API_BASE auto-detection
+   • Kept only session token in localStorage (auth persistence)
+
+5. ✅ LocalStorage Status
+   REMOVED: All vault data storage (cod, arc, sw, pk accounts)
+   REMOVED: User account storage
+   KEPT:    Session token (vault_session_token) - required for auth
+   KEPT:    Backup history metadata - local feature, not synced
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+📋 DEPLOYMENT STEPS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+STEP 1: Run Database Migration
+────────────────────────────────────────────────────────────────────────────
+
+⚠ CRITICAL: This must be run BEFORE pushing backend code to production!
+
+Option A - Railway CLI:
+  cd C:\Users\VENOM-NODE\Documents\P-BOT-main\P-BOT-main
+  railway run psql < backend/migrations/vault_data.sql
+
+Option B - Direct psql:
+  psql "$DATABASE_URL" -f backend/migrations/vault_data.sql
+
+Option C - Railway Dashboard:
+  1. Go to Railway project → Database
+  2. Click "Query" tab
+  3. Copy/paste the SQL from vault_data.sql
+  4. Run
+
+Verify migration success:
+  railway run psql -c "\d vault_data"
+
+Expected output:
+  Table "public.vault_data"
+  Column    |  Type   | Nullable | Default
+  ----------+---------+----------+------------------
+  id        | text    | not null | gen_random_uuid()::text
+  user_id   | text    | not null |
+  guild_id  | text    | not null |
+  data      | jsonb   | not null | '{}'
+  updated_at| timestamp with time zone | | now()
+
+
+STEP 2: Commit & Push Backend Changes
+────────────────────────────────────────────────────────────────────────────
+
+Files to commit:
+  • backend/routes/vault.js              (NEW)
+  • backend/migrations/vault_data.sql    (NEW)
+  • backend/server.js                    (MODIFIED - added vault route)
+
+Commands:
+  cd C:\Users\VENOM-NODE\Documents\P-BOT-main\P-BOT-main
+  git add backend/routes/vault.js
+  git add backend/migrations/vault_data.sql
+  git add backend/server.js
+  git commit -m "Add vault data backend API
+
+  - Create /api/vault routes for vault data CRUD
+  - Add vault_data table migration (JSONB storage)
+  - Register vault routes in server.js
+  - Supports COD, ARC, SW, PK, personal_keys
+  - Admin endpoints for user lookup by Discord ID"
+
+  git push origin main
+
+Wait for Railway auto-deploy to complete (check Railway dashboard).
+
+
+STEP 3: Deploy Vault HTML
+────────────────────────────────────────────────────────────────────────────
+
+The new vault file: D:/COMBINE THESE WEBSITES/og/vault_unified_backend.html
+
+This file needs to be uploaded to wherever the storefront is hosted.
+
+⚠ IMPORTANT: The vault HTML must be served from the SAME DOMAIN as P-BOT
+            backend (e.g., uhservices.xyz) for cookies/CORS to work.
+
+If using Netlify/manual upload:
+  1. Rename vault_unified_backend.html → vault.html (or desired name)
+  2. Upload to the hosting location
+  3. Verify it's accessible at https://yourdomain.com/vault.html
+
+If it's part of the P-BOT public folder:
+  1. Copy to: C:\Users\VENOM-NODE\Documents\P-BOT-main\P-BOT-main\backend\public\vault.html
+  2. Commit and push with backend code
+
+
+STEP 4: Test Locally (Optional but Recommended)
+────────────────────────────────────────────────────────────────────────────
+
+Start P-BOT backend locally:
+  cd C:\Users\VENOM-NODE\Documents\P-BOT-main\P-BOT-main\backend
+  npm start
+
+Open vault in browser:
+  file:///D:/COMBINE%20THESE%20WEBSITES/og/vault_unified_backend.html
+  OR
+  http://localhost:3000/vault.html (if in public folder)
+
+Test checklist:
+  ☐ Register new account (username/password)
+  ☐ Login with username/password
+  ☐ Add a COD account → saves
+  ☐ Refresh page → data persists
+  ☐ Add ARC account, SW key → all save
+  ☐ Logout and login → data still there
+  ☐ Check database: SELECT * FROM vault_data;
+  ☐ Discord OAuth login (if Discord app configured)
+
+
+STEP 5: Test on Production
+────────────────────────────────────────────────────────────────────────────
+
+After deploying:
+
+1. Open production vault URL in browser
+
+2. Test registration:
+   ☐ Click REGISTER tab
+   ☐ Enter username + password
+   ☐ Should create account and auto-login
+
+3. Test data persistence:
+   ☐ Add a test COD account
+   ☐ Refresh page
+   ☐ Data should still be there
+
+4. Test Discord login:
+   ☐ Click "SIGN IN WITH DISCORD"
+   ☐ Should redirect to Discord OAuth
+   ☐ After approval, should return and login
+
+5. Verify database:
+   railway run psql -c "SELECT id, user_id, guild_id, updated_at FROM vault_data;"
+
+   Should show entries for test users.
+
+6. Test admin endpoints (if you have owner role):
+   curl -H "Authorization: Bearer YOUR_SESSION_TOKEN" \
+        https://yourdomain.com/api/vault/admin/all
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+🔧 TROUBLESHOOTING
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Issue: "Login failed" or "Request failed"
+Solution: Check browser console for errors. Verify:
+  • Backend is running
+  • /api/auth/login endpoint exists
+  • CORS is configured (if vault is on different domain)
+
+Issue: "Session expired" after refresh
+Solution:
+  • Check /api/auth/me endpoint
+  • Verify session token is stored in localStorage
+  • Check token expiry in backend
+
+Issue: Data doesn't persist after refresh
+Solution:
+  • Open browser console → Application → Local Storage
+  • Check for "vault_session_token"
+  • Verify /api/vault GET returns data
+  • Check vault_data table in database
+
+Issue: Discord login doesn't work
+Solution:
+  • Verify DISCORD_CLIENT_ID and DISCORD_CLIENT_SECRET are set
+  • Check redirect URI is configured in Discord developer portal
+  • Verify /api/auth/discord-oauth/start endpoint exists
+
+Issue: CORS errors
+Solution:
+  • Vault HTML must be served from same domain as backend
+  • If testing locally, use http://localhost:3000/vault.html
+  • Don't use file:// protocol for production testing
+
+Issue: Migration fails with "relation already exists"
+Solution: Table already created, this is OK. Check:
+  railway run psql -c "\d vault_data"
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+📊 DATA STRUCTURE REFERENCE
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+vault_data.data JSONB structure:
+
+{
+  "cod": [
+    {
+      "id": "generated_id",
+      "title": "Account Title",
+      "email": "email@example.com",
+      "pass": "password",
+      "created": "2026-08-10",
+      "notes": "optional notes",
+      "warzone": 1,
+      "scrappy": 0,
+      ...
+    }
+  ],
+  "arc": [
+    {
+      "id": "generated_id",
+      "title": "ARC Account",
+      "email": "arc@example.com",
+      "pass": "password",
+      "created": "2026-08-10",
+      ...
+    }
+  ],
+  "sw": [
+    {
+      "id": "generated_id",
+      "name": "Software Name",
+      "key": "LICENSE-KEY-HERE",
+      "date": "2026-08-10",
+      "dateActivated": "2026-08-10",
+      "duration": "1 year",
+      ...
+    }
+  ],
+  "pk": [
+    {
+      "id": "generated_id",
+      "name": "Payment Account",
+      "username": "username",
+      "pass": "password",
+      "created": "2026-08-10"
+    }
+  ],
+  "personal_keys": [
+    {
+      "id": "generated_id",
+      "name": "Key Name",
+      "key": "KEY-VALUE",
+      "date": "2026-08-10"
+    }
+  ]
+}
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+✅ WHAT'S BEEN ACHIEVED
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+BEFORE:
+  • Vault data stored in browser localStorage
+  • Separate Supabase auth system
+  • No Discord integration
+  • Data doesn't sync across devices
+  • No admin access to user data
+  • No Discord ID lookup
+
+AFTER:
+  • All vault data in P-BOT backend database
+  • Unified auth with P-BOT (session tokens)
+  • Discord OAuth login supported
+  • Data syncs automatically to backend
+  • Admin can lookup users by Discord ID
+  • Data persists across devices
+  • One backend for storefront + vault + bots
+
+USER REQUEST FULFILLED:
+  ✅ "wire everything to backend nothing must be ran off localStorage"
+
+  Only localStorage usage remaining:
+    • Session token (required for auth persistence)
+    • Backup history metadata (local-only feature)
+
+  All vault data (COD, ARC, SW, PK, personal_keys) → backend database
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+🎯 READY TO DEPLOY
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+All backend code is ready. Migration is ready. Vault HTML is patched.
+
+Next action: Run migration, push code, upload HTML, test.
