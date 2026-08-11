@@ -190,9 +190,11 @@ function reapOauthStates() {
   for (const [s, v] of oauthStates) if (v.expiresAt < now) oauthStates.delete(s);
 }
 function pickReturnTo(raw) {
+  console.log('[Auth] pickReturnTo - raw:', raw, 'STOREFRONT_ORIGINS:', STOREFRONT_ORIGINS);
   if (raw) {
     try {
       const origin = new URL(raw).origin;
+      console.log('[Auth] pickReturnTo - parsed origin:', origin, 'includes:', STOREFRONT_ORIGINS.includes(origin));
       if (STOREFRONT_ORIGINS.includes(origin)) return origin;
     } catch (_) { /* fall through to default */ }
   }
@@ -206,6 +208,7 @@ router.get('/discord-oauth/start', (req, res) => {
   }
   const state = require('crypto').randomBytes(16).toString('hex');
   const returnTo = pickReturnTo(req.query.return_to);
+  console.log('[Auth] Discord OAuth start - return_to query:', req.query.return_to, '→ picked:', returnTo);
   oauthStates.set(state, { returnTo, expiresAt: Date.now() + 10 * 60 * 1000 });
   const url = 'https://discord.com/oauth2/authorize?' + new URLSearchParams({
     client_id: OAUTH_CLIENT_ID,
