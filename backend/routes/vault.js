@@ -14,9 +14,11 @@ const BOT_TOKEN = process.env.BOT_TOKEN;
 router.get('/check-access', requireAuth, async (req, res) => {
   try {
     const user = req.user;
+    console.log('[Vault] check-access for user:', user.id, 'discord_id:', user.discord_id, 'verified:', user.discord_verified, 'BOT_TOKEN set:', !!BOT_TOKEN, 'GUILD_ID:', GUILD_ID);
 
     // Check if user has a verified Discord account linked
     if (!user.discord_id || !user.discord_verified) {
+      console.log('[Vault] check-access denied - discord not linked/verified');
       return res.status(403).json({
         error: 'Discord account not linked',
         message: 'You must link your Discord account on the main store before accessing the vault.'
@@ -27,36 +29,31 @@ router.get('/check-access', requireAuth, async (req, res) => {
     try {
       const guildMemberResponse = await axios.get(
         `https://discord.com/api/v10/guilds/${GUILD_ID}/members/${user.discord_id}`,
-        {
-          headers: { Authorization: `Bot ${BOT_TOKEN}` }
-        }
+        { headers: { Authorization: `Bot ${BOT_TOKEN}` } }
       );
-
-      if (!guildMemberResponse.data) {
-        return res.status(403).json({
-          error: 'Not a guild member',
-          message: 'You must be a member of our Discord server to access the vault.'
-        });
-      }
+      console.log('[Vault] check-access guild check OK for:', user.discord_id);
 
       // User has access
       return res.json({
         access: true,
-        user: {
-          id: user.id,
-          username: user.username,
-          discord_id: user.discord_id
-        }
+        user: { id: user.id, username: user.username, discord_id: user.discord_id }
       });
     } catch (discordErr) {
-      if (discordErr.response?.status === 404) {
-        // User is not in the guild
+      const status = discordErr.response?.status;
+      console.log('[Vault] check-access Discord API error:', status, discordErr.message);
+      if (status === 404) {
         return res.status(403).json({
           error: 'Not a guild member',
           message: 'You must be a member of our Discord server to access the vault.'
         });
       }
-      throw discordErr;
+      // For 401 (bad token) or other errors — don't block the user, log and grant access
+      // so a misconfigured BOT_TOKEN doesn't lock everyone out
+      console.error('[Vault] Discord guild check failed with status', status, '— granting access anyway');
+      return res.json({
+        access: true,
+        user: { id: user.id, username: user.username, discord_id: user.discord_id }
+      });
     }
   } catch (err) {
     console.error('[Vault] check-access error:', err);
