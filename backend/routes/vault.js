@@ -156,14 +156,12 @@ router.post('/', requireAuth, async (req, res) => {
     const now = new Date().toISOString();
 
     await withTransaction(async (exec) => {
-      // Upsert: insert or update
-      const id = `vault_${req.user.id}_${GUILD_ID}`;
       await exec(
-        `INSERT INTO vault_data (id, user_id, guild_id, data, updated_at)
-         VALUES ($1, $2, $3, $4, $5)
+        `INSERT INTO vault_data (user_id, guild_id, data, updated_at)
+         VALUES ($1, $2, $3, $4)
          ON CONFLICT (user_id, guild_id)
-         DO UPDATE SET data = $4, updated_at = $5`,
-        [id, req.user.id, GUILD_ID, JSON.stringify(data), now]
+         DO UPDATE SET data = $3, updated_at = $4`,
+        [req.user.id, GUILD_ID, JSON.stringify(data), now]
       );
     });
 
@@ -226,13 +224,12 @@ router.patch('/game/:gameKey', requireAuth, async (req, res) => {
       currentData[gameKey] = items;
 
       // Upsert
-      const id = `vault_${req.user.id}_${GUILD_ID}`;
       await exec(
-        `INSERT INTO vault_data (id, user_id, guild_id, data, updated_at)
-         VALUES ($1, $2, $3, $4, $5)
+        `INSERT INTO vault_data (user_id, guild_id, data, updated_at)
+         VALUES ($1, $2, $3, $4)
          ON CONFLICT (user_id, guild_id)
-         DO UPDATE SET data = $4, updated_at = $5`,
-        [id, req.user.id, GUILD_ID, JSON.stringify(currentData), now]
+         DO UPDATE SET data = $3, updated_at = $4`,
+        [req.user.id, GUILD_ID, JSON.stringify(currentData), now]
       );
     });
 
