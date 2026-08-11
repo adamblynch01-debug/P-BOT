@@ -1,9 +1,68 @@
 const express = require('express');
 const router = express.Router();
+const axios = require('axios');
 const { query, withTransaction } = require('../db');
 const { requireAuth, requireAdmin } = require('../utils/auth');
 
 const GUILD_ID = process.env.GUILD_ID;
+const BOT_TOKEN = process.env.BOT_TOKEN;
+
+// ─── GET /api/vault/check-access ──────────────────────────────────────────
+// Check if the authenticated user has access to the vault:
+// 1. Must have a web_users account (requireAuth ensures this)
+// 2. Must be a member of the Discord guild
+router.get('/check-access', requireAuth, async (req, res) => {
+  try {
+    const user = req.user;
+
+    // Check if user has a verified Discord account linked
+    if (!user.discord_id || !user.discord_verified) {
+      return res.status(403).json({
+        error: 'Discord account not linked',
+        message: 'You must link your Discord account on the main store before accessing the vault.'
+      });
+    }
+
+    // Check if user is a member of the guild via Discord API
+    try {
+      const guildMemberResponse = await axios.get(
+        `https://discord.com/api/v10/guilds/${GUILD_ID}/members/${user.discord_id}`,
+        {
+          headers: { Authorization: `Bot ${BOT_TOKEN}` }
+        }
+      );
+
+      if (!guildMemberResponse.data) {
+        return res.status(403).json({
+          error: 'Not a guild member',
+          message: 'You must be a member of our Discord server to access the vault.'
+        });
+      }
+
+      // User has access
+      return res.json({
+        access: true,
+        user: {
+          id: user.id,
+          username: user.username,
+          discord_id: user.discord_id
+        }
+      });
+    } catch (discordErr) {
+      if (discordErr.response?.status === 404) {
+        // User is not in the guild
+        return res.status(403).json({
+          error: 'Not a guild member',
+          message: 'You must be a member of our Discord server to access the vault.'
+        });
+      }
+      throw discordErr;
+    }
+  } catch (err) {
+    console.error('[Vault] check-access error:', err);
+    res.status(500).json({ error: 'Failed to verify access' });
+  }
+});
 
 // ─── Migration: create vault_data table if not exists ─────────────────────
 // This table stores the user's vault data (COD accounts, ARC accounts, etc.)
@@ -21,8 +80,29 @@ const GUILD_ID = process.env.GUILD_ID;
 
 // ─── GET /api/vault ───────────────────────────────────────────────────────
 // Fetch the current user's vault data
+// Now also checks guild membership before allowing access
 router.get('/', requireAuth, async (req, res) => {
   try {
+    // Verify guild membership
+    if (req.user.discord_id && req.user.discord_verified) {
+      try {
+        await axios.get(
+          `https://discord.com/api/v10/guilds/${GUILD_ID}/members/${req.user.discord_id}`,
+          { headers: { Authorization: `Bot ${BOT_TOKEN}` } }
+        );
+      } catch (discordErr) {
+        if (discordErr.response?.status === 404) {
+          return res.status(403).json({
+            error: 'You must be a member of our Discord server to access the vault.'
+          });
+        }
+      }
+    } else {
+      return res.status(403).json({
+        error: 'You must link your Discord account on the main store before accessing the vault.'
+      });
+    }
+
     const { rows } = await query(
       `SELECT data FROM vault_data WHERE user_id = $1 AND guild_id = $2`,
       [req.user.id, GUILD_ID]
@@ -51,6 +131,26 @@ router.get('/', requireAuth, async (req, res) => {
 // Body: { data: { cod: [...], arc: [...], sw: [...], pk: [...], personal_keys: [...] } }
 router.post('/', requireAuth, async (req, res) => {
   try {
+    // Verify guild membership
+    if (req.user.discord_id && req.user.discord_verified) {
+      try {
+        await axios.get(
+          `https://discord.com/api/v10/guilds/${GUILD_ID}/members/${req.user.discord_id}`,
+          { headers: { Authorization: `Bot ${BOT_TOKEN}` } }
+        );
+      } catch (discordErr) {
+        if (discordErr.response?.status === 404) {
+          return res.status(403).json({
+            error: 'You must be a member of our Discord server to access the vault.'
+          });
+        }
+      }
+    } else {
+      return res.status(403).json({
+        error: 'You must link your Discord account on the main store before accessing the vault.'
+      });
+    }
+
     const { data } = req.body;
     if (!data || typeof data !== 'object') {
       return res.status(400).json({ error: 'Invalid data format' });
@@ -82,6 +182,26 @@ router.post('/', requireAuth, async (req, res) => {
 // Body: { items: [...] }
 router.patch('/game/:gameKey', requireAuth, async (req, res) => {
   try {
+    // Verify guild membership
+    if (req.user.discord_id && req.user.discord_verified) {
+      try {
+        await axios.get(
+          `https://discord.com/api/v10/guilds/${GUILD_ID}/members/${req.user.discord_id}`,
+          { headers: { Authorization: `Bot ${BOT_TOKEN}` } }
+        );
+      } catch (discordErr) {
+        if (discordErr.response?.status === 404) {
+          return res.status(403).json({
+            error: 'You must be a member of our Discord server to access the vault.'
+          });
+        }
+      }
+    } else {
+      return res.status(403).json({
+        error: 'You must link your Discord account on the main store before accessing the vault.'
+      });
+    }
+
     const { gameKey } = req.params;
     const { items } = req.body;
 
