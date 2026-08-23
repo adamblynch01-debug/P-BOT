@@ -291,11 +291,11 @@ router.post('/reorder', async (req, res) => {
     if (ids.some(n => !Number.isFinite(n))) return res.status(400).json({ error: 'ids must all be numbers' });
     if (new Set(ids).size !== ids.length) return res.status(400).json({ error: 'ids contains a duplicate' });
 
-    const out = await withTransaction(async (client) => {
+    const out = await withTransaction(async (exec) => {
       // Locked for the read: two admins dragging at once would otherwise each
       // compute a permutation of the values they saw and the second would write
       // a set of numbers that no longer matches the rows.
-      const { rows } = await client.query(
+      const { rows } = await exec(
         `SELECT id, sort_order FROM products
           WHERE guild_id = $1 AND game_name = $2
           FOR UPDATE`,
@@ -311,7 +311,7 @@ router.post('/reorder', async (req, res) => {
 
       const slots = rows.map(r => Number(r.sort_order)).sort((a, b) => b - a);
       for (let i = 0; i < ids.length; i++) {
-        await client.query(
+        await exec(
           'UPDATE products SET sort_order = $1, updated_at = now() WHERE id = $2 AND guild_id = $3',
           [slots[i], ids[i], GUILD_ID]
         );
