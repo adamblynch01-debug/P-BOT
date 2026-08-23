@@ -28,7 +28,7 @@ WITH new_product AS (
     'Premium private external cheat for Call of Duty: Black Ops 7. Limited slots available. Monthly subscription includes full ESP, aimbot, and exclusive features.',
     'EXTERNAL',
     'SLOTTED | EXTERNAL | PRIVATE',
-    'PC',
+    ARRAY['PC'],
     false,
     '[{"title":"ESP","features":["Box ESP","Health ESP","Name ESP","Distance ESP","Weapon ESP"]},{"title":"Aimbot","features":["Smooth Aim","FOV Circle","Target Lock","Visibility Check"]},{"title":"Misc","features":["No Recoil","No Spread","Radar","Crosshair"]}]'::jsonb,
     '{}'::jsonb,

@@ -28,7 +28,7 @@ WITH new_product AS (
     'Get your banned account unbanned. Our team will work to restore your account access. Works with permanent spoofer purchases. Service typically completed within 24-48 hours.',
     'SERVICE',
     '24-48 hour turnaround',
-    'PC',
+    ARRAY['PC'],
     false,
     '[]'::jsonb,
     '{}'::jsonb,
