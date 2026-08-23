@@ -1,44 +1,45 @@
 -- Migration: Add Unban Service Addon Product
--- Run this in Railway: railway run psql < backend/migrations/unban_service_addon.sql
+-- Run this in Railway SQL editor
 
--- Insert the product
-INSERT INTO products (
-  guild_id,
-  game_name,
-  name,
-  subtitle,
-  description,
-  tag,
-  specs,
-  platforms,
-  spoofer,
-  sections,
-  media,
-  tab,
-  dropdown,
-  status,
-  vault,
-  sort_order
-) VALUES (
-  (SELECT DISTINCT guild_id FROM products LIMIT 1),  -- Use existing guild_id
-  'Call of Duty: Warzone',  -- Change if needed
-  'Unban Service Addon',
-  'Professional Account Unban Service',
-  'Get your banned account unbanned. Our team will work to restore your account access. Works with permanent spoofer purchases. Service typically completed within 24-48 hours.',
-  'SERVICE',
-  '24-48 hour turnaround',
-  'PC',
-  false,  -- Not a spoofer, it's a service
-  '[]'::jsonb,  -- Empty sections
-  '{}'::jsonb,  -- Empty media
-  null,  -- No tab
-  null,  -- No dropdown
-  'undetected',
-  false,  -- Not vault, regular shop
-  (SELECT COALESCE(MAX(sort_order), 0) + 1 FROM products WHERE guild_id = (SELECT DISTINCT guild_id FROM products LIMIT 1))
-) RETURNING id AS product_id \gset
-
--- Insert the pricing tier
+-- Step 1: Insert the product and get its ID
+WITH new_product AS (
+  INSERT INTO products (
+    guild_id,
+    game_name,
+    name,
+    subtitle,
+    description,
+    tag,
+    specs,
+    platforms,
+    spoofer,
+    sections,
+    media,
+    tab,
+    dropdown,
+    status,
+    vault,
+    sort_order
+  ) VALUES (
+    (SELECT DISTINCT guild_id FROM products LIMIT 1),
+    'Call of Duty: Warzone',
+    'Unban Service Addon',
+    'Professional Account Unban Service',
+    'Get your banned account unbanned. Our team will work to restore your account access. Works with permanent spoofer purchases. Service typically completed within 24-48 hours.',
+    'SERVICE',
+    '24-48 hour turnaround',
+    'PC',
+    false,
+    '[]'::jsonb,
+    '{}'::jsonb,
+    null,
+    null,
+    'undetected',
+    false,
+    (SELECT COALESCE(MAX(sort_order), 0) + 1 FROM products WHERE guild_id = (SELECT DISTINCT guild_id FROM products LIMIT 1))
+  ) RETURNING id
+)
+-- Step 2: Insert the pricing tier using the product ID from above
 INSERT INTO product_tiers (
   product_id,
   guild_id,
@@ -48,16 +49,17 @@ INSERT INTO product_tiers (
   stock_type,
   delivery_type,
   sort_order
-) VALUES (
-  :product_id,
+)
+SELECT
+  new_product.id,
   (SELECT DISTINCT guild_id FROM products LIMIT 1),
   'Unban Service',
-  4999,  -- $49.99 in cents
-  null,  -- One-time service, no period
-  'manual',  -- Manual delivery
+  4999,
+  null,
+  'manual',
   'manual',
   0
-);
+FROM new_product;
 
 -- Verify the product was created
 SELECT

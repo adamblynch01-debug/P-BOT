@@ -1,44 +1,45 @@
 -- Migration: Add CALL OF DUTY BO7: ONTOP PRIVATE EXTERNAL (SLOTTED)
--- Run this in Railway: railway run psql < backend/migrations/bo7_ontop_product.sql
+-- Run this in Railway SQL editor
 
--- Insert the product
-INSERT INTO products (
-  guild_id,
-  game_name,
-  name,
-  subtitle,
-  description,
-  tag,
-  specs,
-  platforms,
-  spoofer,
-  sections,
-  media,
-  tab,
-  dropdown,
-  status,
-  vault,
-  sort_order
-) VALUES (
-  (SELECT DISTINCT guild_id FROM products LIMIT 1),
-  'Call of Duty: Black Ops 7',
-  'ONTOP PRIVATE EXTERNAL',
-  'SLOTTED - Limited Access',
-  'Premium private external cheat for Call of Duty: Black Ops 7. Limited slots available. Monthly subscription includes full ESP, aimbot, and exclusive features.',
-  'EXTERNAL',
-  'SLOTTED | EXTERNAL | PRIVATE',
-  'PC',
-  false,
-  '[{"title":"ESP","features":["Box ESP","Health ESP","Name ESP","Distance ESP","Weapon ESP"]},{"title":"Aimbot","features":["Smooth Aim","FOV Circle","Target Lock","Visibility Check"]},{"title":"Misc","features":["No Recoil","No Spread","Radar","Crosshair"]}]'::jsonb,
-  '{}'::jsonb,
-  null,
-  null,
-  'undetected',
-  false,
-  (SELECT COALESCE(MAX(sort_order), 0) + 1 FROM products WHERE guild_id = (SELECT DISTINCT guild_id FROM products LIMIT 1))
-) RETURNING id AS product_id \gset
-
--- Insert the pricing tier - Monthly $49.99
+-- Step 1: Insert the product and get its ID
+WITH new_product AS (
+  INSERT INTO products (
+    guild_id,
+    game_name,
+    name,
+    subtitle,
+    description,
+    tag,
+    specs,
+    platforms,
+    spoofer,
+    sections,
+    media,
+    tab,
+    dropdown,
+    status,
+    vault,
+    sort_order
+  ) VALUES (
+    (SELECT DISTINCT guild_id FROM products LIMIT 1),
+    'Call of Duty: Black Ops 7',
+    'ONTOP PRIVATE EXTERNAL',
+    'SLOTTED - Limited Access',
+    'Premium private external cheat for Call of Duty: Black Ops 7. Limited slots available. Monthly subscription includes full ESP, aimbot, and exclusive features.',
+    'EXTERNAL',
+    'SLOTTED | EXTERNAL | PRIVATE',
+    'PC',
+    false,
+    '[{"title":"ESP","features":["Box ESP","Health ESP","Name ESP","Distance ESP","Weapon ESP"]},{"title":"Aimbot","features":["Smooth Aim","FOV Circle","Target Lock","Visibility Check"]},{"title":"Misc","features":["No Recoil","No Spread","Radar","Crosshair"]}]'::jsonb,
+    '{}'::jsonb,
+    null,
+    null,
+    'undetected',
+    false,
+    (SELECT COALESCE(MAX(sort_order), 0) + 1 FROM products WHERE guild_id = (SELECT DISTINCT guild_id FROM products LIMIT 1))
+  ) RETURNING id
+)
+-- Step 2: Insert the pricing tier using the product ID from above
 INSERT INTO product_tiers (
   product_id,
   guild_id,
@@ -48,16 +49,17 @@ INSERT INTO product_tiers (
   stock_type,
   delivery_type,
   sort_order
-) VALUES (
-  :product_id,
+)
+SELECT
+  new_product.id,
   (SELECT DISTINCT guild_id FROM products LIMIT 1),
   '1 Month',
-  4999,  -- $49.99 in cents
+  4999,
   'month',
-  'manual',  -- Manual delivery for slotted products
+  'manual',
   'manual',
   0
-);
+FROM new_product;
 
 -- Verify the product was created
 SELECT
