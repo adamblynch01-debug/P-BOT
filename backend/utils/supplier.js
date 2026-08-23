@@ -56,6 +56,18 @@ const PROVIDERS = {
     base: process.env.AIMBETTER_API_BASE || 'https://aimbetter.site/api/v1',
     keyEnv: 'AIMBETTER_API_KEY',
   },
+  delta: {
+    label: 'Delta Solutions',
+    base: process.env.DELTA_API_BASE || 'https://deltasolutions.uk/api/v1',
+    keyEnv: 'DELTA_API_KEY',
+  },
+  kairos: {
+    label: 'Kairos (Pytguard)',
+    base: process.env.KAIROS_API_BASE || 'https://pytguard.com/ext/vendor',
+    keyEnv: 'KAIROS_API_KEY',
+    // Kairos has a different URL format: the key is in the path, not query string
+    customFormat: true,
+  },
 };
 const DEFAULT_SUPPLIER = 'gandy';
 
@@ -296,14 +308,27 @@ async function purchase(link, { qty = 1, orderId = null, buyerRef = null } = {})
     return { status, deliveryId, ...patch };
   };
 
-  const url = `${provider.base}/deliver/${encodeURIComponent(link.supplier_product_id)}`;
+  // Build URL based on supplier format
+  let url;
+  let params;
+  if (provider.customFormat && supplierName === 'kairos') {
+    // Kairos format: https://pytguard.com/ext/vendor/{key}/kairos/{duration}
+    // supplier_product_id should be: day, week, month, or lifetime
+    url = `${provider.base}/${apiKey(supplierName)}/kairos/${encodeURIComponent(link.supplier_product_id)}`;
+    params = buyerRef ? { buyerRef } : {};
+  } else {
+    // Standard format: /deliver/{product_id}?key=xxx&qty=1
+    url = `${provider.base}/deliver/${encodeURIComponent(link.supplier_product_id)}`;
+    params = Object.assign(
+      { key: apiKey(supplierName), qty: units },
+      buyerRef ? { buyerRef } : {}
+    );
+  }
+
   let res;
   try {
     res = await axios.get(url, {
-      params: Object.assign(
-        { key: apiKey(supplierName), qty: units },
-        buyerRef ? { buyerRef } : {}
-      ),
+      params: params,
       timeout: TIMEOUT_MS,
       // We want the body on a 4xx/5xx too — their error text is more useful
       // than the status code, and axios would otherwise throw it away into an
