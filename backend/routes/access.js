@@ -2,15 +2,18 @@
 // Returns whether the current user has access to the full website
 const express = require('express');
 const router = express.Router();
-const { publicUser } = require('../utils/auth');
+const { attachUser } = require('../utils/auth');
 const { checkDiscordAccess } = require('../utils/discordAccess');
 
 // GET /api/access/check
 // Returns { hasAccess: boolean, reason: string, discordLinked: boolean }
-router.get('/check', publicUser, async (req, res) => {
+router.get('/check', attachUser, async (req, res) => {
   try {
+    console.log('[Access] Check request received, user:', req.user ? req.user.username : 'none');
+
     // User not logged in
     if (!req.user) {
+      console.log('[Access] Not logged in');
       return res.json({
         hasAccess: false,
         reason: 'not_logged_in',
@@ -20,6 +23,7 @@ router.get('/check', publicUser, async (req, res) => {
 
     // User has no Discord linked
     if (!req.user.discord_id) {
+      console.log('[Access] No Discord linked:', req.user.username);
       return res.json({
         hasAccess: false,
         reason: 'no_discord_linked',
@@ -28,8 +32,12 @@ router.get('/check', publicUser, async (req, res) => {
       });
     }
 
+    console.log('[Access] Checking Discord access for:', req.user.discord_id);
+
     // Check Discord server membership and role
     const access = await checkDiscordAccess(req.user.discord_id);
+
+    console.log('[Access] Discord check result:', access);
 
     if (!access.inServer) {
       return res.json({
@@ -52,6 +60,7 @@ router.get('/check', publicUser, async (req, res) => {
     }
 
     // User has full access!
+    console.log('[Access] User authorized:', req.user.username);
     return res.json({
       hasAccess: true,
       reason: 'authorized',
