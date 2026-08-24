@@ -6,6 +6,7 @@ const axios = require('axios');
 
 const DISCORD_BOT_TOKEN = process.env.DISCORD_BOT_TOKEN;
 const GUILD_ID = process.env.GUILD_ID;
+const CUSTOMER_ROLE_ID = process.env.CUSTOMER_ROLE_ID || null;
 const CUSTOMER_ROLE_NAME = process.env.CUSTOMER_ROLE_NAME || 'customer';
 
 // Cache Discord member data for 5 minutes to avoid rate limits
@@ -68,8 +69,13 @@ async function checkDiscordAccess(discordId) {
     const guildRoles = rolesResponse.data;
     const roleMap = new Map(guildRoles.map(r => [r.id, r.name.toLowerCase()]));
 
-    // Check if user has customer role
+    // Check if user has customer role (by ID or name)
     const hasCustomerRole = memberRoles.some(roleId => {
+      // Priority 1: Check by role ID (most reliable)
+      if (CUSTOMER_ROLE_ID && roleId === CUSTOMER_ROLE_ID) {
+        return true;
+      }
+      // Priority 2: Fallback to role name
       const roleName = roleMap.get(roleId);
       return roleName === CUSTOMER_ROLE_NAME.toLowerCase();
     });
