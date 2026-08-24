@@ -156,7 +156,15 @@ app.use('/api/game-tiles', require('./routes/gameTiles'));
 app.use('/api/unsplash', require('./routes/unsplash'));
 app.use('/api/supplier', require('./routes/supplier'));
 app.use('/api/vault', require('./routes/vault'));
-app.use('/api/access', require('./routes/access'));
+
+// Discord access gate - with error handling
+try {
+  app.use('/api/access', require('./routes/access'));
+  console.log('[Startup] Discord access gate loaded');
+} catch (error) {
+  console.error('[Startup] Failed to load Discord access gate:', error.message);
+  console.error('[Startup] Stack:', error.stack);
+}
 
 // ─── Health ─────────────────────────────────────────────
 app.get('/health', (req, res) => res.json({ status: 'ok', store: process.env.STORE_NAME || 'ONTOP Shop' }));
