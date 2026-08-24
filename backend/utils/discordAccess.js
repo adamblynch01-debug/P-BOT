@@ -4,7 +4,7 @@
 
 const axios = require('axios');
 
-const DISCORD_BOT_TOKEN = process.env.DISCORD_BOT_TOKEN;
+const DISCORD_BOT_TOKEN = process.env.DISCORD_TOKEN || process.env.DISCORD_BOT_TOKEN;
 const GUILD_ID = process.env.GUILD_ID;
 const CUSTOMER_ROLE_ID = process.env.CUSTOMER_ROLE_ID || null;
 const CUSTOMER_ROLE_NAME = process.env.CUSTOMER_ROLE_NAME || 'customer';
