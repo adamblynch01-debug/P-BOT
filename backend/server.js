@@ -97,6 +97,7 @@ app.set('trust proxy', 1);
 
 app.use(cors({
   origin: '*',
+  credentials: true,
   methods: ['GET', 'POST', 'PATCH', 'DELETE', 'OPTIONS'],
   allowedHeaders: ['Content-Type', 'Authorization'],
 }));
