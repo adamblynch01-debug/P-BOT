@@ -96,7 +96,7 @@ const app = express();
 app.set('trust proxy', 1);
 
 app.use(cors({
-  origin: '*',
+  origin: ['https://zeropoint.wtf', 'https://www.zeropoint.wtf', 'https://uhservices.xyz', 'https://www.uhservices.xyz'],
   credentials: true,
   methods: ['GET', 'POST', 'PATCH', 'DELETE', 'OPTIONS'],
   allowedHeaders: ['Content-Type', 'Authorization'],
