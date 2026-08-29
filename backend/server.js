@@ -157,6 +157,7 @@ app.use('/api/game-tiles', require('./routes/gameTiles'));
 app.use('/api/unsplash', require('./routes/unsplash'));
 app.use('/api/supplier', require('./routes/supplier'));
 app.use('/api/vault', require('./routes/vault'));
+app.use('/api/generator', require('./routes/generator'));
 
 // Discord access gate - with error handling
 try {
