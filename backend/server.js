@@ -158,6 +158,7 @@ app.use('/api/unsplash', require('./routes/unsplash'));
 app.use('/api/supplier', require('./routes/supplier'));
 app.use('/api/vault', require('./routes/vault'));
 app.use('/api/generator', require('./routes/generator'));
+app.use('/api/sms', require('./routes/generator')); // Mount SMS routes at /api/sms for frontend compatibility
 
 // Discord access gate - with error handling
 try {
