@@ -247,11 +247,12 @@ router.post('/sms/fivesim/purchase', async (req, res) => {
         }
       });
     } else {
-      res.json({ success: false, error: 'Purchase failed' });
+      console.error('[5SIM] Purchase failed - invalid response:', data);
+      res.json({ success: false, error: 'Purchase failed', details: data });
     }
   } catch (error) {
-    console.error('[5SIM] Purchase error:', error);
-    res.json({ success: false, error: 'Purchase failed' });
+    console.error('[5SIM] Purchase error:', error.response?.data || error.message);
+    res.json({ success: false, error: 'Purchase failed', details: error.response?.data || error.message });
   }
 });
 
