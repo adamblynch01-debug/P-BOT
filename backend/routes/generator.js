@@ -8,6 +8,7 @@
 const express = require('express');
 const router = express.Router();
 const db = require('../db');
+const axios = require('axios');
 
 // ─────────────────────────────────────────────────────────────────────────────
 // CHECK GENERATOR ACCESS
@@ -179,8 +180,8 @@ const FIVESIM_BASE = 'https://5sim.net/v1';
 
 router.get('/sms/fivesim/services', async (req, res) => {
   try {
-    const response = await fetch(`${FIVESIM_BASE}/guest/products/russia/any`);
-    const data = await response.json();
+    const response = await axios.get(`${FIVESIM_BASE}/guest/products/russia/any`);
+    const data = response.data;
 
     const services = Object.keys(data).map(key => ({
       value: key,
@@ -198,8 +199,8 @@ router.get('/sms/fivesim/countries', async (req, res) => {
   try {
     const { service } = req.query;
 
-    const response = await fetch(`${FIVESIM_BASE}/guest/countries`);
-    const data = await response.json();
+    const response = await axios.get(`${FIVESIM_BASE}/guest/countries`);
+    const data = response.data;
 
     const countries = Object.keys(data).map(code => ({
       code: code,
@@ -218,7 +219,7 @@ router.post('/sms/fivesim/purchase', async (req, res) => {
   try {
     const { service, country, userId } = req.body;
 
-    const response = await fetch(
+    const response = await axios.get(
       `${FIVESIM_BASE}/user/buy/activation/${country}/any/${service}`,
       {
         headers: {
@@ -228,7 +229,7 @@ router.post('/sms/fivesim/purchase', async (req, res) => {
       }
     );
 
-    const data = await response.json();
+    const data = response.data;
 
     if (data.id && data.phone) {
       // Save order to database
@@ -258,14 +259,14 @@ router.get('/sms/fivesim/check/:orderId', async (req, res) => {
   try {
     const { orderId } = req.params;
 
-    const response = await fetch(`${FIVESIM_BASE}/user/check/${orderId}`, {
+    const response = await axios.get(`${FIVESIM_BASE}/user/check/${orderId}`, {
       headers: {
         'Authorization': `Bearer ${FIVESIM_API_KEY}`,
         'Accept': 'application/json'
       }
     });
 
-    const data = await response.json();
+    const data = response.data;
 
     if (data.sms && data.sms.length > 0) {
       const code = data.sms[0].code;
@@ -289,8 +290,7 @@ router.post('/sms/fivesim/cancel/:orderId', async (req, res) => {
   try {
     const { orderId } = req.params;
 
-    await fetch(`${FIVESIM_BASE}/user/cancel/${orderId}`, {
-      method: 'GET',
+    await axios.get(`${FIVESIM_BASE}/user/cancel/${orderId}`, {
       headers: {
         'Authorization': `Bearer ${FIVESIM_API_KEY}`,
         'Accept': 'application/json'
@@ -310,8 +310,7 @@ router.post('/sms/fivesim/resend/:orderId', async (req, res) => {
   try {
     const { orderId } = req.params;
 
-    await fetch(`${FIVESIM_BASE}/user/finish/${orderId}`, {
-      method: 'GET',
+    await axios.get(`${FIVESIM_BASE}/user/finish/${orderId}`, {
       headers: {
         'Authorization': `Bearer ${FIVESIM_API_KEY}`,
         'Accept': 'application/json'
@@ -336,13 +335,12 @@ router.get('/sms/smspool/services', async (req, res) => {
   try {
     const params = new URLSearchParams({ key: SMSPOOL_API_KEY });
 
-    const response = await fetch(`${SMSPOOL_BASE}/service/retrieve_all`, {
-      method: 'POST',
+    const response = await axios.get(`${SMSPOOL_BASE}/service/retrieve_all`, {
       headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
       body: params
     });
 
-    const data = await response.json();
+    const data = response.data;
 
     const services = Object.keys(data).map(key => ({
       value: key,
@@ -361,13 +359,12 @@ router.get('/sms/smspool/countries', async (req, res) => {
     const { service } = req.query;
     const params = new URLSearchParams({ key: SMSPOOL_API_KEY });
 
-    const response = await fetch(`${SMSPOOL_BASE}/country/retrieve_all`, {
-      method: 'POST',
+    const response = await axios.get(`${SMSPOOL_BASE}/country/retrieve_all`, {
       headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
       body: params
     });
 
-    const data = await response.json();
+    const data = response.data;
 
     const countries = Object.keys(data).map(code => ({
       code: code,
@@ -392,13 +389,11 @@ router.post('/sms/smspool/purchase', async (req, res) => {
       service: service
     });
 
-    const response = await fetch(`${SMSPOOL_BASE}/purchase/sms`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-      body: params
+    const response = await axios.post(`${SMSPOOL_BASE}/purchase/sms`, params, {
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' }
     });
 
-    const data = await response.json();
+    const data = response.data;
 
     if (data.success && data.number) {
       await db.query(`
@@ -427,11 +422,11 @@ router.get('/sms/smspool/check/:orderId', async (req, res) => {
   try {
     const { orderId } = req.params;
 
-    const response = await fetch(
+    const response = await axios.get(
       `${SMSPOOL_BASE}/sms/check?key=${SMSPOOL_API_KEY}&orderid=${orderId}`
     );
 
-    const data = await response.json();
+    const data = response.data;
 
     if (data.status === 3 && data.sms) {
       await db.query(`
@@ -452,8 +447,7 @@ router.post('/sms/smspool/cancel/:orderId', async (req, res) => {
   try {
     const { orderId } = req.params;
 
-    await fetch(`${SMSPOOL_BASE}/sms/cancel?key=${SMSPOOL_API_KEY}&orderid=${orderId}`, {
-      method: 'POST'
+    await axios.get(`${SMSPOOL_BASE}/sms/cancel?key=${SMSPOOL_API_KEY}&orderid=${orderId}`, {
     });
 
     await db.query(`UPDATE sms_orders SET cancelled = true WHERE order_id = $1`, [orderId]);
@@ -469,8 +463,7 @@ router.post('/sms/smspool/resend/:orderId', async (req, res) => {
   try {
     const { orderId } = req.params;
 
-    await fetch(`${SMSPOOL_BASE}/sms/resend?key=${SMSPOOL_API_KEY}&orderid=${orderId}`, {
-      method: 'POST'
+    await axios.get(`${SMSPOOL_BASE}/sms/resend?key=${SMSPOOL_API_KEY}&orderid=${orderId}`, {
     });
 
     res.json({ success: true });
