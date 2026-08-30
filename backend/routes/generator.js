@@ -411,11 +411,12 @@ router.post('/sms/smspool/purchase', async (req, res) => {
         }
       });
     } else {
-      res.json({ success: false, error: 'Purchase failed' });
+      console.error('[SMSPOOL] Purchase failed - invalid response:', data);
+      res.json({ success: false, error: 'Purchase failed', details: data });
     }
   } catch (error) {
-    console.error('[SMSPOOL] Purchase error:', error);
-    res.json({ success: false, error: 'Purchase failed' });
+    console.error('[SMSPOOL] Purchase error:', error.response?.data || error.message);
+    res.json({ success: false, error: 'Purchase failed', details: error.response?.data || error.message });
   }
 });
 
