@@ -234,9 +234,9 @@ router.post('/sms/fivesim/purchase', async (req, res) => {
     if (data.id && data.phone) {
       // Save order to database
       await db.query(`
-        INSERT INTO sms_orders (order_id, provider, service_name, country, number, user_id)
-        VALUES ($1, $2, $3, $4, $5, $6)
-      `, [data.id, 'fivesim', service, country, data.phone, userId]);
+        INSERT INTO sms_orders (order_id, provider, service_name, country, number, user_id, channel_id)
+        VALUES ($1, $2, $3, $4, $5, $6, $7)
+      `, [data.id, 'fivesim', service, country, data.phone, userId, null]);
 
       res.json({
         success: true,
@@ -398,9 +398,9 @@ router.post('/sms/smspool/purchase', async (req, res) => {
 
     if (data.success && data.number) {
       await db.query(`
-        INSERT INTO sms_orders (order_id, provider, service_name, country, number, user_id)
-        VALUES ($1, $2, $3, $4, $5, $6)
-      `, [data.order_id, 'smspool', service, country, data.number, userId]);
+        INSERT INTO sms_orders (order_id, provider, service_name, country, number, user_id, channel_id)
+        VALUES ($1, $2, $3, $4, $5, $6, $7)
+      `, [data.order_id, 'smspool', service, country, data.number, userId, null]);
 
       res.json({
         success: true,
