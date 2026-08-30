@@ -180,7 +180,7 @@ const FIVESIM_BASE = 'https://5sim.net/v1';
 
 router.get('/sms/fivesim/services', async (req, res) => {
   try {
-    const response = await axios.get(`${FIVESIM_BASE}/guest/products/russia/any`);
+    const response = await axios.get(`${FIVESIM_BASE}/guest/products/usa/any`);
     const data = response.data;
 
     const services = Object.keys(data).map(key => ({
