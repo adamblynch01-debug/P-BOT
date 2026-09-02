@@ -461,3 +461,13 @@ Safety/operations for the next thread:
   and restart only `pbot-backend` by default. `superbot` should remain online.
 
 - Final auth cleanup deployment: removed unreachable standalone Google account-creation branch after enforcing Discord-linked Google login. Backup: /var/backups/nullpoint/20260901-final/auth.js.pre-cleanup. Production auth SHA-256 now matches local: 25c8a2b71e40910f5f21f34404a4aed6b5c2ed3608358dc20783ed9033cc6a53.
+
+## Transition stop — 2026-09-01 continuation
+
+- Recovery validation completed locally: 116 project backend JavaScript files and all 24 inline website scripts parse successfully; auth hardening (49), server-side 2FA (26), delivery labels (29), and Movie Night stream contract tests pass.
+- A local recovery commit was created: `0e47c1d Recover generator vault movie night and access changes`.
+- `git push origin main` was rejected because GitHub `origin/main` advanced to `f681662` and contains 23 commits not present in this checkout (including later generator/SMS fixes).
+- A merge was attempted only locally, exposed add/add/content conflicts in `backend/routes/generator.js`, `backend/server.js`, and `backend/utils/discordAccess.js`, and was immediately aborted. No force-push was performed.
+- Current local branch is clean at `0e47c1d`, ahead of the old base by one commit and behind current `origin/main` by 23 commits. Production was not changed in this continuation; health remains HTTP 200, `pbot-backend` and `superbot` are online, and `streaming-bot` is stopped.
+- Production still has older copies of `index.html`, `backend/routes/generator.js`, `backend/routes/movieNight.js`, and `backend/routes/chat.js`; their local SHA-256 hashes differ. The local website is `C:\Users\VENOM-NODE\nullpoint-index.html` and is outside this Git repository.
+- Next thread: merge `origin/main` into the recovery commit carefully, preserving the remote generator/SMS fixes and the local Vault/access/Movie Night/chat hardening; rerun all validation; then back up and deploy only after explicit approval. Do not force-push, reset, clean, start `streaming-bot`, or expose secrets.
