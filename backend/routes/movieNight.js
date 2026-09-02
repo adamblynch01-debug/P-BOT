@@ -192,6 +192,22 @@ function normaliseBrowserItem(raw, kind, sourceUrl, fallbackIndex) {
   return { id, kind, title, group, logo: /^https:\/\//i.test(String(raw?.stream_icon || raw?.logo || '')) ? String(raw.stream_icon || raw.logo) : null, sourceUrl: url, container: String(raw?.container_extension || '').toLowerCase() || null };
 }
 
+function categoryMap(rows) {
+  const map = new Map();
+  (Array.isArray(rows) ? rows : []).forEach((row) => {
+    const id = String(row?.category_id ?? row?.id ?? '').trim();
+    const name = cleanString(row?.category_name || row?.name || '', 120);
+    if (id && name) map.set(id, name);
+  });
+  return map;
+}
+
+function withCategory(row, categories) {
+  if (!row || row.category_name) return row;
+  const category = categories.get(String(row.category_id ?? ''));
+  return category ? { ...row, category_name: category } : row;
+}
+
 async function parseM3U() {
   if (!IPTV_M3U_URL) return [];
   const response = await axios.get(IPTV_M3U_URL, { timeout: CONTROL_TIMEOUT_MS, responseType: 'text' });
@@ -224,12 +240,23 @@ async function getBrowserCatalog() {
       xtreamRequest('get_vod_streams'),
       xtreamRequest('get_series'),
     ]);
+    // Category endpoints are optional across Xtream providers. A provider
+    // may expose streams but reject one or more category calls; titles should
+    // still load, using the stream's own category_name when available.
+    const [liveCategories, vodCategories, seriesCategories] = await Promise.all([
+      xtreamRequest('get_live_categories').catch(() => []),
+      xtreamRequest('get_vod_categories').catch(() => []),
+      xtreamRequest('get_series_categories').catch(() => []),
+    ]);
+    const liveMap = categoryMap(liveCategories);
+    const vodMap = categoryMap(vodCategories);
+    const seriesMap = categoryMap(seriesCategories);
     const liveRows = Array.isArray(live) ? live : [];
     const movieRows = Array.isArray(movies) ? movies : [];
     const seriesRows = Array.isArray(series) ? series : [];
-    items = liveRows.map((row, i) => normaliseBrowserItem(row, 'live', `${iptvStreamOrigin()}/live/${encodeURIComponent(IPTV_USER)}/${encodeURIComponent(IPTV_PASSWORD)}/${row.stream_id}.${IPTV_LIVE_EXTENSION}`, i)).filter(Boolean)
-      .concat(movieRows.map((row, i) => normaliseBrowserItem(row, 'movie', `${iptvStreamOrigin()}/movie/${encodeURIComponent(IPTV_USER)}/${encodeURIComponent(IPTV_PASSWORD)}/${row.stream_id}.${row.container_extension || 'mp4'}`, i)).filter(Boolean))
-      .concat(seriesRows.map((row, i) => ({ id: Number.parseInt(row.series_id, 10) || stableStreamId(row.name, i), kind: 'series', title: cleanString(row.name, 180), group: cleanString(row.category_name || '', 120) || null, logo: /^https:\/\//i.test(String(row.cover || '')) ? String(row.cover) : null, sourceUrl: null, container: null })));
+    items = liveRows.map((row, i) => normaliseBrowserItem(withCategory(row, liveMap), 'live', `${iptvStreamOrigin()}/live/${encodeURIComponent(IPTV_USER)}/${encodeURIComponent(IPTV_PASSWORD)}/${row.stream_id}.${IPTV_LIVE_EXTENSION}`, i)).filter(Boolean)
+      .concat(movieRows.map((row, i) => normaliseBrowserItem(withCategory(row, vodMap), 'movie', `${iptvStreamOrigin()}/movie/${encodeURIComponent(IPTV_USER)}/${encodeURIComponent(IPTV_PASSWORD)}/${row.stream_id}.${row.container_extension || 'mp4'}`, i)).filter(Boolean))
+      .concat(seriesRows.map((row, i) => { const item = withCategory(row, seriesMap); return { id: Number.parseInt(item.series_id, 10) || stableStreamId(item.name, i), kind: 'series', title: cleanString(item.name, 180), group: cleanString(item.category_name || '', 120) || null, logo: /^https:\/\//i.test(String(item.cover || '')) ? String(item.cover) : null, sourceUrl: null, container: null }; }));
   } else {
     items = await parseM3U();
   }
@@ -436,20 +463,25 @@ router.get('/access', requireAuth, async (req, res) => {
 router.get('/catalog', requireAuth, requireMovieNightAccess, async (req, res) => {
   const search = cleanString(req.query.search, 100);
   const group = cleanString(req.query.group, 120);
+  const requestedKind = cleanString(req.query.kind, 20).toLowerCase();
+  const kind = ['live', 'movie', 'series'].includes(requestedKind) ? requestedKind : '';
   const limit = Math.max(1, Math.min(MAX_CATALOG_LIMIT, Number.parseInt(req.query.limit, 10) || 40));
   try {
     const browserCatalog = await getBrowserCatalog();
     if (browserCatalog) {
       const wanted = search.toLowerCase();
-      const filtered = browserCatalog.items.filter((item) => {
+      const matching = browserCatalog.items.filter((item) => {
+        if (kind && item.kind !== kind) return false;
         if (group && String(item.group || '') !== group) return false;
         if (!wanted) return true;
         return `${item.title} ${item.group || ''} ${item.kind}`.toLowerCase().includes(wanted);
-      }).slice(0, limit);
+      });
+      const filtered = matching.slice(0, limit);
+      const groups = [...new Set(matching.map((item) => item.group).filter(Boolean))].sort((a, b) => a.localeCompare(b));
       return res.json({
         channels: filtered.map((item) => publicChannel({ id: item.id, title: item.title, group: item.group, logo: item.logo, kind: item.kind })),
-        groups: browserCatalog.groups,
-        total: filtered.length,
+        groups,
+        total: matching.length,
         current: null,
         mode: 'browser',
       });
@@ -457,6 +489,7 @@ router.get('/catalog', requireAuth, requireMovieNightAccess, async (req, res) =>
     const params = new URLSearchParams({ limit: String(limit) });
     if (search) params.set('search', search);
     if (group) params.set('group', group);
+    if (kind) params.set('kind', kind);
     const data = await callControl('get', '/v1/catalog?' + params.toString());
     const channels = Array.isArray(data.channels) ? data.channels.map(publicChannel).filter(Boolean) : [];
     return res.json({
@@ -467,6 +500,39 @@ router.get('/catalog', requireAuth, requireMovieNightAccess, async (req, res) =>
     });
   } catch (error) {
     return res.status(error.statusCode || 503).json({ error: error.message || 'Could not load Movie Night catalog' });
+  }
+});
+
+function decodeXtreamText(value) {
+  const raw = String(value || '');
+  if (!raw) return '';
+  try {
+    const decoded = Buffer.from(raw, 'base64').toString('utf8').replace(/[\u0000-\u001f\u007f]/g, ' ').trim();
+    return decoded && /[A-Za-z0-9]/.test(decoded) ? decoded : cleanString(raw, 500);
+  } catch (_) { return cleanString(raw, 500); }
+}
+
+router.get('/epg/:streamId', requireAuth, requireMovieNightAccess, async (req, res) => {
+  const streamId = Number.parseInt(req.params.streamId, 10);
+  if (!Number.isSafeInteger(streamId) || streamId < 1) return res.status(400).json({ error: 'Invalid channel' });
+  if (!browserIptvConfigured() || !(IPTV_BASE && IPTV_USER && IPTV_PASSWORD)) {
+    return res.status(503).json({ error: 'Live TV guide is not configured' });
+  }
+  try {
+    const data = await xtreamRequest('get_short_epg', { stream_id: streamId, limit: 24 });
+    const entries = Array.isArray(data?.epg_listings) ? data.epg_listings : [];
+    return res.json({ stream_id: streamId, listings: entries.map((entry) => ({
+      id: cleanString(entry.id || '', 120),
+      title: decodeXtreamText(entry.title),
+      description: decodeXtreamText(entry.description),
+      start: cleanString(entry.start || '', 40),
+      end: cleanString(entry.end || '', 40),
+      start_timestamp: Number(entry.start_timestamp) || null,
+      stop_timestamp: Number(entry.stop_timestamp) || null,
+      now_playing: String(entry.now_playing) === '1',
+    })).filter((entry) => entry.title) });
+  } catch (error) {
+    return res.status(503).json({ error: 'Could not load the live TV guide' });
   }
 });
 

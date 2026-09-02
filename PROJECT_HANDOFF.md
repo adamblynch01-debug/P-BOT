@@ -542,3 +542,27 @@ Safety/operations for the next thread:
 - Before any further production mutation, create a new dated backup. Restart
   only `pbot-backend` by default; keep `superbot` online and
   `streaming-bot` stopped.
+
+## Movie Night catalog/guide playback fix (2026-09-02)
+
+- Follow-up issue: the browser showed only Live TV, had no Movies/Series view,
+  no guide, and channel playback appeared to do nothing.
+- Provider probe confirmed the configured Xtream account is valid (`auth=1`),
+  with approximately 27,820 live streams, 156,172 VOD movies, and 61,965
+  series. HLS live URLs return HTTP 200 and VOD MP4 URLs support byte ranges.
+- Updated `backend/routes/movieNight.js` to resolve Xtream category IDs to
+  category names, filter `/catalog` by `kind=live|movie|series`, report the
+  true matching total, and add role-gated `GET /api/movie-night/epg/:streamId`.
+  EPG text is decoded server-side and provider URLs/credentials remain private.
+- Updated `nullpoint-index.html` Movie Night UI with Live TV, Movies, and Series
+  tabs, per-kind search/category filters, a Live TV Guide panel, and a Guide
+  button for each live channel.
+- Category calls are optional/fault-tolerant so a provider that serves streams
+  but rejects category metadata still shows the catalog.
+- Validation: Movie Night browser stream contract passes; all 24 inline website
+  scripts parse; production health is HTTP 200; live site contains the player,
+  kind tabs, and guide UI; unauthenticated catalog remains HTTP 401.
+- Deployment backup: `/var/backups/nullpoint/20260902-151608/`.
+- Deployed the website and Movie Night route, then restarted only
+  `pbot-backend`. Final PM2 state: `pbot-backend` online, `superbot` online,
+  `streaming-bot` stopped. Temporary staging files were removed.
