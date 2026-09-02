@@ -25,7 +25,7 @@ const MAX_CATALOG_LIMIT = 100;
 // a provider that uses a different live extension.
 const STREAM_TOKEN_TTL_MS = 2 * 60 * 60 * 1000;
 const streamTokens = new Map();
-let browserCatalogCache = { at: 0, items: [], groups: [] };
+let browserCatalogCache = { at: 0, items: [], groups: [], byKind: {} };
 
 const MOVIE_NIGHT_SECRET_KEYS = {
   xtream_url: { env: 'MOVIE_NIGHT_XTREAM_URL', db: 'MOVIE_NIGHT_XTREAM_URL_ENC', label: 'Xtream server URL' },
@@ -73,7 +73,7 @@ function refreshRuntimeConfig() {
   runtimeConfigSignature = signature;
   // A changed connection must not leave a catalog from the previous provider
   // in memory or make the owner wait for the one-minute cache to expire.
-  browserCatalogCache = { at: 0, items: [], groups: [] };
+  browserCatalogCache = { at: 0, items: [], groups: [], byKind: {} };
 }
 
 refreshRuntimeConfig();
@@ -166,13 +166,16 @@ function stableStreamId(value, fallback) {
   return Math.abs(hash >>> 0) || 1;
 }
 
-async function xtreamRequest(action, extra) {
+async function xtreamRequest(action, extra, requestOptions) {
   if (!(IPTV_BASE && IPTV_USER && IPTV_PASSWORD)) return null;
   const base = /player_api\.php$/i.test(IPTV_BASE) ? IPTV_BASE : IPTV_BASE + '/player_api.php';
   const params = new URLSearchParams({ username: IPTV_USER, password: IPTV_PASSWORD, action: String(action) });
   Object.entries(extra || {}).forEach(([key, value]) => { if (value != null) params.set(key, String(value)); });
-  const response = await axios.get(base + '?' + params.toString(), { timeout: CONTROL_TIMEOUT_MS, validateStatus: (status) => status < 500 });
+  const response = await axios.get(base + '?' + params.toString(), { timeout: Number(requestOptions?.timeoutMs) || CONTROL_TIMEOUT_MS, validateStatus: (status) => status < 500 });
   if (response.status >= 400) throw new Error('IPTV catalog request failed');
+  if (action === 'get_live_streams' || action === 'get_vod_streams' || action === 'get_series') {
+    if (!Array.isArray(response.data)) throw new Error('IPTV catalog response was invalid');
+  }
   return response.data;
 }
 
@@ -230,30 +233,27 @@ async function parseM3U() {
   return items;
 }
 
-async function getBrowserCatalog() {
+async function getBrowserCatalog(requestedKind) {
   if (!browserIptvConfigured()) return null;
-  if (Date.now() - browserCatalogCache.at < 60_000 && browserCatalogCache.items.length) return browserCatalogCache;
+  const wantedKind = ['live', 'movie', 'series'].includes(String(requestedKind || '').toLowerCase()) ? String(requestedKind).toLowerCase() : '';
+  const cached = wantedKind ? browserCatalogCache.byKind[wantedKind] : browserCatalogCache;
+  if (cached && Date.now() - cached.at < 60_000 && cached.items.length) return cached;
   let items = [];
   if (IPTV_BASE && IPTV_USER && IPTV_PASSWORD) {
-    const [live, movies, series] = await Promise.all([
-      xtreamRequest('get_live_streams'),
-      xtreamRequest('get_vod_streams'),
-      xtreamRequest('get_series'),
-    ]);
+    const kinds = wantedKind ? [wantedKind] : ['live', 'movie', 'series'];
+    const actions = { live: 'get_live_streams', movie: 'get_vod_streams', series: 'get_series' };
+    const categoryActions = { live: 'get_live_categories', movie: 'get_vod_categories', series: 'get_series_categories' };
+    const rowsByKind = Object.fromEntries(await Promise.all(kinds.map(async (kind) => [kind, await xtreamRequest(actions[kind], null, { timeoutMs: 30_000 })] )));
     // Category endpoints are optional across Xtream providers. A provider
     // may expose streams but reject one or more category calls; titles should
     // still load, using the stream's own category_name when available.
-    const [liveCategories, vodCategories, seriesCategories] = await Promise.all([
-      xtreamRequest('get_live_categories').catch(() => []),
-      xtreamRequest('get_vod_categories').catch(() => []),
-      xtreamRequest('get_series_categories').catch(() => []),
-    ]);
-    const liveMap = categoryMap(liveCategories);
-    const vodMap = categoryMap(vodCategories);
-    const seriesMap = categoryMap(seriesCategories);
-    const liveRows = Array.isArray(live) ? live : [];
-    const movieRows = Array.isArray(movies) ? movies : [];
-    const seriesRows = Array.isArray(series) ? series : [];
+    const categoriesByKind = Object.fromEntries(await Promise.all(kinds.map(async (kind) => [kind, categoryMap(await xtreamRequest(categoryActions[kind], null, { timeoutMs: 15_000 }).catch(() => []))])));
+    const liveRows = Array.isArray(rowsByKind.live) ? rowsByKind.live : [];
+    const movieRows = Array.isArray(rowsByKind.movie) ? rowsByKind.movie : [];
+    const seriesRows = Array.isArray(rowsByKind.series) ? rowsByKind.series : [];
+    const liveMap = categoriesByKind.live || new Map();
+    const vodMap = categoriesByKind.movie || new Map();
+    const seriesMap = categoriesByKind.series || new Map();
     items = liveRows.map((row, i) => normaliseBrowserItem(withCategory(row, liveMap), 'live', `${iptvStreamOrigin()}/live/${encodeURIComponent(IPTV_USER)}/${encodeURIComponent(IPTV_PASSWORD)}/${row.stream_id}.${IPTV_LIVE_EXTENSION}`, i)).filter(Boolean)
       .concat(movieRows.map((row, i) => normaliseBrowserItem(withCategory(row, vodMap), 'movie', `${iptvStreamOrigin()}/movie/${encodeURIComponent(IPTV_USER)}/${encodeURIComponent(IPTV_PASSWORD)}/${row.stream_id}.${row.container_extension || 'mp4'}`, i)).filter(Boolean))
       .concat(seriesRows.map((row, i) => { const item = withCategory(row, seriesMap); return { id: Number.parseInt(item.series_id, 10) || stableStreamId(item.name, i), kind: 'series', title: cleanString(item.name, 180), group: cleanString(item.category_name || '', 120) || null, logo: /^https:\/\//i.test(String(item.cover || '')) ? String(item.cover) : null, sourceUrl: null, container: null }; }));
@@ -261,8 +261,10 @@ async function getBrowserCatalog() {
     items = await parseM3U();
   }
   const groups = [...new Set(items.map((item) => item.group).filter(Boolean))].sort((a, b) => a.localeCompare(b));
-  browserCatalogCache = { at: Date.now(), items, groups };
-  return browserCatalogCache;
+  const result = { at: Date.now(), items, groups };
+  if (wantedKind) browserCatalogCache.byKind[wantedKind] = result;
+  else browserCatalogCache = { ...result, byKind: {} };
+  return result;
 }
 
 function issueStreamToken(userId, item) {
@@ -642,7 +644,7 @@ router.post('/play', requireAuth, requireMovieNightAccess, async (req, res) => {
         if (!tokenEntry) return res.status(404).json({ error: 'This playback link has expired' });
         item = { id: channelId, kind: tokenEntry.kind, title: tokenEntry.title, group: null, sourceUrl: tokenEntry.sourceUrl };
       } else {
-        const catalog = await getBrowserCatalog();
+        const catalog = await getBrowserCatalog(kind);
         item = catalog && catalog.items.find((candidate) => Number(candidate.id) === channelId && String(candidate.kind) === kind);
       }
       if (!item || !item.sourceUrl) {
