@@ -471,3 +471,11 @@ Safety/operations for the next thread:
 - Current local branch is clean at `0e47c1d`, ahead of the old base by one commit and behind current `origin/main` by 23 commits. Production was not changed in this continuation; health remains HTTP 200, `pbot-backend` and `superbot` are online, and `streaming-bot` is stopped.
 - Production still has older copies of `index.html`, `backend/routes/generator.js`, `backend/routes/movieNight.js`, and `backend/routes/chat.js`; their local SHA-256 hashes differ. The local website is `C:\Users\VENOM-NODE\nullpoint-index.html` and is outside this Git repository.
 - Next thread: merge `origin/main` into the recovery commit carefully, preserving the remote generator/SMS fixes and the local Vault/access/Movie Night/chat hardening; rerun all validation; then back up and deploy only after explicit approval. Do not force-push, reset, clean, start `streaming-bot`, or expose secrets.
+
+## Merge continuation — 2026-09-01
+
+- Merged the 23-commit `origin/main` update locally as `a5e6be3` (`Merge remote-tracking branch 'origin/main'`).
+- Kept the recovery versions of `backend/routes/generator.js`, `backend/server.js`, and `backend/utils/discordAccess.js` during conflict resolution because they contain the authenticated generator, Vault/Movie Night/chat mounts, and Discord-role helpers. The recovery generator already includes the upstream Axios/USA catalog/channel-id SMS fixes.
+- The local branch is clean and is three commits ahead of `origin/main`; no force-push was attempted and production was not changed.
+- Validation passed: all 116 backend JavaScript files parse; all 24 inline scripts in `nullpoint-index.html` parse; `test_auth_hardening.js` (49 assertions), `test_2fa_server_side.js` (26), `test_delivery_game_label.js` (29), and `backend/test_movie_night_stream.js` pass.
+- Deployment remains intentionally pending explicit approval. Before deployment, back up remote files, browser-test the Vault handoff and Movie Night playback, restart only `pbot-backend`, and keep `superbot` online and `streaming-bot` stopped.
