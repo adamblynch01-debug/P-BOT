@@ -566,3 +566,24 @@ Safety/operations for the next thread:
 - Deployed the website and Movie Night route, then restarted only
   `pbot-backend`. Final PM2 state: `pbot-backend` online, `superbot` online,
   `streaming-bot` stopped. Temporary staging files were removed.
+
+## Movie Night playback/guide follow-up (2026-09-02)
+
+- Owner reported that the guide should not permanently dominate the page, movie
+  and series titles were not visible, and Live TV clicks left a black player.
+- Updated the browser UI in `C:\Users\VENOM-NODE\nullpoint-index.html` with a
+  side-panel guide, explicit Hide guide/Show guide control, channel-specific
+  guide headings, and player `error`, `playing`, and HLS fatal-network status
+  handling. HLS loading now has a jsDelivr fallback to unpkg.
+- Updated `backend/routes/movieNight.js` so a selected kind loads only its own
+  Xtream feed (avoiding a slow all-catalog fetch before playback), with
+  per-kind cache entries. Category metadata remains optional/fault-tolerant.
+- Validation: all 24 inline website scripts parse; backend syntax check passes;
+  `test_movie_night_stream.js` passes. Provider-side probes confirmed Xtream
+  auth=1, live HLS HTTP 200, and VOD MP4 byte-range support.
+- Fresh deployment backup: `/var/backups/nullpoint/20260902-162543/`.
+- Deployed the updated website and Movie Night route and restarted only
+  `pbot-backend`; `superbot` stayed online and `streaming-bot` stayed stopped.
+  Health remained HTTP 200 and unauthenticated catalog access remained 401.
+- If a user still sees the old layout, perform a hard refresh (Ctrl+F5) because
+  the single-file site can be cached by the browser/CDN.
