@@ -1,6 +1,6 @@
 # ZEROPOINT / P-BOT Project Handoff
 
-Last updated: 2026-09-01 (America/Chicago) — stopping point after todo review
+Last updated: 2026-09-02 (Asia/Tokyo) — Movie Night and generator deployment complete
 
 This file is the durable handoff for continuing work in a new thread after a
 computer failure or context reset. Do not put secrets, tokens, passwords, or
@@ -499,3 +499,46 @@ Safety/operations for the next thread:
   website scripts, Movie Night browser stream contract, auth hardening (49),
   server-side 2FA (26), and delivery labels (29) all pass. No production
   files, secrets, database rows, or PM2 processes were changed.
+
+## New-thread transition — deployment complete (2026-09-02)
+
+- Owner approved deployment of Movie Night and generator changes.
+- Production backup created before mutation at:
+  `/var/backups/nullpoint/20260902-071200/`.
+- Deployed `C:\Users\VENOM-NODE\nullpoint-index.html` to
+  `/var/www/html/index.html`. The live page now contains the browser media
+  player (`mnPlayer`), Movie Night catalog UI, and no old Discord watch-room
+  copy. Website HTTP status is 200.
+- Deployed the validated backend route/server/util files and applied, in order:
+  `generator_access_v2.sql`, `generator_access_v3_typed_plans.sql`,
+  `generator_unified_stock.sql`, `generator_stock_email_password.sql`, and
+  `movie_night.sql`.
+- IPTV values from `C:\Users\VENOM-NODE\IPTV LOGIN.txt` were read locally and
+  stored encrypted in the production `config` table. Xtream authentication
+  returned `auth=1`. No credential value is recorded here or exposed to
+  website users. The M3U and Xtream hosts are configured.
+- Movie Night is enabled and role-gated to Discord role ID
+  `1544152852140785764` (`🎥 𝐌𝐎𝐕𝐈𝐄 𝐍𝐈𝐆𝐇𝐓`).
+- Restarted only `pbot-backend`; final PM2 state is `pbot-backend` online,
+  `superbot` online, and `streaming-bot` stopped. Do not start
+  `streaming-bot` without explicit owner approval.
+- Production health check: `https://nullpoint.top/health` returned HTTP 200
+  with `{"status":"ok","store":"ZEROPOINT"}`. Unauthenticated Movie Night
+  access/catalog requests correctly return HTTP 401. SMS service discovery
+  also returns HTTP 401 without authentication/entitlement.
+- Local and production SHA-256 hashes match for the deployed website,
+  `server.js`, and Chat/Config/Generator/MovieNight/Vault routes.
+- Temporary remote staging files were removed after deployment. The source
+  repository is clean at commit `59a6251`.
+
+### Next-thread safety and starting point
+
+- Treat this section as superseding older notes that say deployment is pending.
+- Read `Documents\todo2.txt` if the owner asks to continue the original todo;
+  its requested items are now deployed, with browser/functional follow-up still
+  appropriate for Vault handoff and playback UX.
+- Never print, quote, commit, or send IPTV credentials, API keys, `.env`
+  values, or the SSH private key. Do not copy secrets into this handoff.
+- Before any further production mutation, create a new dated backup. Restart
+  only `pbot-backend` by default; keep `superbot` online and
+  `streaming-bot` stopped.
