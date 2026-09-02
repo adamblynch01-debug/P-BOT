@@ -601,3 +601,14 @@ Safety/operations for the next thread:
   still black. Verify guide side-panel hide/show behavior at the same time.
 - Never expose IPTV credentials, M3U URLs, tokens, API keys, `.env` values, or
   the deployment SSH key while diagnosing or documenting playback.
+
+### Latest owner browser result (2026-09-02)
+
+- Movies and TV series titles now display correctly and catalog browsing looks
+  good.
+- Playback still fails after selecting content: the player remains at `0:00`
+  and shows `Playback error (code 4)`; screenshot:
+  `C:\Users\VENOM-NODE\Pictures\no video playing.PNG`.
+- Treat this as the next debugging target: capture console errors and the
+  `/api/movie-night/play` plus `/api/movie-night/stream/<token>` network
+  responses for one failing item. Do not expose provider URLs or credentials.
