@@ -56,6 +56,26 @@ const PROVIDERS = {
     base: process.env.AIMBETTER_API_BASE || 'https://aimbetter.site/api/v1',
     keyEnv: 'AIMBETTER_API_KEY',
   },
+  delta: {
+    label: 'Delta Solutions',
+    base: process.env.DELTA_API_BASE || 'https://deltasolutions.uk/api/v1',
+    keyEnv: 'DELTA_API_KEY',
+  },
+  kairos: {
+    label: 'Kairos (Pytguard)',
+    base: process.env.KAIROS_API_BASE || 'https://pytguard.com/ext/vendor',
+    keyEnv: 'KAIROS_API_KEY',
+    // Kairos has a different URL format: the key is in the path, not query string
+    customFormat: true,
+  },
+  codlabs: {
+    label: 'CODLABS (SellAuth)',
+    base: process.env.CODLABS_API_BASE || 'https://api.sellauth.com',
+    keyEnv: 'CODLABS_API_KEY',
+    // CODLABS uses a completely different API (REST JSON, not Flask)
+    customFormat: true,
+    apiType: 'sellauth',
+  },
 };
 const DEFAULT_SUPPLIER = 'gandy';
 
@@ -296,14 +316,75 @@ async function purchase(link, { qty = 1, orderId = null, buyerRef = null } = {})
     return { status, deliveryId, ...patch };
   };
 
-  const url = `${provider.base}/deliver/${encodeURIComponent(link.supplier_product_id)}`;
+  // Build URL based on supplier format
+  let url;
+  let params;
+  let requestConfig;
+
+  // CODLABS uses a completely different API (SellAuth REST API)
+  if (provider.apiType === 'sellauth' && supplierName === 'codlabs') {
+    const codlabs = require('./suppliers/codlabs');
+
+    try {
+      // supplier_product_id format: "productId:variantId" e.g. "123:456"
+      const [productId, variantId] = link.supplier_product_id.split(':').map(Number);
+
+      if (!productId || !variantId) {
+        return finish('error', { error: `Invalid CODLABS product format: ${link.supplier_product_id}. Expected "productId:variantId"` });
+      }
+
+      // Generate idempotency key from order ID to prevent duplicate charges on retry
+      const idempotencyKey = orderId ? `pbot-order-${orderId}` : null;
+
+      const result = await codlabs.purchase(productId, variantId, 1, idempotencyKey);
+
+      if (!result.success || !result.items || !result.items.length) {
+        return finish('error', { error: 'CODLABS purchase returned no items' });
+      }
+
+      const item = result.items[0];
+      const delivered = item.delivered || [];
+
+      if (!delivered.length) {
+        return finish('error', { error: `CODLABS purchase succeeded but no keys delivered (status: ${item.status})` });
+      }
+
+      console.log(`[Supplier] CODLABS delivered ${delivered.length} key(s) for order ${orderId || '(none)'}`);
+
+      return finish('ok', { lines: delivered });
+
+    } catch (err) {
+      const errorMsg = err.message || 'Unknown CODLABS error';
+      console.error('[Supplier] CODLABS purchase failed:', redact(errorMsg));
+
+      // "Insufficient balance" is an error we can report clearly
+      if (errorMsg.includes('Insufficient') || errorMsg.includes('balance')) {
+        return finish('error', { error: 'CODLABS: Insufficient reseller balance' });
+      }
+
+      return finish('error', { error: `CODLABS: ${errorMsg}` });
+    }
+  }
+
+  // Kairos format: https://pytguard.com/ext/vendor/{key}/kairos/{duration}
+  if (provider.customFormat && supplierName === 'kairos') {
+    // Kairos format: https://pytguard.com/ext/vendor/{key}/kairos/{duration}
+    // supplier_product_id should be: day, week, month, or lifetime
+    url = `${provider.base}/${apiKey(supplierName)}/kairos/${encodeURIComponent(link.supplier_product_id)}`;
+    params = buyerRef ? { buyerRef } : {};
+  } else {
+    // Standard format: /deliver/{product_id}?key=xxx&qty=1
+    url = `${provider.base}/deliver/${encodeURIComponent(link.supplier_product_id)}`;
+    params = Object.assign(
+      { key: apiKey(supplierName), qty: units },
+      buyerRef ? { buyerRef } : {}
+    );
+  }
+
   let res;
   try {
     res = await axios.get(url, {
-      params: Object.assign(
-        { key: apiKey(supplierName), qty: units },
-        buyerRef ? { buyerRef } : {}
-      ),
+      params: params,
       timeout: TIMEOUT_MS,
       // We want the body on a 4xx/5xx too — their error text is more useful
       // than the status code, and axios would otherwise throw it away into an

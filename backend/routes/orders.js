@@ -6,7 +6,7 @@ const { generateNote } = require('../utils/noteGenerator');
 const { generateCryptoAddress, registerWebhook, quoteCrypto } = require('../utils/cryptoUtils');
 const { notifyBot } = require('../utils/botNotify');
 const { invoiceNo, normalizeInvoiceNo } = require('../utils/invoiceNo');
-const { attachUser, requireAuth, requireAdmin, requireDiscordLinked, botAuthorized, botAuthUnavailable } = require('../utils/auth');
+const { attachUser, requireAuth, requireAdmin, requireDiscordLinked, requireCurrentDiscordMember, botAuthorized, botAuthUnavailable } = require('../utils/auth');
 const { safeCompare } = require('../utils/rateLimit');
 // The shop's currency, and the only place it is decided. See utils/money.js for
 // why a `$`-to-`€` sweep is not the same job as changing currency.
@@ -650,7 +650,7 @@ router.post('/quote', attachUser, async (req, res) => {
 // arrived in the BODY, so an order could name any snowflake the buyer liked,
 // and the delivery DM went to a stranger. It is now read from the session and
 // the body field is ignored.
-router.post('/create', requireAuth, requireDiscordLinked, async (req, res) => {
+router.post('/create', requireAuth, requireCurrentDiscordMember, async (req, res) => {
   try {
     const { items, email, payment_method, coupon_code } = req.body;
 

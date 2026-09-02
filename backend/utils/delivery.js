@@ -84,6 +84,128 @@ function collectFailures(deliveredGoods) {
   return failures;
 }
 
+// Normalise catalog labels into the Software Tracker's parser-friendly form.
+// Legacy tiers often use bare labels ("Day", "Week", "Month") while the
+// Vault UI expects a numeric duration such as "7 Days". Unknown labels remain
+// visible rather than being guessed.
+function trackerDuration(label) {
+  const raw = String(label || '').trim();
+  // Missing metadata is not evidence of a lifetime license. Keep it unknown
+  // so the Vault never silently displays the wrong subscription term.
+  if (!raw) return null;
+  const lower = raw.toLowerCase();
+  if (lower.includes('lifetime')) return 'Lifetime';
+  const n = Number.parseFloat(raw);
+  if (lower.includes('year')) return `${(Number.isFinite(n) ? n : 1) * 365} Days`;
+  if (lower.includes('month')) return `${(Number.isFinite(n) ? n : 1) * 30} Days`;
+  if (lower.includes('week')) return `${(Number.isFinite(n) ? n : 1) * 7} Days`;
+  if (lower.includes('day')) return `${Number.isFinite(n) ? n : 1} Days`;
+  return raw;
+}
+
+// Every delivered license key is also a Software Tracker record. This is
+// written server-side from the same delivered_goods that the order receipt
+// uses, so a browser cannot forge or lose tracker entries by editing
+// localStorage. The deterministic id and order/key check make retries safe.
+async function syncDeliveredGoodsToVault(order, deliveredGoods) {
+  if (!order || !order.web_user_id || !GUILD_ID) return;
+  const orderNum = order.invoice_no || String(order.id);
+  const paidAt = order.delivered_at || order.paid_at || order.created_at || new Date().toISOString();
+  const paidDate = new Date(paidAt);
+  const purchaseDate = Number.isNaN(paidDate.getTime())
+    ? new Date().toISOString().slice(0, 10)
+    : paidDate.toISOString().slice(0, 10);
+  let snapshots = order.items_snapshot;
+  if (typeof snapshots === 'string') {
+    try { snapshots = JSON.parse(snapshots); } catch (_) { snapshots = []; }
+  }
+  if (!Array.isArray(snapshots)) snapshots = [];
+  await withTransaction(async (exec) => {
+    // A first delivery for a user has no vault_data row yet.  Create it before
+    // locking so the SELECT below always gives us a row to merge into.
+    await exec(
+      `INSERT INTO vault_data (user_id, guild_id, data, updated_at)
+       VALUES ($1, $2, '{}'::jsonb, now())
+       ON CONFLICT (user_id, guild_id) DO NOTHING`,
+      [order.web_user_id, GUILD_ID]
+    );
+    const { rows } = await exec(
+      `SELECT data FROM vault_data WHERE user_id = $1 AND guild_id = $2 FOR UPDATE`,
+      [order.web_user_id, GUILD_ID]
+    );
+    const data = rows.length && rows[0].data && typeof rows[0].data === 'object' ? rows[0].data : {};
+    const tracker = Array.isArray(data.sw) ? data.sw : [];
+    const seen = new Set(tracker.map((item) => `${item.orderNum || ''}\u0000${item.key || ''}`));
+    let changed = false;
+    let index = 0;
+    let lineIndex = 0;
+    for (const line of (deliveredGoods || [])) {
+      const snapshot = snapshots[lineIndex] || {};
+      const tierLabel = line.tier_label || snapshot.tier_label || snapshot.period || null;
+      if (String(line.product || '').toLowerCase() === 'balance top-up') { index += (line.items || []).length; lineIndex++; continue; }
+      for (const raw of (line.items || [])) {
+        const value = raw == null ? '' : String(raw).trim();
+        if (!value || FAILURE_MARKERS.has(value)) { index++; continue; }
+        // Non-key status text (wallet credits, custom payments) is not a
+        // software license and should not pollute the tracker.
+        if (/^(ALREADY_CREDITED|CREDIT_FAILED|NO_ACCOUNT_LINKED)$/i.test(value)) { index++; continue; }
+        if (/manual fulfillment/i.test(value)) { index++; continue; }
+        const dedupe = `${orderNum}\u0000${value}`;
+        if (seen.has(dedupe)) {
+          // Older deliveries were written with the purchase date in
+          // dateActivated. Preserve an explicitly activated key, but repair
+          // untouched legacy rows so the subscription does not start ticking
+          // before the customer chooses ACTIVATE.
+          const existing = tracker.find((item) => `${item.orderNum || ''}\u0000${item.key || ''}` === dedupe);
+          if (existing && existing.source === 'website-order' && !existing.purchaseDate) {
+            existing.purchaseDate = purchaseDate;
+            if (!existing.activationStatus || existing.dateActivated === purchaseDate) {
+              existing.dateActivated = null;
+              existing.activationStatus = 'not_activated';
+            }
+            changed = true;
+          }
+          index++;
+          continue;
+        }
+        const id = `order_${order.id}_${index}`;
+        tracker.push({
+          id,
+          client: order.email || order.discord_id || 'Customer',
+          name: line.product || 'Delivered license',
+          // Purchase is recorded immediately; the subscription clock starts
+          // only after the customer explicitly activates the key in the Vault.
+          purchaseDate,
+          dateActivated: null,
+          activationStatus: 'not_activated',
+          duration: trackerDuration(tierLabel),
+          seller: 'NullPoint',
+          paymentMethod: order.payment_method ? String(order.payment_method).toUpperCase() : 'CRYPTO',
+          key: value,
+          price: line.unit_price == null ? '' : String(line.unit_price),
+          orderNum,
+          notes: line.game ? `Automatically added from website order — Game: ${line.game}` : 'Automatically added from website order',
+          tags: ['purchased', 'website'],
+          source: 'website-order',
+        });
+        seen.add(dedupe);
+        changed = true;
+        index++;
+      }
+      lineIndex++;
+    }
+    if (!changed) return;
+    data.sw = tracker;
+    await exec(
+      `INSERT INTO vault_data (user_id, guild_id, data, updated_at)
+       VALUES ($1, $2, $3, now())
+       ON CONFLICT (user_id, guild_id)
+       DO UPDATE SET data = $3, updated_at = now()`,
+      [order.web_user_id, GUILD_ID, JSON.stringify(data)]
+    );
+  });
+}
+
 async function deliver(order) {
   try {
     const items = Array.isArray(order.items_snapshot)
@@ -298,6 +420,18 @@ async function deliver(order) {
         { severity: 'error', order_id: order.id, context: { attempted_status: finalStatus } }).catch(() => {});
     }
 
+    // Keep the Software Tracker in lockstep with the order's authoritative
+    // delivery record. A failure here must not erase the order; raise an alert
+    // for staff while the customer can still see the delivered order itself.
+    try {
+      await syncDeliveredGoodsToVault(order, deliveredGoods);
+    } catch (vaultErr) {
+      console.error(`[Delivery] Vault tracker sync failed for order ${order.id}:`, vaultErr.message);
+      await raiseAlert('delivery_vault_sync_failed',
+        `Order ${order.id} delivered but Software Tracker sync failed: ${vaultErr.message}`,
+        { severity: 'error', order_id: order.id, context: { web_user_id: order.web_user_id } }).catch(() => {});
+    }
+
     // Not awaited: deliver() runs inside the customer's checkout request, and
     // this is a Discord round-trip that can burn the full 8s notify timeout.
     // The goods are already written to the order row above, and the storefront
@@ -348,4 +482,4 @@ async function deliver(order) {
   }
 }
 
-module.exports = { deliver };
+module.exports = { deliver, syncDeliveredGoodsToVault };

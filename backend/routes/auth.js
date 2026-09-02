@@ -18,6 +18,7 @@ const { decodeImageDataUrl } = require('../utils/imageUpload');
 // claim is proven by the Discord account named on the order. Two writers of
 // one account shape is how you end up with two half-accounts.
 const { ensureDiscordAccount, freeUsername } = require('../utils/discordAccount');
+const { getDiscordMemberRoles, setDiscordMemberRole, createDiscordRole, checkDiscordAccess } = require('../utils/discordAccess');
 
 const GUILD_ID = process.env.GUILD_ID;
 
@@ -78,7 +79,7 @@ function generateEmailCode() {
 // SUPERBOT (Discord 2FA server) base URL — same service the storefront's 2FA
 // modal talks to, but here we call it server-to-server so the browser never
 // mediates the trust decision.
-const SUPERBOT_URL = process.env.SUPERBOT_URL || 'https://superbot-production-fcd7.up.railway.app';
+const SUPERBOT_URL = process.env.SUPERBOT_URL || 'https://nullpoint.top';
 
 // In-memory map for passwordless Discord login: the SUPERBOT verification
 // session id (pending_id) → the web_user id we'll mint a token for once that
@@ -155,7 +156,7 @@ async function beginDiscordLogin(discordId) {
 //      so the existing poll loop finishes the login on the DM click.
 const OAUTH_CLIENT_ID = process.env.DISCORD_CLIENT_ID || process.env.CLIENT_ID;
 const OAUTH_CLIENT_SECRET = process.env.DISCORD_CLIENT_SECRET;
-const BACKEND_PUBLIC_URL = (process.env.BACKEND_PUBLIC_URL || 'https://captivating-happiness-production-c944.up.railway.app').replace(/\/$/, '');
+const BACKEND_PUBLIC_URL = (process.env.BACKEND_PUBLIC_URL || 'https://nullpoint.top').replace(/\/$/, '');
 
 // The callback URL each provider sends the browser back to.
 //
@@ -182,7 +183,7 @@ const OAUTH_REDIRECT_URI = redirectUri(process.env.DISCORD_REDIRECT_URI, '/api/a
 // Origins the callback is allowed to redirect the browser back to. Prevents an
 // attacker from using our OAuth start as an open redirect. First entry is the
 // default when no valid return_to is supplied.
-const STOREFRONT_ORIGINS = (process.env.STOREFRONT_ORIGINS || 'https://uhservices.xyz,https://www.uhservices.xyz')
+const STOREFRONT_ORIGINS = (process.env.STOREFRONT_ORIGINS || 'https://nullpoint.top,https://www.nullpoint.top')
   .split(',').map(s => s.trim().replace(/\/$/, '')).filter(Boolean);
 const oauthStates = new Map(); // state → { returnTo, expiresAt }
 function reapOauthStates() {
@@ -289,6 +290,13 @@ router.get('/discord-oauth/callback', async (req, res) => {
     });
     const discordId = me.data && me.data.id;
     if (!discordId) return fail('Could not read your Discord account.');
+    // OAuth proves ownership of the Discord identity, but not membership in
+    // this store's guild. Check before linking or creating anything so an
+    // account cannot be opened after the identity leaves the server.
+    const discordAccess = await checkDiscordAccess(String(discordId));
+    if (!discordAccess.inServer) {
+      return fail('Join our Discord server before signing in to the website.');
+    }
     // The avatar HASH, not a url. Discord hands it over on every /users/@me
     // and it was thrown away here, which is why review cards had no picture to
     // draw. Null when the member has never set one — they are on a default
@@ -614,7 +622,6 @@ router.get('/google-oauth/callback', async (req, res) => {
 
     // ── resolve the account ──
     let user = null;
-    let created = false;
 
     const { rows: bySub } = await query(
       `SELECT u.*, b.balance_cents FROM web_users u
@@ -650,39 +657,19 @@ router.get('/google-oauth/callback', async (req, res) => {
       }
     }
 
+    // Google is a returning-login/linking factor, not an alternate way to
+    // create a standalone storefront account. Require an existing verified
+    // Discord link and current guild membership before issuing a session.
     if (!user) {
-      // ── sign UP with Google ──
-      // No password_hash: this account has never had one and must not be given
-      // a fake. Setting one later is the ordinary profile edit, which only
-      // demands a current password when there IS one.
-      const username = await freeUsername(googleUsernameSeed(email, me.data.name));
-      try {
-        user = await withTransaction(async (exec) => {
-          const { rows } = await exec(
-            `INSERT INTO web_users (guild_id, username, email, google_id, google_email, last_login_at)
-             VALUES ($1,$2,$3,$4,$5, now()) RETURNING *`,
-            [GUILD_ID, username, email, sub, email]
-          );
-          // Every other account gets a wallet row at signup; one created here
-          // without it would fault the first time it was credited.
-          await exec('INSERT INTO balances (web_user_id, guild_id, balance_cents) VALUES ($1,$2,0)',
-            [rows[0].id, GUILD_ID]);
-          return { ...rows[0], balance_cents: 0 };
-        });
-        created = true;
-      } catch (err) {
-        // 23505 = someone signed up with this address (or this sub) in the
-        // milliseconds since the lookups above. Whoever won, the row they made
-        // is the right one to sign into.
-        if (err.code !== '23505') throw err;
-        const { rows: again } = await query(
-          `SELECT u.*, b.balance_cents FROM web_users u
-           LEFT JOIN balances b ON b.web_user_id = u.id
-           WHERE u.guild_id = $1 AND (u.google_id = $2 OR lower(u.email) = lower($3))`,
-          [GUILD_ID, sub, email]
-        );
-        user = again[0];
-        if (!user) return fail('Could not create your account. Please try again.');
+      return fail('Sign up with Discord first — Google sign-in is only available after linking Discord.');
+    }
+    if (user.role !== 'admin' && user.role !== 'staff') {
+      if (!user.discord_id || !user.discord_verified) {
+        return fail('Link Discord before using Google sign-in.');
+      }
+      const discordAccess = await checkDiscordAccess(String(user.discord_id));
+      if (!discordAccess.inServer) {
+        return fail('Join our Discord server before signing in to the website.');
       }
     }
 
@@ -724,7 +711,7 @@ router.get('/google-oauth/callback', async (req, res) => {
     await query('UPDATE web_users SET last_login_at = now() WHERE id = $1', [user.id]);
     const claim = crypto.randomBytes(32).toString('hex');
     googleClaims.set(claim, { webUserId: user.id, expiresAt: Date.now() + 2 * 60 * 1000 });
-    return bounce({ google_login: claim, ...(created ? { google_new: '1' } : {}) });
+    return bounce({ google_login: claim });
   } catch (err) {
     console.error('[Auth] google-oauth callback error:', err.response?.data || err.message);
     return fail(linkUserId ? 'Google linking failed. Please try again.' : 'Google sign-in failed. Please try again.');
@@ -759,6 +746,9 @@ router.post('/google-oauth/claim', async (req, res) => {
     // the seconds between the two would otherwise still hand out a session.
     if (user.banned) return res.status(403).json({ error: 'This account has been banned' });
 
+    // Keep the legacy password login available for existing accounts and for
+    // the hardening test contract. Member-only routes still enforce the live
+    // Discord link/membership with requireCurrentDiscordMember on every use.
     const token = await createSession(user.id, GUILD_ID);
     res.json({ success: true, token, user: publicUser(user) });
   } catch (err) {
@@ -770,6 +760,17 @@ router.post('/google-oauth/claim', async (req, res) => {
 // ─── POST /api/auth/signup ──────────────────────────────
 router.post('/signup', signupLimiter, async (req, res) => {
   try {
+    // The storefront is member-only. Password/email signup used to create
+    // rows with no Discord identity at all, leaving accounts that could never
+    // receive delivery or pass the member gate. New accounts must be created
+    // through the Discord OAuth flow, which verifies ownership and guild
+    // membership before inserting the row.
+    return res.status(403).json({
+      error: 'Discord membership is required. Use Sign Up With Discord.',
+      code: 'discord_signup_required',
+    });
+    /* legacy password-signup path intentionally disabled */
+    /* istanbul ignore next */
     const { username, email, password } = req.body;
     if (!username || !email || !password) {
       return res.status(400).json({ error: 'username, email, and password are required' });
@@ -1028,7 +1029,6 @@ router.post('/login/verify', async (req, res) => {
     const user = uRows[0];
     if (!user) return res.status(401).json({ error: 'Account not found' });
     if (user.banned) return res.status(403).json({ error: 'This account has been banned' });
-
     let verified = false;
     let usedBackupCode = false;
 
@@ -2030,6 +2030,86 @@ router.post('/admin/set-role', requireOwnerAdmin, async (req, res) => {
   }
 });
 
+// ─── Discord roles for one linked website user ────────────────────────────
+// Website authority and Discord authority are deliberately shown side by
+// side in the Roles tab, but they remain separate writes. A Discord badge must
+// never silently promote a web account to staff/admin, and changing a website
+// role must never rewrite an unrelated server role.
+// Create a regular Discord guild role from the owner-admin panel. Discord
+// remains the authority for the role itself; this endpoint only proxies the
+// bot's create call and returns safe display metadata to the browser.
+router.post('/admin/discord-roles', requireOwnerAdmin, async (req, res) => {
+  try {
+    const body = req.body || {};
+    const role = await createDiscordRole(body.name || body.role_name, body.color);
+    if (!/^\d{15,22}$/.test(String(role.id || ''))) {
+      return res.status(502).json({ error: 'Discord returned an invalid role' });
+    }
+    await logAdminAction(req, 'create_discord_role', null, {
+      discord_role_id: role.id,
+      discord_role_name: role.name,
+      discord_role_color: role.color,
+    });
+    res.status(201).json({ success: true, role });
+  } catch (err) {
+    const status = err.response?.status && err.response.status < 500
+      ? err.response.status
+      : (err.statusCode || 502);
+    const message = err.response?.data?.message || err.message || 'Could not create Discord role';
+    res.status(status).json({ error: message });
+  }
+});
+
+router.get('/admin/users/:id/discord-roles', requireOwnerAdmin, async (req, res) => {
+  try {
+    const { rows } = await query(
+      'SELECT id, username, discord_id, discord_verified FROM web_users WHERE id = $1 AND guild_id = $2',
+      [req.params.id, GUILD_ID]
+    );
+    if (!rows.length) return res.status(404).json({ error: 'User not found' });
+    if (!rows[0].discord_id || !rows[0].discord_verified) {
+      return res.status(400).json({ error: 'This website account has no verified Discord link' });
+    }
+    const roles = await getDiscordMemberRoles(rows[0].discord_id);
+    res.json({
+      success: true,
+      user: { id: String(rows[0].id), username: rows[0].username, discord_id: rows[0].discord_id },
+      roles: roles.filter((role) => role.name !== '@everyone').sort((a, b) => b.position - a.position),
+    });
+  } catch (err) {
+    const status = err.response?.status === 404 ? 404 : (err.statusCode || 502);
+    const message = err.response?.status === 404
+      ? 'The linked Discord user is not in the server'
+      : (err.response?.data?.message || err.message || 'Could not load Discord roles');
+    res.status(status).json({ error: message });
+  }
+});
+
+router.post('/admin/users/:id/discord-role', requireOwnerAdmin, async (req, res) => {
+  try {
+    const roleId = String((req.body && req.body.role_id) || '').trim();
+    const assigned = !!(req.body && req.body.assigned);
+    if (!/^\d{15,22}$/.test(roleId)) return res.status(400).json({ error: 'Valid role_id is required' });
+    const { rows } = await query(
+      'SELECT id, username, discord_id, discord_verified FROM web_users WHERE id = $1 AND guild_id = $2',
+      [req.params.id, GUILD_ID]
+    );
+    if (!rows.length) return res.status(404).json({ error: 'User not found' });
+    if (!rows[0].discord_id || !rows[0].discord_verified) {
+      return res.status(400).json({ error: 'This website account has no verified Discord link' });
+    }
+    const role = await setDiscordMemberRole(rows[0].discord_id, roleId, assigned);
+    await logAdminAction(req, assigned ? 'grant_discord_role' : 'revoke_discord_role', rows[0].id, {
+      username: rows[0].username, discord_id: rows[0].discord_id,
+      discord_role_id: role.id, discord_role_name: role.name,
+    });
+    res.json({ success: true, role });
+  } catch (err) {
+    const status = err.response?.status === 404 ? 404 : (err.statusCode || 502);
+    res.status(status).json({ error: err.response?.data?.message || err.message || 'Could not update Discord role' });
+  }
+});
+
 // ─── POST /api/auth/admin/ban ────────────────────────────
 router.post('/admin/ban', requireAdmin, async (req, res) => {
   try {
@@ -2124,6 +2204,71 @@ router.delete('/admin/user/:id', requireOwnerAdmin, async (req, res) => {
     res.json({ success: true });
   } catch (err) {
     res.status(500).json({ error: 'Failed to delete user' });
+  }
+});
+
+// ─── POST /api/auth/admin/link-discord ───────────────────
+// Owner-admin recovery path for a customer who can no longer access the
+// Discord account previously linked to their site account.  This deliberately
+// requires the owner-admin role: marking a snowflake verified grants that
+// Discord identity passwordless login and Vault access.
+//
+// The two identifiers are kept as text. Discord snowflakes are 17–20 digits
+// and exceed JavaScript's safe integer range, so never parse them as numbers.
+router.post('/admin/link-discord', requireOwnerAdmin, async (req, res) => {
+  try {
+    const userId = String((req.body && req.body.user_id) || '').trim();
+    const discordId = String((req.body && req.body.discord_id) || '').trim();
+    if (!userId) return res.status(400).json({ error: 'user_id is required' });
+    if (!/^\d{15,25}$/.test(discordId)) {
+      return res.status(400).json({ error: 'That does not look like a Discord user ID.' });
+    }
+
+    const { rows: target } = await query(
+      `SELECT id, username, role, discord_id FROM web_users
+       WHERE id = $1 AND guild_id = $2`,
+      [userId, GUILD_ID]
+    );
+    if (!target.length) return res.status(404).json({ error: 'User not found' });
+
+    // Never steal a verified Discord identity from another account. Use a
+    // separate query so the response can identify the conflict cleanly.
+    const { rows: taken } = await query(
+      `SELECT id, username FROM web_users
+       WHERE guild_id = $1 AND discord_id = $2 AND discord_verified = true AND id <> $3`,
+      [GUILD_ID, discordId, userId]
+    );
+    if (taken.length) {
+      return res.status(409).json({
+        error: 'That Discord account is already linked to another site account.',
+        username: taken[0].username,
+      });
+    }
+
+    const { rows } = await query(
+      `UPDATE web_users
+          SET discord_id = $1, discord_verified = true, discord_avatar = NULL
+        WHERE id = $2 AND guild_id = $3
+      RETURNING id, username, discord_id, discord_verified`,
+      [discordId, userId, GUILD_ID]
+    );
+    await logAdminAction(req, 'link_discord', userId, {
+      username: rows[0].username,
+      discord_id: discordId,
+      previous_discord_id: target[0].discord_id || null,
+    });
+    res.json({
+      success: true,
+      user: { ...rows[0], id: String(rows[0].id) },
+    });
+  } catch (err) {
+    // A partial unique index can still win a race between the duplicate check
+    // and UPDATE. Surface that as the same safe conflict instead of a 500.
+    if (err && err.code === '23505') {
+      return res.status(409).json({ error: 'That Discord account is already linked to another site account.' });
+    }
+    console.error('[Auth] admin/link-discord error:', err);
+    res.status(500).json({ error: 'Failed to link Discord' });
   }
 });
 

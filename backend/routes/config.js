@@ -6,6 +6,7 @@ const EXPIRY = require('../utils/expiry');
 const { payableMethods, isPayableCashtag, isPayableEmail,
         methodStates, normalisePaypalMe, toggleMethod, ALL_METHODS } = require('../utils/paymentAddress');
 const { requireOwnerAdmin } = require('../utils/auth');
+const { decryptRuntimeSecret } = require('../utils/runtimeSecrets');
 
 const GUILD_ID = process.env.GUILD_ID;
 
@@ -34,7 +35,15 @@ const secretLimiter = failureLimiter({ windowMs: 15 * 60 * 1000, max: 30, global
 // like /_API_KEY$/: a rule that guesses which names are dangerous will one day
 // guess wrong in the direction that costs money.
 const ENV_ONLY_KEYS = ['PANEL_PASSWORD', 'VAULT_PASSWORD', 'ORDER_LOG_CHANNEL_ID',
-  'GANDY_API_KEY', 'AIMBETTER_API_KEY'];
+  'GANDY_API_KEY', 'AIMBETTER_API_KEY', 'FIVESIM_API_KEY', 'SMSPOOL_API_KEY'];
+
+// Provider credentials edited in the admin panel are stored encrypted under
+// separate config keys. Keeping the mapping explicit prevents a generic config
+// row from ever being copied into process.env as ciphertext.
+const ENCRYPTED_CONFIG_KEYS = {
+  FIVESIM_API_KEY_ENC: 'FIVESIM_API_KEY',
+  SMSPOOL_API_KEY_ENC: 'SMSPOOL_API_KEY',
+};
 
 router.get('/', (req, res) => {
   res.json({
@@ -297,6 +306,17 @@ async function loadConfigFromDB() {
     let applied = 0;
     for (const row of rows) {
       if (row.value == null) continue;
+      const secretEnv = ENCRYPTED_CONFIG_KEYS[row.key];
+      if (secretEnv) {
+        const decrypted = decryptRuntimeSecret(String(row.value));
+        if (decrypted == null) {
+          console.warn(`[Config] Could not decrypt ${secretEnv} from DB; keeping the Railway value`);
+        } else {
+          process.env[secretEnv] = decrypted;
+          applied += 1;
+        }
+        continue;
+      }
       if (ENV_ONLY_KEYS.includes(row.key)) { ignored.push(row.key); continue; }
       const prev = process.env[row.key];
       if (prev !== undefined && prev !== row.value) overridden.push(row.key);

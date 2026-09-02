@@ -28,17 +28,22 @@ const app = express();
   const missingRequired = Object.keys(required).filter(k => !process.env[k]);
   const missingRecommended = Object.keys(recommended).filter(k => !process.env[k]);
 
+  const emailWatcherDisabled = /^(1|true|yes|on)$/i.test(String(process.env.DISABLE_EMAIL_WATCHER || '').trim());
+  if (emailWatcherDisabled) {
+    console.log('[Startup] payment email watcher disabled (crypto-only payments)');
+  }
+
   // Not a plain key check any more: GMAIL_USER used to be the one and only way
   // to feed the payment watcher, but each method can now point at its own
   // mailbox, so naming a single variable here would warn about a perfectly
   // configured split deployment. Ask the resolver what it actually found.
   try {
     const { inboundAccounts, outboundAccount } = require('./utils/mailAccounts');
-    const inbound = inboundAccounts();
-    if (!inbound.length) {
+    const inbound = emailWatcherDisabled ? [] : inboundAccounts();
+    if (!emailWatcherDisabled && !inbound.length) {
       console.warn('[Startup] no payment mailbox configured — the email payment watcher cannot start ' +
         '(set PAYPAL_GMAIL_USER/_PASSWORD and CASHAPP_GMAIL_USER/_PASSWORD, or the GMAIL_USER/GMAIL_PASSWORD pair)');
-    } else {
+    } else if (!emailWatcherDisabled) {
       // Names and routing only. The addresses themselves are never logged.
       console.log(`[Startup] payment mailboxes: ${inbound.map(a => `${a.methods.join('+')} via ${a.provider}`).join(', ')}`);
     }
@@ -96,7 +101,8 @@ const app = express();
 app.set('trust proxy', 1);
 
 app.use(cors({
-  origin: '*',
+  origin: ['https://nullpoint.top', 'https://www.nullpoint.top', 'https://nullpoint.top', 'https://www.nullpoint.top'],
+  credentials: true,
   methods: ['GET', 'POST', 'PATCH', 'DELETE', 'OPTIONS'],
   allowedHeaders: ['Content-Type', 'Authorization'],
 }));
@@ -156,6 +162,19 @@ app.use('/api/game-tiles', require('./routes/gameTiles'));
 app.use('/api/unsplash', require('./routes/unsplash'));
 app.use('/api/supplier', require('./routes/supplier'));
 app.use('/api/vault', require('./routes/vault'));
+app.use('/api/generator', require('./routes/generator'));
+app.use('/api/sms', require('./routes/generator')); // Mount SMS routes at /api/sms for frontend compatibility
+app.use('/api/movie-night', require('./routes/movieNight'));
+app.use('/api/chat', require('./routes/chat'));
+
+// Discord access gate - with error handling
+try {
+  app.use('/api/access', require('./routes/access'));
+  console.log('[Startup] Discord access gate loaded');
+} catch (error) {
+  console.error('[Startup] Failed to load Discord access gate:', error.message);
+  console.error('[Startup] Stack:', error.stack);
+}
 
 // ─── Health ─────────────────────────────────────────────
 app.get('/health', (req, res) => res.json({ status: 'ok', store: process.env.STORE_NAME || 'ONTOP Shop' }));

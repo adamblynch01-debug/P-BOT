@@ -58,6 +58,10 @@ function makeWatcher(account) {
 }
 
 function start() {
+  if (/^(1|true|yes|on)$/i.test(String(process.env.DISABLE_EMAIL_WATCHER || '').trim())) {
+    console.log('[EmailWatcher] Disabled by configuration (crypto-only payments)');
+    return;
+  }
   const accounts = inboundAccounts();
   if (!accounts.length) {
     console.warn('[EmailWatcher] No payment mailbox configured — disabled');

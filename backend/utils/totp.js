@@ -66,6 +66,24 @@ function verifyTOTP(secret, token) {
   return ok;
 }
 
+// Generate the current RFC 6238 code for a supplied account secret.  This is
+// intentionally separate from verifyTOTP: generator customers are asking for
+// the code belonging to an account they already own, not trying to enrol a
+// factor on their website account.  The caller must still authenticate, while
+// the secret is used only in memory and is never persisted or logged.
+function generateTOTP(secret) {
+  const normalized = String(secret || '').trim().toUpperCase().replace(/\s+/g, '');
+  if (!/^[A-Z2-7]+=*$/.test(normalized)) {
+    throw new Error('Invalid TOTP secret format');
+  }
+  const counter = Math.floor(Date.now() / 1000 / 30);
+  return {
+    code: codeAt(normalized, counter),
+    remaining: 30 - (Math.floor(Date.now() / 1000) % 30),
+    period: 30,
+  };
+}
+
 function generateBackupCodes(n = 8) {
   return Array.from({ length: n }, () => crypto.randomBytes(4).toString('hex').toUpperCase());
 }
@@ -81,5 +99,5 @@ function otpauthUrl(secret, account, issuer) {
 }
 
 module.exports = {
-  generateSecret, verifyTOTP, generateBackupCodes, hashBackupCode, otpauthUrl,
+  generateSecret, verifyTOTP, generateTOTP, generateBackupCodes, hashBackupCode, otpauthUrl,
 };

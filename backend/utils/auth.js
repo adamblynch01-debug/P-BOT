@@ -5,6 +5,7 @@
 const crypto = require('crypto');
 const { query } = require('../db');
 const { safeCompare } = require('./rateLimit');
+const { checkDiscordAccess } = require('./discordAccess');
 
 const SESSION_TTL_MS = 30 * 24 * 60 * 60 * 1000; // 30 days
 
@@ -150,6 +151,47 @@ async function requireDiscordLinked(req, res, next) {
   });
 }
 
+// A verified link proves which Discord account the customer controls; it does
+// not prove that the account is still in the guild. Membership can change
+// after OAuth, so money-moving, vault, and generator routes use this stricter
+// gate on every request. Staff/owner accounts remain usable for operations
+// even when they do not hold the customer role.
+async function requireCurrentDiscordMember(req, res, next) {
+  try {
+    if (!req.user) return res.status(401).json({ error: 'Not logged in' });
+    if (req.user.role === 'admin' || req.user.role === 'staff') return next();
+    if (!discordLinked(req.user)) {
+      return res.status(403).json({
+        error: 'Link your Discord account before continuing',
+        code: 'discord_link_required',
+      });
+    }
+    const access = await checkDiscordAccess(String(req.user.discord_id));
+    if (!access.inServer) {
+      return res.status(403).json({
+        error: 'You must be a member of our Discord server',
+        code: 'discord_membership_required',
+      });
+    }
+    if (!access.hasCustomerRole) {
+      return res.status(403).json({
+        error: 'Your Discord account does not have the required member role',
+        code: 'discord_role_required',
+      });
+    }
+    req.discordAccess = access;
+    return next();
+  } catch (err) {
+    // Fail closed on a Discord/API outage. Granting access during an outage is
+    // exactly how a stale linked account can bypass a member-only store.
+    console.error('[Auth] Current Discord membership check failed:', err.message);
+    return res.status(503).json({
+      error: 'Discord membership could not be verified',
+      code: 'discord_membership_unavailable',
+    });
+  }
+}
+
 // Stricter gate for the routes that can hand out authority or move money:
 // role changes, password resets, account deletion, wallet adjustment.
 //
@@ -207,6 +249,6 @@ function publicUser(row) {
 module.exports = {
   hashPassword, verifyPassword, createSession, getSessionUser, bearerToken,
   attachUser, requireAuth, requireAdmin, requireOwnerAdmin, publicUser,
-  discordLinked, requireDiscordLinked,
+  discordLinked, requireDiscordLinked, requireCurrentDiscordMember,
   botAuthorized, botAuthUnavailable,
 };

@@ -40,7 +40,7 @@ let firstQueuedAt = 0;
 function storeUrl() {
   const raw = process.env.STORE_URL
     || (process.env.STOREFRONT_ORIGINS || '').split(',')[0]
-    || 'https://uhservices.xyz';
+    || 'https://nullpoint.top';
   return String(raw).trim().replace(/\/+$/, '');
 }
 
