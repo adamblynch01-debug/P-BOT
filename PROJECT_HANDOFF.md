@@ -479,3 +479,23 @@ Safety/operations for the next thread:
 - The local branch is clean and is three commits ahead of `origin/main`; no force-push was attempted and production was not changed.
 - Validation passed: all 116 backend JavaScript files parse; all 24 inline scripts in `nullpoint-index.html` parse; `test_auth_hardening.js` (49 assertions), `test_2fa_server_side.js` (26), `test_delivery_game_label.js` (29), and `backend/test_movie_night_stream.js` pass.
 - Deployment remains intentionally pending explicit approval. Before deployment, back up remote files, browser-test the Vault handoff and Movie Night playback, restart only `pbot-backend`, and keep `superbot` online and `streaming-bot` stopped.
+
+## Local follow-up - 2026-09-02
+
+- Confirmed the live domain still serves the older Movie Night build: it has
+  the Discord watch-room copy and no `mnPlayer` browser media element. The
+  browser player is present locally in `C:\Users\VENOM-NODE\nullpoint-index.html`
+  and remains undeployed pending owner approval.
+- The local follow-up rechecks the typed generator allowance after every
+  successful account/phone claim, hardens clipboard fallback handling, and
+  gates SMS service/country discovery behind the same phone entitlement as
+  purchase. Staff/admin account operations remain available, but provider
+  SMS purchases no longer receive an automatic unlimited allowance.
+- The `/api/sms/*` compatibility mount now maps to the generator's canonical
+  `/sms/*` routes instead of creating `/api/sms/sms/*`. Store chat sends
+  authenticated questions to the configured store-only AI provider without
+  the old brittle keyword gate; deterministic catalogue fallback remains.
+- Validation after these local changes: backend syntax checks, 24 inline
+  website scripts, Movie Night browser stream contract, auth hardening (49),
+  server-side 2FA (26), and delivery labels (29) all pass. No production
+  files, secrets, database rows, or PM2 processes were changed.

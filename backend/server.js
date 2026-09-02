@@ -162,8 +162,16 @@ app.use('/api/game-tiles', require('./routes/gameTiles'));
 app.use('/api/unsplash', require('./routes/unsplash'));
 app.use('/api/supplier', require('./routes/supplier'));
 app.use('/api/vault', require('./routes/vault'));
-app.use('/api/generator', require('./routes/generator'));
-app.use('/api/sms', require('./routes/generator')); // Mount SMS routes at /api/sms for frontend compatibility
+const generatorRouter = require('./routes/generator');
+app.use('/api/generator', generatorRouter);
+// Compatibility alias for older storefront builds. The generator router's
+// canonical paths are /sms/*, so mounting it directly at /api/sms produced
+// the accidental /api/sms/sms/* URL. Rewrite only this alias to the intended
+// router prefix while keeping the canonical /api/generator/* endpoints.
+app.use('/api/sms', (req, res, next) => {
+  req.url = '/sms' + (req.url || '/');
+  return generatorRouter(req, res, next);
+});
 app.use('/api/movie-night', require('./routes/movieNight'));
 app.use('/api/chat', require('./routes/chat'));
 

@@ -10,31 +10,131 @@ const db = require('../db');
 const { requireAuth, requireOwnerAdmin, discordLinked, bearerToken, getSessionUser } = require('../utils/auth');
 const { getGuildRoles, checkDiscordAccess } = require('../utils/discordAccess');
 const { logAdminAction } = require('../utils/adminLog');
+const { encryptRuntimeSecret } = require('../utils/runtimeSecrets');
 
 const router = express.Router();
 const GUILD_ID = process.env.GUILD_ID;
-const CONTROL_URL = String(process.env.MOVIE_NIGHT_CONTROL_URL || '').replace(/\/+$/, '');
-const CONTROL_TOKEN = process.env.MOVIE_NIGHT_CONTROL_TOKEN || '';
-const CONTROL_TIMEOUT_MS = Math.max(1000, Math.min(15000, Number(process.env.MOVIE_NIGHT_CONTROL_TIMEOUT_MS) || 7000));
 const MAX_CATALOG_LIMIT = 100;
 // Browser playback uses a server-side Xtream/M3U proxy. Provider credentials
 // stay in the backend environment; the browser receives only short-lived,
 // per-user proxy tokens. The older Luminary control path remains available as
 // a compatibility fallback until the browser IPTV connection is configured.
-const IPTV_BASE = String(process.env.MOVIE_NIGHT_XTREAM_URL || process.env.MOVIE_NIGHT_IPTV_URL || '').replace(/\/+$/, '');
-const IPTV_USER = String(process.env.MOVIE_NIGHT_XTREAM_USERNAME || process.env.MOVIE_NIGHT_IPTV_USERNAME || '').trim();
-const IPTV_PASSWORD = String(process.env.MOVIE_NIGHT_XTREAM_PASSWORD || process.env.MOVIE_NIGHT_IPTV_PASSWORD || '').trim();
-const IPTV_M3U_URL = String(process.env.MOVIE_NIGHT_M3U_URL || '').trim();
 // Xtream servers commonly expose live channels as MPEG-TS (`.ts`) and also
 // provide an HLS variant. Browsers cannot play a raw TS response reliably, so
 // prefer the HLS variant for the browser player; an owner can override this for
 // a provider that uses a different live extension.
-const IPTV_LIVE_EXTENSION = String(process.env.MOVIE_NIGHT_XTREAM_LIVE_EXTENSION || 'm3u8').replace(/[^a-z0-9]/gi, '') || 'm3u8';
 const STREAM_TOKEN_TTL_MS = 2 * 60 * 60 * 1000;
 const streamTokens = new Map();
 let browserCatalogCache = { at: 0, items: [], groups: [] };
 
+const MOVIE_NIGHT_SECRET_KEYS = {
+  xtream_url: { env: 'MOVIE_NIGHT_XTREAM_URL', db: 'MOVIE_NIGHT_XTREAM_URL_ENC', label: 'Xtream server URL' },
+  xtream_username: { env: 'MOVIE_NIGHT_XTREAM_USERNAME', db: 'MOVIE_NIGHT_XTREAM_USERNAME_ENC', label: 'Xtream username' },
+  xtream_password: { env: 'MOVIE_NIGHT_XTREAM_PASSWORD', db: 'MOVIE_NIGHT_XTREAM_PASSWORD_ENC', label: 'Xtream password' },
+  m3u_url: { env: 'MOVIE_NIGHT_M3U_URL', db: 'MOVIE_NIGHT_M3U_URL_ENC', label: 'M3U URL' },
+  control_url: { env: 'MOVIE_NIGHT_CONTROL_URL', db: 'MOVIE_NIGHT_CONTROL_URL_ENC', label: 'Luminary control URL' },
+  control_token: { env: 'MOVIE_NIGHT_CONTROL_TOKEN', db: 'MOVIE_NIGHT_CONTROL_TOKEN_ENC', label: 'Luminary control token' },
+};
+
+// These values may be loaded from encrypted owner-admin settings after this
+// module is required. Keep them refreshable instead of capturing process.env
+// once at boot, so a newly saved IPTV connection works without a restart.
+let CONTROL_URL = '';
+let CONTROL_TOKEN = '';
+let CONTROL_TIMEOUT_MS = 7000;
+let IPTV_BASE = '';
+let IPTV_USER = '';
+let IPTV_PASSWORD = '';
+let IPTV_M3U_URL = '';
+let IPTV_LIVE_EXTENSION = 'm3u8';
+let runtimeConfigSignature = '';
+
+function refreshRuntimeConfig() {
+  const next = {
+    controlUrl: String(process.env.MOVIE_NIGHT_CONTROL_URL || '').replace(/\/+$/, ''),
+    controlToken: String(process.env.MOVIE_NIGHT_CONTROL_TOKEN || ''),
+    timeout: Math.max(1000, Math.min(15000, Number(process.env.MOVIE_NIGHT_CONTROL_TIMEOUT_MS) || 7000)),
+    iptvBase: String(process.env.MOVIE_NIGHT_XTREAM_URL || process.env.MOVIE_NIGHT_IPTV_URL || '').replace(/\/+$/, ''),
+    iptvUser: String(process.env.MOVIE_NIGHT_XTREAM_USERNAME || process.env.MOVIE_NIGHT_IPTV_USERNAME || '').trim(),
+    iptvPassword: String(process.env.MOVIE_NIGHT_XTREAM_PASSWORD || process.env.MOVIE_NIGHT_IPTV_PASSWORD || '').trim(),
+    m3uUrl: String(process.env.MOVIE_NIGHT_M3U_URL || '').trim(),
+    liveExtension: String(process.env.MOVIE_NIGHT_XTREAM_LIVE_EXTENSION || 'm3u8').replace(/[^a-z0-9]/gi, '') || 'm3u8',
+  };
+  const signature = JSON.stringify(next);
+  CONTROL_URL = next.controlUrl;
+  CONTROL_TOKEN = next.controlToken;
+  CONTROL_TIMEOUT_MS = next.timeout;
+  IPTV_BASE = next.iptvBase;
+  IPTV_USER = next.iptvUser;
+  IPTV_PASSWORD = next.iptvPassword;
+  IPTV_M3U_URL = next.m3uUrl;
+  IPTV_LIVE_EXTENSION = next.liveExtension;
+  if (signature === runtimeConfigSignature) return;
+  runtimeConfigSignature = signature;
+  // A changed connection must not leave a catalog from the previous provider
+  // in memory or make the owner wait for the one-minute cache to expire.
+  browserCatalogCache = { at: 0, items: [], groups: [] };
+}
+
+refreshRuntimeConfig();
+
+// Config loading happens after route modules are required during server boot.
+// Refresh before every request so admin changes and DB-restored secrets apply
+// immediately and no secret is ever sent to the browser.
+router.use((req, res, next) => { refreshRuntimeConfig(); next(); });
+
 function browserIptvConfigured() { return !!((IPTV_BASE && IPTV_USER && IPTV_PASSWORD) || IPTV_M3U_URL); }
+
+function maskedSecretConfig() {
+  const mask = (value) => value ? `••••••••${String(value).slice(-4)}` : '';
+  let host = '';
+  try { host = IPTV_BASE ? new URL(IPTV_BASE).host : ''; } catch (_) { host = ''; }
+  let m3uHost = '';
+  try { m3uHost = IPTV_M3U_URL ? new URL(IPTV_M3U_URL).host : ''; } catch (_) { m3uHost = ''; }
+  return {
+    xtream_url: { configured: !!IPTV_BASE, host },
+    xtream_username: { configured: !!IPTV_USER, masked: mask(IPTV_USER) },
+    xtream_password: { configured: !!IPTV_PASSWORD, masked: mask(IPTV_PASSWORD) },
+    m3u_url: { configured: !!IPTV_M3U_URL, host: m3uHost },
+    control_url: { configured: !!CONTROL_URL, host: (() => { try { return CONTROL_URL ? new URL(CONTROL_URL).host : ''; } catch (_) { return ''; } })() },
+    control_token: { configured: !!CONTROL_TOKEN, masked: mask(CONTROL_TOKEN) },
+  };
+}
+
+function validPrivateUrl(value) {
+  try {
+    const parsed = new URL(String(value));
+    return parsed.protocol === 'http:' || parsed.protocol === 'https:';
+  } catch (_) { return false; }
+}
+
+async function saveMovieNightSecretConfig(body) {
+  const changes = [];
+  for (const [field, meta] of Object.entries(MOVIE_NIGHT_SECRET_KEYS)) {
+    if (!Object.prototype.hasOwnProperty.call(body || {}, field)) continue;
+    const value = String(body[field] == null ? '' : body[field]).trim();
+    if (value.length > 2048) {
+      const error = new Error(`${meta.label} is too long`);
+      error.statusCode = 400;
+      throw error;
+    }
+    if ((field === 'xtream_url' || field === 'm3u_url' || field === 'control_url') && value && !validPrivateUrl(value)) {
+      const error = new Error(`${meta.label} must be a valid http(s) URL`);
+      error.statusCode = 400;
+      throw error;
+    }
+    const encrypted = encryptRuntimeSecret(value);
+    await db.query(
+      `INSERT INTO config (guild_id, key, value, updated_at) VALUES ($1,$2,$3,now())
+       ON CONFLICT (guild_id, key) DO UPDATE SET value = EXCLUDED.value, updated_at = now()`,
+      [GUILD_ID, meta.db, encrypted]
+    );
+    process.env[meta.env] = value;
+    changes.push(field);
+  }
+  if (changes.length) refreshRuntimeConfig();
+  return changes;
+}
 
 function iptvStreamOrigin() {
   return IPTV_BASE.replace(/\/player_api\.php$/i, '').replace(/\/+$/, '');
@@ -44,6 +144,19 @@ function cleanProviderUrl(value) {
   const raw = String(value || '').trim();
   if (!/^https?:\/\//i.test(raw)) return null;
   return raw;
+}
+
+function browserCompatibleM3uUrl(value) {
+  const url = cleanProviderUrl(value);
+  if (!url) return null;
+  // Xtream M3U exports often contain raw `.ts` live URLs even when the same
+  // channel is available as HLS. Prefer the HLS variant for browsers; VOD
+  // files and already-HLS URLs are left untouched.
+  if (/\.ts(?:$|\?)/i.test(url)) {
+    const extension = String(process.env.MOVIE_NIGHT_M3U_LIVE_EXTENSION || 'm3u8').replace(/[^a-z0-9]/gi, '') || 'm3u8';
+    return url.replace(/\.ts(?=$|\?)/i, `.${extension}`);
+  }
+  return url;
 }
 
 function stableStreamId(value, fallback) {
@@ -93,7 +206,7 @@ async function parseM3U() {
       info = { name: comma >= 0 ? line.slice(comma + 1).trim() : '', group: attrs['group-title'] || attrs.group || '', logo: attrs['tvg-logo'] || '' };
     } else if (info && line.trim() && !line.startsWith('#')) {
       const kind = classifyGroup(info.group, 'live');
-      const item = normaliseBrowserItem({ name: info.name, group: info.group, logo: info.logo }, kind, line.trim(), items.length);
+      const item = normaliseBrowserItem({ name: info.name, group: info.group, logo: info.logo }, kind, browserCompatibleM3uUrl(line.trim()), items.length);
       if (item) items.push(item);
       info = null;
     }
@@ -573,6 +686,7 @@ router.get('/admin/settings', requireOwnerAdmin, async (req, res) => {
       streaming_configured: controlConfigured() || browserIptvConfigured(),
       control_configured: controlConfigured(),
       browser_configured: browserIptvConfigured(),
+      browser_config: maskedSecretConfig(),
     });
   } catch (error) {
     if (migrationError(error)) return res.status(503).json({ error: 'Movie Night setup has not been installed yet' });
@@ -593,6 +707,7 @@ router.put('/admin/settings', requireOwnerAdmin, async (req, res) => {
     if (enabled && !allowedRoleIds.length) {
       return res.status(400).json({ error: 'Select at least one Discord role before enabling Movie Night' });
     }
+    const changedSecrets = await saveMovieNightSecretConfig(req.body || {});
     await db.query(
       `INSERT INTO movie_night_settings (singleton, enabled, allowed_role_ids, updated_by, updated_at)
        VALUES (true,$1,$2::jsonb,$3,now())
@@ -609,6 +724,8 @@ router.put('/admin/settings', requireOwnerAdmin, async (req, res) => {
       streaming_configured: controlConfigured() || browserIptvConfigured(),
       control_configured: controlConfigured(),
       browser_configured: browserIptvConfigured(),
+      browser_config: maskedSecretConfig(),
+      changed_secret_fields: changedSecrets,
     });
   } catch (error) {
     if (migrationError(error)) return res.status(503).json({ error: 'Movie Night setup has not been installed yet' });

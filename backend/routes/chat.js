@@ -32,11 +32,28 @@ function publicCatalog(rows) {
   }));
 }
 
-function topicLikelyStoreRelated(message) {
-  // Cheap safety filter; the system prompt remains the actual policy. It keeps
-  // obviously unrelated prompts on the deterministic path and avoids spending
-  // provider tokens on arbitrary requests.
-  return /(store|shop|price|cost|product|plan|tier|stock|buy|purchase|order|checkout|payment|balance|vault|account|generator|sms|phone|support|ticket|delivery|refund|license|key|discord|movie|night|stream|game|steam|activision|outlook|cash ?app|paypal|bitcoin|litecoin|currency|eur|usd|gbp)/i.test(message);
+function productReply(message, catalog) {
+  const q = String(message || '').toLowerCase();
+  if (!catalog.length) return null;
+  const matches = catalog.filter((product) => {
+    const haystack = `${product.name} ${product.game || ''} ${product.tier || ''}`.toLowerCase();
+    return haystack && haystack.split(/\s+/).some((word) => word.length >= 3 && q.includes(word));
+  });
+  if (!matches.length) return null;
+  const unique = [];
+  const seen = new Set();
+  matches.forEach((item) => {
+    const key = `${item.name}|${item.tier || ''}`;
+    if (!seen.has(key)) { seen.add(key); unique.push(item); }
+  });
+  const shown = unique.slice(0, 8);
+  const detail = shown.map((item) => {
+    const price = Number.isFinite(item.price_eur) ? `€${item.price_eur.toFixed(2)}` : 'price shown on the product card';
+    const term = item.period ? `, ${item.period}` : '';
+    const state = item.status ? `, ${item.status}` : '';
+    return `${item.name}${item.tier ? ` (${item.tier})` : ''}: ${price}${term}${state}`;
+  }).join('; ');
+  return `I found ${shown.length === 1 ? 'this listing' : 'these listings'}: ${detail}. Open the product card for the full tier list, then checkout will re-check the live price and stock.`;
 }
 
 function fallbackReply(message, catalog) {
@@ -48,6 +65,8 @@ function fallbackReply(message, catalog) {
     const names = catalog.slice(0, 12).map((p) => p.name).filter(Boolean);
     return names.length ? `The store currently lists: ${names.join(', ')}. Ask me about any product for its price, term, or availability.` : 'The live catalogue is temporarily unavailable; open the Products section to browse the current store.';
   }
+  const specific = productReply(message, catalog);
+  if (specific) return specific;
   if (/\b(price|cost|how much|plans?|tier)\b/.test(q)) {
     const priced = catalog.filter((p) => Number.isFinite(p.price_eur)).slice(0, 8);
     if (priced.length) {
@@ -127,10 +146,12 @@ router.post('/', requireAuth, requireCurrentDiscordMember, chatLimiter, async (r
   if (!message) return res.status(400).json({ error: 'A message is required' });
   const catalog = await loadCatalog();
   let reply = null;
-  if (topicLikelyStoreRelated(message)) {
-    try { reply = await askProvider(message, catalog); }
-    catch (err) { console.warn('[Chat] provider unavailable:', err.message); }
-  }
+  // This is an authenticated store-support channel. Let the configured model
+  // classify the question against the store-only system prompt instead of a
+  // brittle keyword gate; the old gate made normal questions such as “how do I
+  // activate this?” fall back to the same generic sentence every time.
+  try { reply = await askProvider(message, catalog); }
+  catch (err) { console.warn('[Chat] provider unavailable:', err.message); }
   res.json({ reply: reply || fallbackReply(message, catalog), source: reply ? 'ai' : 'catalog' });
 });
 

@@ -55,6 +55,27 @@ async function backfillTrackerForUser(userId) {
   }
 }
 
+function vaultItemTime(item, fallback) {
+  const raw = item && (item.createdAt || item.created_at || item.purchaseDate || item.purchasedAt || item.dateCreated || item.dateAdded || item.dateActivated);
+  const parsed = raw ? Date.parse(String(raw)) : NaN;
+  return Number.isFinite(parsed) ? parsed : Number(fallback || 0);
+}
+
+// New generator claims and delivered records should appear first even when a
+// legacy client saved a category in an older order. Sort only the response
+// copy; the stored JSON remains untouched and older clients keep their data.
+function newestFirstVaultData(value) {
+  const source = value && typeof value === 'object' && !Array.isArray(value) ? value : {};
+  const next = { ...source };
+  Object.keys(next).forEach((key) => {
+    if (!Array.isArray(next[key])) return;
+    next[key] = next[key].map((item, index) => ({ item, index }))
+      .sort((a, b) => vaultItemTime(b.item, b.index) - vaultItemTime(a.item, a.index))
+      .map((entry) => entry.item);
+  });
+  return next;
+}
+
 // ─── GET /api/vault/check-access ──────────────────────────────────────────
 // Check if the authenticated user has access to the vault:
 // 1. Must have a web_users account (requireAuth ensures this)
@@ -123,7 +144,7 @@ router.get('/', requireAuth, requireCurrentDiscordMember, async (req, res) => {
       return;
     }
 
-    res.json(rows[0].data || {});
+    res.json(newestFirstVaultData(rows[0].data || {}));
     // Historical order repair is deliberately non-blocking. New deliveries
     // are synchronised before they are reported complete; this path only
     // repairs old records and can safely run after the response.

@@ -295,9 +295,11 @@ function operationKind(type) {
 // overspend either allowance.
 async function generatorAccessState(exec, userId, lock, role, requestedKind) {
   // Website admins and staff operate the stock/service panel and should be
-  // able to verify inventory without buying a customer entitlement. This is
+  // able to verify inventory without buying a customer entitlement. SMS is
+  // different: opening a provider purchase can spend real provider credit,
+  // so even staff must have an explicit phone entitlement. This is
   // deliberately server-side; changing localStorage.role never grants it.
-  if (role === 'admin' || role === 'staff') {
+  if ((role === 'admin' || role === 'staff') && requestedKind !== 'phone') {
     return { hasAccess: true, type: 'unlimited', remaining: null, accountRemaining: null, phoneRemaining: null, unlimited: true, genMember: false };
   }
   // A provider request can outlive the Node process. Do not let a crashed
@@ -373,6 +375,29 @@ async function generatorAccessState(exec, userId, lock, role, requestedKind) {
     accountRemaining: 0, phoneRemaining: 0, planType: sub?.plan_type || null,
     genMember: !!sub, subscriptionId: sub?.id || null, expiresAt: sub?.expires_at || null,
   };
+}
+
+// Provider metadata is not itself a purchase, but exposing the SMS catalogue
+// to every Discord member made the phone generator look unlocked and allowed
+// the old frontend to walk users right up to a paid provider action. Keep the
+// same server-side entitlement check on the service/country discovery routes;
+// the free 2FA utility intentionally does not use this guard.
+async function requireGeneratorPhoneAccess(req, res, next) {
+  try {
+    const state = await generatorAccessState(db.query, req.user.id, false, req.user.role, 'phone');
+    if (!state.hasAccess) {
+      return res.status(402).json({
+        success: false,
+        error: state.genMember ? 'Monthly generator allowance exhausted' : 'Generator access required',
+        code: 'generator_access_required',
+      });
+    }
+    req.generatorPhoneAccess = state;
+    return next();
+  } catch (error) {
+    console.error('[GENERATOR] Phone access check error:', error.message);
+    return res.status(503).json({ success: false, error: 'Generator access could not be verified' });
+  }
 }
 
 async function reserveGeneratorUse(exec, userId, type, role) {
@@ -652,7 +677,7 @@ router.post('/2fa', requireAuth, generator2FALimiter, async (req, res) => {
 const getFivesimApiKey = () => process.env.FIVESIM_API_KEY || '';
 const FIVESIM_BASE = 'https://5sim.net/v1';
 
-router.get('/sms/fivesim/services', requireAuth, requireCurrentDiscordMember, async (req, res) => {
+router.get('/sms/fivesim/services', requireAuth, requireCurrentDiscordMember, requireGeneratorPhoneAccess, async (req, res) => {
   try {
     const response = await axios.get(`${FIVESIM_BASE}/guest/products/usa/any`);
     const data = response.data;
@@ -669,7 +694,7 @@ router.get('/sms/fivesim/services', requireAuth, requireCurrentDiscordMember, as
   }
 });
 
-router.get('/sms/fivesim/countries', requireAuth, requireCurrentDiscordMember, async (req, res) => {
+router.get('/sms/fivesim/countries', requireAuth, requireCurrentDiscordMember, requireGeneratorPhoneAccess, async (req, res) => {
   try {
     const { service } = req.query;
 
@@ -830,7 +855,7 @@ router.post('/sms/fivesim/resend/:orderId', requireAuth, requireCurrentDiscordMe
 const getSmspoolApiKey = () => process.env.SMSPOOL_API_KEY || '';
 const SMSPOOL_BASE = 'https://api.smspool.net';
 
-router.get('/sms/smspool/services', requireAuth, requireCurrentDiscordMember, async (req, res) => {
+router.get('/sms/smspool/services', requireAuth, requireCurrentDiscordMember, requireGeneratorPhoneAccess, async (req, res) => {
   try {
     const params = new URLSearchParams({ key: getSmspoolApiKey() });
 
@@ -852,7 +877,7 @@ router.get('/sms/smspool/services', requireAuth, requireCurrentDiscordMember, as
   }
 });
 
-router.get('/sms/smspool/countries', requireAuth, requireCurrentDiscordMember, async (req, res) => {
+router.get('/sms/smspool/countries', requireAuth, requireCurrentDiscordMember, requireGeneratorPhoneAccess, async (req, res) => {
   try {
     const { service } = req.query;
     const params = new URLSearchParams({ key: getSmspoolApiKey() });
