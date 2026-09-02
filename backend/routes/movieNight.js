@@ -24,6 +24,7 @@ const MAX_CATALOG_LIMIT = 100;
 // prefer the HLS variant for the browser player; an owner can override this for
 // a provider that uses a different live extension.
 const STREAM_TOKEN_TTL_MS = 2 * 60 * 60 * 1000;
+const STREAM_USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/131 Safari/537.36';
 const streamTokens = new Map();
 let browserCatalogCache = { at: 0, items: [], groups: [], byKind: {} };
 
@@ -267,7 +268,85 @@ async function getBrowserCatalog(requestedKind) {
   return result;
 }
 
-function issueStreamToken(userId, item) {
+function normaliseProviderCookie(value) {
+  const values = Array.isArray(value) ? value : (value ? [value] : []);
+  const cookies = values.map((cookie) => String(cookie || '').split(';', 1)[0].trim()).filter(Boolean);
+  return cookies.length ? cookies.join('; ') : null;
+}
+
+function providerCookiePairs(value, setCookie) {
+  const values = Array.isArray(value) ? value : (value ? [value] : []);
+  return values.flatMap((cookie) => {
+    const text = String(cookie || '').trim();
+    // Set-Cookie values contain attributes after the first semicolon. A
+    // browser Cookie header, on the other hand, may contain several pairs;
+    // preserve each pair without ever forwarding cookie attributes upstream.
+    return String(setCookie ? text.split(';', 1)[0] : text)
+      .split(';')
+      .map((part) => part.trim())
+      .filter((part) => part && part.includes('='));
+  });
+}
+
+function mergeProviderCookies(previous, responseCookies) {
+  const byName = new Map();
+  providerCookiePairs(previous, false).concat(providerCookiePairs(responseCookies, true)).forEach((pair) => {
+    const separator = pair.indexOf('=');
+    const name = pair.slice(0, separator).trim();
+    if (name) byName.set(name, pair);
+  });
+  return byName.size ? [...byName.values()].join('; ') : null;
+}
+
+function providerAuthorizationFromUrl(value) {
+  try {
+    const parsed = new URL(String(value || ''));
+    if (!parsed.username && !parsed.password) return null;
+    const username = decodeURIComponent(parsed.username || '');
+    const password = decodeURIComponent(parsed.password || '');
+    return `Basic ${Buffer.from(`${username}:${password}`).toString('base64')}`;
+  } catch (_) { return null; }
+}
+
+function providerStreamContext(entry, sourceUrl, response, requestHeaders) {
+  const previous = entry && entry.providerContext && typeof entry.providerContext === 'object'
+    ? entry.providerContext : {};
+  // Axios' Node adapter exposes the final URL after redirects on the response
+  // request object. Keep it server-side so providers that bind segments to
+  // the redirected playlist continue to see the right Referer.
+  const redirectedUrl = cleanProviderUrl(response?.request?.res?.responseUrl || response?.request?._currentUrl);
+  let origin = previous.origin || null;
+  if (!origin) {
+    try { origin = new URL(previous.referrer || redirectedUrl || sourceUrl).origin; } catch (_) { origin = null; }
+  }
+  const authorization = previous.authorization
+    || requestHeaders?.Authorization
+    || providerAuthorizationFromUrl(sourceUrl)
+    || null;
+  return {
+    // Keep the first playlist as the referrer for every child request. This
+    // matters for providers that authorize segments against the playlist URL.
+    referrer: previous.referrer || redirectedUrl || sourceUrl,
+    origin,
+    cookie: mergeProviderCookies(previous.cookie, response?.headers?.['set-cookie']),
+    authorization,
+  };
+}
+
+function providerRequestHeaders(entry, sourceUrl, req) {
+  const context = entry && entry.providerContext && typeof entry.providerContext === 'object'
+    ? entry.providerContext : {};
+  const headers = { 'User-Agent': STREAM_USER_AGENT };
+  if (context.referrer && validPrivateUrl(context.referrer)) headers.Referer = context.referrer;
+  if (context.origin && /^https?:\/\//i.test(String(context.origin))) headers.Origin = context.origin;
+  if (context.cookie) headers.Cookie = context.cookie;
+  const authorization = context.authorization || providerAuthorizationFromUrl(sourceUrl);
+  if (authorization && /^(?:Basic|Bearer)\s+\S+$/i.test(String(authorization))) headers.Authorization = authorization;
+  if (req?.headers?.range) headers.Range = req.headers.range;
+  return headers;
+}
+
+function issueStreamToken(userId, item, providerContext) {
   // Playlist rewriting can mint a token per segment. Prune old capabilities on
   // the write path so a long-running Movie Night session cannot grow this
   // process-local map without bound.
@@ -276,7 +355,19 @@ function issueStreamToken(userId, item) {
     if (!value || value.expiresAt < now) streamTokens.delete(key);
   }
   const token = require('crypto').randomBytes(24).toString('base64url');
-  streamTokens.set(token, { userId: String(userId), sourceUrl: item.sourceUrl, title: item.title, kind: item.kind, expiresAt: now + STREAM_TOKEN_TTL_MS });
+  streamTokens.set(token, {
+    userId: String(userId), sourceUrl: item.sourceUrl, title: item.title,
+    kind: item.kind, container: item.container || null,
+    // Provider request context is deliberately held only in this server-side
+    // capability map; it is never serialized into browser-visible URLs.
+    providerContext: providerContext && typeof providerContext === 'object' ? {
+      referrer: cleanProviderUrl(providerContext.referrer),
+      origin: /^https?:\/\//i.test(String(providerContext.origin || '')) ? String(providerContext.origin) : null,
+      cookie: mergeProviderCookies(null, providerContext.cookie),
+      authorization: /^(?:Basic|Bearer)\s+\S+$/i.test(String(providerContext.authorization || '')) ? String(providerContext.authorization) : null,
+    } : null,
+    expiresAt: now + STREAM_TOKEN_TTL_MS,
+  });
   return token;
 }
 
@@ -590,36 +681,46 @@ router.get('/stream/:token', async (req, res) => {
   if (!sourceUrl) return res.status(404).json({ error: 'Playback source unavailable' });
   try {
     const isPlaylist = /\.m3u8(?:$|\?)/i.test(sourceUrl);
+    const requestHeaders = providerRequestHeaders(entry, sourceUrl, req);
     const response = await axios.get(sourceUrl, {
       responseType: isPlaylist ? 'text' : 'stream', timeout: CONTROL_TIMEOUT_MS,
-      headers: req.headers.range ? { Range: req.headers.range } : undefined,
+      headers: requestHeaders,
       validateStatus: (status) => status >= 200 && status < 400,
     });
     if (isPlaylist || /mpegurl/i.test(String(response.headers['content-type'] || ''))) {
       const playlist = String(response.data || '');
+      const effectiveSourceUrl = cleanProviderUrl(response?.request?.res?.responseUrl || response?.request?._currentUrl) || sourceUrl;
+      const childContext = providerStreamContext(entry, effectiveSourceUrl, response, requestHeaders);
       const rewritten = playlist.split(/\r?\n/).map((line) => {
         if (!line || line.startsWith('#EXT')) {
           return line.replace(/URI="([^"]+)"/gi, (_, uri) => {
-            const absolute = cleanProviderUrl(new URL(uri, sourceUrl).toString());
+            const absolute = cleanProviderUrl(new URL(uri, effectiveSourceUrl).toString());
             if (!absolute) return `URI="${uri}"`;
-            const child = issueStreamToken(streamUserId, { sourceUrl: absolute, title: entry.title, kind: entry.kind });
+            const child = issueStreamToken(streamUserId, { sourceUrl: absolute, title: entry.title, kind: entry.kind }, childContext);
             return `URI="/api/movie-night/stream/${child}"`;
           });
         }
         if (line.trim().startsWith('#')) return line;
         let absolute;
-        try { absolute = cleanProviderUrl(new URL(line.trim(), sourceUrl).toString()); } catch (_) { absolute = null; }
+        try { absolute = cleanProviderUrl(new URL(line.trim(), effectiveSourceUrl).toString()); } catch (_) { absolute = null; }
         if (!absolute) return line;
-        const child = issueStreamToken(streamUserId, { sourceUrl: absolute, title: entry.title, kind: entry.kind });
+        const child = issueStreamToken(streamUserId, { sourceUrl: absolute, title: entry.title, kind: entry.kind }, childContext);
         return `/api/movie-night/stream/${child}`;
       }).join('\n');
-      res.status(200).set({ 'Content-Type': 'application/vnd.apple.mpegurl', 'Cache-Control': 'no-store' }).send(rewritten);
+      res.status(200).set({
+        'Content-Type': 'application/vnd.apple.mpegurl; charset=utf-8',
+        'Cache-Control': 'no-store', 'X-Accel-Buffering': 'no',
+      }).send(rewritten);
       return;
     }
+    const upstreamType = String(response.headers['content-type'] || '').split(';')[0].trim().toLowerCase();
+    const mediaType = upstreamType === 'application/octet-stream' || !upstreamType
+      ? ((entry.kind === 'movie' || entry.kind === 'episode') ? 'video/mp4' : (upstreamType || 'application/octet-stream'))
+      : upstreamType;
     res.status(response.status).set({
-      'Content-Type': response.headers['content-type'] || 'video/mp4',
+      'Content-Type': mediaType,
       'Cache-Control': 'no-store',
-      ...(response.headers['content-length'] ? { 'Content-Length': response.headers['content-length'] } : {}),
+      'X-Accel-Buffering': 'no',
       ...(response.headers['accept-ranges'] ? { 'Accept-Ranges': response.headers['accept-ranges'] } : {}),
       ...(response.headers['content-range'] ? { 'Content-Range': response.headers['content-range'] } : {}),
     });

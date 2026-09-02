@@ -612,3 +612,37 @@ Safety/operations for the next thread:
 - Treat this as the next debugging target: capture console errors and the
   `/api/movie-night/play` plus `/api/movie-night/stream/<token>` network
   responses for one failing item. Do not expose provider URLs or credentials.
+
+## Movie Night HLS provider-context fix (2026-09-02)
+
+- Root cause isolated: the provider accepted the root HLS playlist but returned
+  HTTP 401 for independently fetched child segments when the playlist request
+  context was not inherited.
+- Updated `backend/routes/movieNight.js` to keep server-only provider context in
+  short-lived stream capabilities and forward a safe `User-Agent`, root
+  playlist `Referer`, appropriate `Origin`, captured `Set-Cookie` values, and
+  byte-range headers on playlist/segment requests. Browser-visible URLs still
+  contain only local opaque stream tokens; credentials and provider URLs remain
+  private.
+- Extended `backend/test_movie_night_stream.js` with a fake provider that
+  rejects child requests without inherited context and confirms successful
+  playback when context is forwarded. The contract test passes.
+- Validation: all 117 backend JavaScript files and all 24 inline website
+  scripts parse successfully. Production `/health` is HTTP 200, unauthenticated
+  Movie Night catalog remains HTTP 401, and the deployed route hash matches the
+  local route hash.
+- Fresh deployment backup: `/var/backups/nullpoint/20260902-122444/`.
+- Deployed only the Movie Night route and restarted only `pbot-backend`.
+  `superbot` remains online and `streaming-bot` remains stopped.
+- After a final redirect-aware context refinement, the exact local route was
+  synchronized to production byte-for-byte. Final fresh backup:
+  `/var/backups/nullpoint/20260902-123809/`; local and remote SHA-256 both
+  equal `649707d6031b98a841ad9230108dcd4a38a15003d70b387302a1f665716823ef`.
+
+### Next browser verification
+
+- Hard-refresh `https://nullpoint.top` (Ctrl+F5), then test one role-authorized
+  Live TV channel, one movie, and one series episode. Confirm the player leaves
+  `0:00`, the guide side-panel hide/show control works, and no provider URL or
+  credential appears in browser-visible requests. If playback still fails,
+  capture only status codes and sanitized HLS.js/browser errors.

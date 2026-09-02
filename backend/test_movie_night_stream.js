@@ -55,10 +55,10 @@ require.cache[authPath] = { id: authPath, filename: authPath, loaded: true, expo
 require.cache[discordPath] = { id: discordPath, filename: discordPath, loaded: true, exports: fakeDiscord };
 require.cache[adminLogPath] = { id: adminLogPath, filename: adminLogPath, loaded: true, exports: fakeAdminLog };
 
-function streamResponse(contentType, body) {
+function streamResponse(contentType, body, status = 200, extraHeaders = {}) {
   const data = new PassThrough();
   process.nextTick(() => data.end(Buffer.from(body)));
-  return { status: 200, headers: { 'content-type': contentType }, data };
+  return { status, headers: { 'content-type': contentType, ...extraHeaders }, data };
 }
 
 const fakeAxios = {
@@ -71,15 +71,26 @@ const fakeAxios = {
       if (action === 'get_vod_streams') return { status: 200, data: [] };
       if (action === 'get_series') return { status: 200, data: [] };
     }
+    if (url.includes('/segment.ts')) {
+      // The fake provider rejects a child fetched without the root playlist's
+      // request context. This catches regressions where only the first HLS
+      // request is authorized.
+      const headers = options.headers || {};
+      const expectedReferrer = 'https://iptv.test/live/user-test/pass-test/1.m3u8';
+      if (headers.Referer !== expectedReferrer || headers.Origin !== 'https://iptv.test' || headers.Cookie !== 'sid=abc') {
+        return streamResponse('text/plain', 'missing provider context', 401);
+      }
+      assert.ok(headers['User-Agent'], 'child request should include a User-Agent');
+      return streamResponse('video/mp2t', 'segment');
+    }
     if (url.includes('/live/')) {
       assert.strictEqual(options.responseType, 'text');
       return {
         status: 200,
-        headers: { 'content-type': 'application/vnd.apple.mpegurl' },
+        headers: { 'content-type': 'application/vnd.apple.mpegurl', 'set-cookie': ['sid=abc; Path=/'] },
         data: '#EXTM3U\n#EXT-X-TARGETDURATION:4\nsegment.ts\n',
       };
     }
-    if (url.includes('/segment.ts')) return streamResponse('video/mp2t', 'segment');
     throw new Error(`Unexpected IPTV URL: ${url}`);
   },
 };
@@ -109,7 +120,16 @@ app.use('/api/movie-night', router);
     const origin = new URL(base).origin;
     const playlist = await fetch(`${origin}${playBody.stream_url}`);
     assert.strictEqual(playlist.status, 200);
-    assert.match(await playlist.text(), /\/api\/movie-night\/stream\//);
+    const playlistText = await playlist.text();
+    assert.match(playlistText, /\/api\/movie-night\/stream\//);
+    assert.doesNotMatch(playlistText, /iptv\.test|user-test|pass-test/i, 'provider URL/credentials must stay server-side');
+    const childPath = playlistText.split(/\r?\n/).find((line) => /^\/api\/movie-night\/stream\//.test(line));
+    assert.ok(childPath, 'playlist should contain a proxied child segment');
+    const child = await fetch(`${origin}${childPath}`);
+    const childText = await child.text();
+    assert.strictEqual(child.status, 200, childText);
+    assert.match(String(child.headers.get('content-type') || ''), /video\/mp2t/i);
+    assert.strictEqual(childText, 'segment');
 
     console.log('Movie Night browser stream contract passed');
   } finally {
