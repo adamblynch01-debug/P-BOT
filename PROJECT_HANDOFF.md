@@ -587,3 +587,17 @@ Safety/operations for the next thread:
   Health remained HTTP 200 and unauthenticated catalog access remained 401.
 - If a user still sees the old layout, perform a hard refresh (Ctrl+F5) because
   the single-file site can be cached by the browser/CDN.
+
+## Memory sync for the next thread (2026-09-02)
+
+- The companion transition-memory file was refreshed with the complete current
+  state, security rules, deployment details, validation results, and browser
+  follow-up checklist:
+  `C:\Users\VENOM-NODE\Documents\NULLPOINT_TRANSITION_MEMORY.md`.
+- The latest local repository commit is `cda56c8`; the working tree is clean.
+- The current user priority remains end-to-end Movie Night playback: hard
+  refresh the site, test a role-authorized Live TV channel, movie, and series
+  episode, then inspect browser console/network/HLS errors if playback is
+  still black. Verify guide side-panel hide/show behavior at the same time.
+- Never expose IPTV credentials, M3U URLs, tokens, API keys, `.env` values, or
+  the deployment SSH key while diagnosing or documenting playback.
