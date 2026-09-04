@@ -660,3 +660,15 @@ Safety/operations for the next thread:
   was removed, and the repository remains clean.
 - The local repository has unpushed commits beyond `origin/main`; no push was
   performed for this clarification. Review those commits before publishing.
+
+## Movie Night catalog performance follow-up (2026-09-05)
+
+- Fixed `backend/routes/movieNight.js` so `/catalog` passes the selected `kind`
+  to the provider loader. Live TV, Movies, and Series requests now fetch and
+  normalize only their selected Xtream feed instead of all three large feeds.
+- Local commit: `59dbcec` (`Load only selected Movie Night catalog feed`).
+- Validation passed: all 116 tracked backend JavaScript files parse, all 24
+  inline website scripts parse, `backend/test_movie_night_stream.js` passes,
+  and `git diff --check` is clean.
+- This follow-up is local only; no production files were changed, no remote
+  backup was created, and no push or restart was performed.
