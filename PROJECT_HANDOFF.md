@@ -709,3 +709,24 @@ Safety/operations for the next thread:
 - Next owner check: hard-refresh `https://nullpoint.top`, then exercise one Live TV channel,
   movie, and series episode while signed in with the Movie Night role. Diagnose any remaining
   playback/provider issue from sanitized browser status codes after this rollout.
+
+## Transition sync (2026-09-05)
+
+- This file is synchronized after the rollout. The repository is clean on `main` and matches
+  `origin/main` at commit `7197938` (`Document completed todo production rollout`).
+- The production website and intended backend files are deployed and byte-for-byte matched to
+  local at verification time. No secrets, provider credentials, tokens, or private keys were
+  placed in source, logs, or this handoff.
+- Production backup to use for rollback/reference: `/var/backups/nullpoint/20260904-154928/`.
+- Current PM2 contract is unchanged: `pbot-backend` online, `superbot` online,
+  `streaming-bot` stopped. Do not start `streaming-bot` without explicit approval.
+- Current health/access checks: `/health` returns 200; unauthenticated Movie Night catalog,
+  Movie Night admin, activity-admin, and SMS service routes return 401; `/api/products/vault`
+  returns 200.
+- Validation snapshot: 25 inline website scripts parse; backend syntax, Movie Night stream
+  contract, auth hardening (49), server-side 2FA (26), delivery labels (29), config (23), and
+  stock resurrection (10) pass. The legacy purchase-gate harness remains 35/36 because its
+  test-only Discord mock raises `ids.map is not a function`; this is not a production error.
+- Next thread should begin with an authenticated browser smoke test after `Ctrl+F5`: play one
+  Live TV item, one movie, and one series episode; verify guide hide/show and playback status.
+  If anything fails, capture only sanitized HTTP status, console, and HLS/browser error data.
