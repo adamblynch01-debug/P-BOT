@@ -1,6 +1,7 @@
 require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
+const { logActivity } = require('./utils/activityLog');
 
 const app = express();
 
@@ -141,6 +142,25 @@ app.use((req, res, next) => {
   return jsonParser(req, res, next);
 });
 
+// Record authenticated API activity after the route has had a chance to
+// resolve req.user. Media segment requests are intentionally excluded: an HLS
+// player can make dozens of those per minute and the playback log already
+// records the meaningful start/stop events.
+app.use((req, res, next) => {
+  res.on('finish', () => {
+    if (!req.user || !req.path.startsWith('/api/') || req.path === '/api/activity/admin'
+      || /^\/api\/movie-night\/stream\//.test(req.path)) return;
+    logActivity({
+      guildId: process.env.GUILD_ID,
+      userId: req.user.id,
+      eventType: `${req.method.toLowerCase()} ${req.path}`,
+      req,
+      metadata: { status: res.statusCode },
+    });
+  });
+  next();
+});
+
 // ─── Routes ─────────────────────────────────────────────
 app.use('/api/orders',   require('./routes/orders'));
 app.use('/api/products', require('./routes/products'));
@@ -156,6 +176,7 @@ app.use('/api/state',    require('./routes/state'));
 app.use('/api/reseller', require('./routes/reseller'));
 app.use('/api/tickets',  require('./routes/tickets'));
 app.use('/api/alerts',   require('./routes/alerts'));
+app.use('/api/activity', require('./routes/activity'));
 app.use('/api/downloads', require('./routes/downloads'));
 app.use('/api/coupons', require('./routes/coupons'));
 app.use('/api/game-tiles', require('./routes/gameTiles'));

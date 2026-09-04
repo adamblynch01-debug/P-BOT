@@ -10,7 +10,7 @@ const db = require('../db');
 const { requireAuth, requireOwnerAdmin, discordLinked, bearerToken, getSessionUser } = require('../utils/auth');
 const { getGuildRoles, checkDiscordAccess } = require('../utils/discordAccess');
 const { logAdminAction } = require('../utils/adminLog');
-const { encryptRuntimeSecret } = require('../utils/runtimeSecrets');
+const { encryptRuntimeSecret, decryptRuntimeSecret } = require('../utils/runtimeSecrets');
 
 const router = express.Router();
 const GUILD_ID = process.env.GUILD_ID;
@@ -26,7 +26,19 @@ const MAX_CATALOG_LIMIT = 100;
 const STREAM_TOKEN_TTL_MS = 2 * 60 * 60 * 1000;
 const STREAM_USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/131 Safari/537.36';
 const streamTokens = new Map();
-let browserCatalogCache = { at: 0, items: [], groups: [], byKind: {} };
+const streamAccessCache = new Map();
+const STREAM_ACCESS_CACHE_MS = 15 * 1000;
+const BROWSER_CATALOG_CACHE_MS = 60 * 1000;
+const WATCH_SESSION_CACHE_MS = 10 * 1000;
+const WATCH_SESSION_TOUCH_MS = 20 * 1000;
+// Catalog requests can be large (especially M3U feeds). Share an in-flight
+// fetch so a burst of tabs/searches does not start the same provider request
+// several times concurrently.
+const browserCatalogInflight = new Map();
+const watchSessionStatusCache = new Map();
+const watchSessionTouchAt = new Map();
+let streamTokenPruneAt = 0;
+let browserCatalogCache = { at: 0, items: [], groups: [], bySource: {} };
 
 const MOVIE_NIGHT_SECRET_KEYS = {
   xtream_url: { env: 'MOVIE_NIGHT_XTREAM_URL', db: 'MOVIE_NIGHT_XTREAM_URL_ENC', label: 'Xtream server URL' },
@@ -74,7 +86,7 @@ function refreshRuntimeConfig() {
   runtimeConfigSignature = signature;
   // A changed connection must not leave a catalog from the previous provider
   // in memory or make the owner wait for the one-minute cache to expire.
-  browserCatalogCache = { at: 0, items: [], groups: [], byKind: {} };
+  browserCatalogCache = { at: 0, items: [], groups: [], bySource: {} };
 }
 
 refreshRuntimeConfig();
@@ -85,6 +97,84 @@ refreshRuntimeConfig();
 router.use((req, res, next) => { refreshRuntimeConfig(); next(); });
 
 function browserIptvConfigured() { return !!((IPTV_BASE && IPTV_USER && IPTV_PASSWORD) || IPTV_M3U_URL); }
+
+function runtimeConnection() {
+  return { id: null, method: IPTV_BASE && IPTV_USER && IPTV_PASSWORD ? 'xtream' : 'm3u', base: IPTV_BASE, username: IPTV_USER, password: IPTV_PASSWORD, m3uUrl: IPTV_M3U_URL, liveExtension: IPTV_LIVE_EXTENSION, liveCategories: [], movieCategories: [], seriesCategories: [] };
+}
+
+async function primaryPlaylistConnection() {
+  try {
+    const { rows } = await db.query(
+      `SELECT id, method, playlist_url_enc, host_url_enc, username_enc,
+              password_enc, live_categories, movie_categories, series_categories FROM movie_night_playlists
+        WHERE guild_id = $1 AND enabled = true
+        ORDER BY sort_order, id LIMIT 1`, [GUILD_ID]
+    );
+    const row = rows[0];
+    if (!row) return runtimeConnection();
+    return playlistConnectionFromRow(row) || runtimeConnection();
+  } catch (error) {
+    // The table is optional during a rolling deploy and in older test/legacy
+    // environments. Keep the original environment-backed connection working
+    // until the migration is present.
+    if (!migrationError(error)) console.warn('[MovieNight] playlist lookup unavailable:', error.message);
+    return runtimeConnection();
+  }
+}
+
+function playlistConnectionFromRow(row) {
+  if (!row) return null;
+  const method = playlistMethod(row.method);
+  return {
+    id: Number(row.id) || null,
+    method,
+    base: decryptRuntimeSecret(String(row.host_url_enc || '')) || '',
+    username: decryptRuntimeSecret(String(row.username_enc || '')) || '',
+    password: decryptRuntimeSecret(String(row.password_enc || '')) || '',
+    m3uUrl: decryptRuntimeSecret(String(row.playlist_url_enc || '')) || '',
+    liveExtension: IPTV_LIVE_EXTENSION,
+    liveCategories: playlistCategories(row.live_categories),
+    movieCategories: playlistCategories(row.movie_categories),
+    seriesCategories: playlistCategories(row.series_categories),
+  };
+}
+
+async function playlistConnections() {
+  try {
+    const { rows } = await db.query(
+      `SELECT id, method, playlist_url_enc, host_url_enc, username_enc,
+              password_enc, live_categories, movie_categories, series_categories
+         FROM movie_night_playlists
+        WHERE guild_id = $1 AND enabled = true
+        ORDER BY sort_order, id`, [GUILD_ID]
+    );
+    const connections = rows.map(playlistConnectionFromRow).filter((source) => source && ((source.base && source.username && source.password) || source.m3uUrl));
+    if (connections.length) return connections;
+  } catch (error) {
+    if (!migrationError(error)) console.warn('[MovieNight] playlist list unavailable:', error.message);
+  }
+  return browserIptvConfigured() ? [runtimeConnection()] : [];
+}
+
+async function browserIptvConfiguredAsync() {
+  return (await playlistConnections()).length > 0;
+}
+
+async function playlistConnectionById(id) {
+  const wanted = Number.parseInt(id, 10);
+  if (!Number.isSafeInteger(wanted) || wanted < 1) return null;
+  try {
+    const { rows } = await db.query(
+      `SELECT id, method, playlist_url_enc, host_url_enc, username_enc,
+              password_enc, live_categories, movie_categories, series_categories
+         FROM movie_night_playlists WHERE id = $1 AND guild_id = $2 AND enabled = true LIMIT 1`, [wanted, GUILD_ID]
+    );
+    return playlistConnectionFromRow(rows[0]);
+  } catch (error) {
+    if (!migrationError(error)) console.warn('[MovieNight] playlist lookup unavailable:', error.message);
+    return null;
+  }
+}
 
 function maskedSecretConfig() {
   const mask = (value) => value ? `••••••••${String(value).slice(-4)}` : '';
@@ -137,8 +227,8 @@ async function saveMovieNightSecretConfig(body) {
   return changes;
 }
 
-function iptvStreamOrigin() {
-  return IPTV_BASE.replace(/\/player_api\.php$/i, '').replace(/\/+$/, '');
+function iptvStreamOrigin(connection) {
+  return String((connection || runtimeConnection()).base || '').replace(/\/player_api\.php$/i, '').replace(/\/+$/, '');
 }
 
 function cleanProviderUrl(value) {
@@ -167,10 +257,11 @@ function stableStreamId(value, fallback) {
   return Math.abs(hash >>> 0) || 1;
 }
 
-async function xtreamRequest(action, extra, requestOptions) {
-  if (!(IPTV_BASE && IPTV_USER && IPTV_PASSWORD)) return null;
-  const base = /player_api\.php$/i.test(IPTV_BASE) ? IPTV_BASE : IPTV_BASE + '/player_api.php';
-  const params = new URLSearchParams({ username: IPTV_USER, password: IPTV_PASSWORD, action: String(action) });
+async function xtreamRequest(action, extra, requestOptions, connection) {
+  const source = connection || runtimeConnection();
+  if (!(source.base && source.username && source.password)) return null;
+  const base = /player_api\.php$/i.test(source.base) ? source.base : source.base + '/player_api.php';
+  const params = new URLSearchParams({ username: source.username, password: source.password, action: String(action) });
   Object.entries(extra || {}).forEach(([key, value]) => { if (value != null) params.set(key, String(value)); });
   const response = await axios.get(base + '?' + params.toString(), { timeout: Number(requestOptions?.timeoutMs) || CONTROL_TIMEOUT_MS, validateStatus: (status) => status < 500 });
   if (response.status >= 400) throw new Error('IPTV catalog request failed');
@@ -212,9 +303,10 @@ function withCategory(row, categories) {
   return category ? { ...row, category_name: category } : row;
 }
 
-async function parseM3U() {
-  if (!IPTV_M3U_URL) return [];
-  const response = await axios.get(IPTV_M3U_URL, { timeout: CONTROL_TIMEOUT_MS, responseType: 'text' });
+async function parseM3U(connection) {
+  const source = connection || runtimeConnection();
+  if (!source.m3uUrl) return [];
+  const response = await axios.get(source.m3uUrl, { timeout: CONTROL_TIMEOUT_MS, responseType: 'text' });
   const lines = String(response.data || '').split(/\r?\n/);
   const items = [];
   let info = null;
@@ -227,45 +319,109 @@ async function parseM3U() {
     } else if (info && line.trim() && !line.startsWith('#')) {
       const kind = classifyGroup(info.group, 'live');
       const item = normaliseBrowserItem({ name: info.name, group: info.group, logo: info.logo }, kind, browserCompatibleM3uUrl(line.trim()), items.length);
-      if (item) items.push(item);
+      if (item) { item.playlist_id = source.id || null; items.push(item); }
       info = null;
     }
   }
   return items;
 }
 
-async function getBrowserCatalog(requestedKind) {
-  if (!browserIptvConfigured()) return null;
+async function getBrowserCatalogFromConnection(requestedKind, connection) {
+  const source = connection || await primaryPlaylistConnection();
+  if (!(source && ((source.base && source.username && source.password) || source.m3uUrl))) return null;
   const wantedKind = ['live', 'movie', 'series'].includes(String(requestedKind || '').toLowerCase()) ? String(requestedKind).toLowerCase() : '';
-  const cached = wantedKind ? browserCatalogCache.byKind[wantedKind] : browserCatalogCache;
-  if (cached && Date.now() - cached.at < 60_000 && cached.items.length) return cached;
-  let items = [];
-  if (IPTV_BASE && IPTV_USER && IPTV_PASSWORD) {
-    const kinds = wantedKind ? [wantedKind] : ['live', 'movie', 'series'];
-    const actions = { live: 'get_live_streams', movie: 'get_vod_streams', series: 'get_series' };
-    const categoryActions = { live: 'get_live_categories', movie: 'get_vod_categories', series: 'get_series_categories' };
-    const rowsByKind = Object.fromEntries(await Promise.all(kinds.map(async (kind) => [kind, await xtreamRequest(actions[kind], null, { timeoutMs: 30_000 })] )));
-    // Category endpoints are optional across Xtream providers. A provider
-    // may expose streams but reject one or more category calls; titles should
-    // still load, using the stream's own category_name when available.
-    const categoriesByKind = Object.fromEntries(await Promise.all(kinds.map(async (kind) => [kind, categoryMap(await xtreamRequest(categoryActions[kind], null, { timeoutMs: 15_000 }).catch(() => []))])));
-    const liveRows = Array.isArray(rowsByKind.live) ? rowsByKind.live : [];
-    const movieRows = Array.isArray(rowsByKind.movie) ? rowsByKind.movie : [];
-    const seriesRows = Array.isArray(rowsByKind.series) ? rowsByKind.series : [];
-    const liveMap = categoriesByKind.live || new Map();
-    const vodMap = categoriesByKind.movie || new Map();
-    const seriesMap = categoriesByKind.series || new Map();
-    items = liveRows.map((row, i) => normaliseBrowserItem(withCategory(row, liveMap), 'live', `${iptvStreamOrigin()}/live/${encodeURIComponent(IPTV_USER)}/${encodeURIComponent(IPTV_PASSWORD)}/${row.stream_id}.${IPTV_LIVE_EXTENSION}`, i)).filter(Boolean)
-      .concat(movieRows.map((row, i) => normaliseBrowserItem(withCategory(row, vodMap), 'movie', `${iptvStreamOrigin()}/movie/${encodeURIComponent(IPTV_USER)}/${encodeURIComponent(IPTV_PASSWORD)}/${row.stream_id}.${row.container_extension || 'mp4'}`, i)).filter(Boolean))
-      .concat(seriesRows.map((row, i) => { const item = withCategory(row, seriesMap); return { id: Number.parseInt(item.series_id, 10) || stableStreamId(item.name, i), kind: 'series', title: cleanString(item.name, 180), group: cleanString(item.category_name || '', 120) || null, logo: /^https:\/\//i.test(String(item.cover || '')) ? String(item.cover) : null, sourceUrl: null, container: null }; }));
-  } else {
-    items = await parseM3U();
+  const sourceKey = source.id ? `playlist:${source.id}` : 'runtime';
+  browserCatalogCache.bySource = browserCatalogCache.bySource || {};
+  const sourceCache = browserCatalogCache.bySource[sourceKey] || (browserCatalogCache.bySource[sourceKey] = {});
+  const now = Date.now();
+  const cached = sourceCache[wantedKind || 'all'];
+  // Empty feeds are valid cache entries too. Re-fetching an empty provider on
+  // every search/tab change was a particularly expensive failure mode.
+  if (cached && now - cached.at < BROWSER_CATALOG_CACHE_MS) return cached;
+
+  const fetchKey = `${sourceKey}|${wantedKind || 'all'}`;
+  if (browserCatalogInflight.has(fetchKey)) return browserCatalogInflight.get(fetchKey);
+  const pending = (async () => {
+    let items = [];
+    if (source.base && source.username && source.password) {
+      const kinds = wantedKind ? [wantedKind] : ['live', 'movie', 'series'];
+      const actions = { live: 'get_live_streams', movie: 'get_vod_streams', series: 'get_series' };
+      const categoryActions = { live: 'get_live_categories', movie: 'get_vod_categories', series: 'get_series_categories' };
+      const rowsByKind = Object.fromEntries(await Promise.all(kinds.map(async (kind) => [kind, await xtreamRequest(actions[kind], null, { timeoutMs: 30_000 }, source)] )));
+      // Category endpoints are optional across Xtream providers. A provider
+      // may expose streams but reject one or more category calls; titles should
+      // still load, using the stream's own category_name when available.
+      const categoriesByKind = Object.fromEntries(await Promise.all(kinds.map(async (kind) => [kind, categoryMap(await xtreamRequest(categoryActions[kind], null, { timeoutMs: 15_000 }, source).catch(() => []))])));
+      const liveRows = Array.isArray(rowsByKind.live) ? rowsByKind.live : [];
+      const movieRows = Array.isArray(rowsByKind.movie) ? rowsByKind.movie : [];
+      const seriesRows = Array.isArray(rowsByKind.series) ? rowsByKind.series : [];
+      const liveMap = categoriesByKind.live || new Map();
+      const vodMap = categoriesByKind.movie || new Map();
+      const seriesMap = categoriesByKind.series || new Map();
+      items = liveRows.map((row, i) => {
+        const item = normaliseBrowserItem(withCategory(row, liveMap), 'live', `${iptvStreamOrigin(source)}/live/${encodeURIComponent(source.username)}/${encodeURIComponent(source.password)}/${row.stream_id}.${source.liveExtension || 'm3u8'}`, i);
+        if (item) item.playlist_id = source.id || null;
+        return item;
+      }).filter(Boolean)
+        .concat(movieRows.map((row, i) => {
+          const item = normaliseBrowserItem(withCategory(row, vodMap), 'movie', `${iptvStreamOrigin(source)}/movie/${encodeURIComponent(source.username)}/${encodeURIComponent(source.password)}/${row.stream_id}.${row.container_extension || 'mp4'}`, i);
+          if (item) item.playlist_id = source.id || null;
+          return item;
+        }).filter(Boolean))
+        .concat(seriesRows.map((row, i) => { const item = withCategory(row, seriesMap); return { id: Number.parseInt(item.series_id, 10) || stableStreamId(item.name, i), kind: 'series', title: cleanString(item.name, 180), group: cleanString(item.category_name || '', 120) || null, logo: /^https:\/\//i.test(String(item.cover || '')) ? String(item.cover) : null, sourceUrl: null, container: null, playlist_id: source.id || null }; }));
+    } else {
+      // Parse an M3U exactly once, then derive per-kind views from that cache.
+      // This avoids repeatedly downloading and scanning a large playlist when
+      // the UI switches between Live/Movies/Series tabs.
+      const allKey = `${sourceKey}|m3u`;
+      let allEntry = sourceCache.all;
+      if (!(allEntry && now - allEntry.at < BROWSER_CATALOG_CACHE_MS)) {
+        if (browserCatalogInflight.has(allKey)) {
+          allEntry = await browserCatalogInflight.get(allKey);
+        } else {
+          const m3uPending = parseM3U(source).then((parsed) => {
+            const entry = { at: Date.now(), items: parsed, groups: [...new Set(parsed.map((item) => item.group).filter(Boolean))].sort((a, b) => a.localeCompare(b)) };
+            sourceCache.all = entry;
+            return entry;
+          }).finally(() => browserCatalogInflight.delete(allKey));
+          browserCatalogInflight.set(allKey, m3uPending);
+          allEntry = await m3uPending;
+        }
+      }
+      items = (allEntry?.items || []).filter((item) => !wantedKind || item.kind === wantedKind);
+    }
+    const categoryAllowlist = wantedKind === 'live' ? source.liveCategories : wantedKind === 'movie' ? source.movieCategories : wantedKind === 'series' ? source.seriesCategories : [];
+    if (categoryAllowlist.length) {
+      const allowed = new Set(categoryAllowlist.map((value) => String(value).toLowerCase()));
+      items = items.filter((item) => item.group && allowed.has(String(item.group).toLowerCase()));
+    }
+    const groups = [...new Set(items.map((item) => item.group).filter(Boolean))].sort((a, b) => a.localeCompare(b));
+    const result = { at: Date.now(), items, groups };
+    sourceCache[wantedKind || 'all'] = result;
+    return result;
+  })().finally(() => browserCatalogInflight.delete(fetchKey));
+  browserCatalogInflight.set(fetchKey, pending);
+  return pending;
+}
+
+async function getBrowserCatalog(requestedKind, connection) {
+  if (connection) return getBrowserCatalogFromConnection(requestedKind, connection);
+  const connections = await playlistConnections();
+  if (!connections.length) return null;
+  let lastError = null;
+  for (let index = 0; index < connections.length; index += 1) {
+    try {
+      const result = await getBrowserCatalogFromConnection(requestedKind, connections[index]);
+      // An empty feed is a failed fallback candidate when another playlist is
+      // available. Keep the final empty result so the UI can still explain it.
+      if (result && (result.items.length || index === connections.length - 1)) return result;
+    } catch (error) {
+      lastError = error;
+      if (index === connections.length - 1) throw error;
+    }
   }
-  const groups = [...new Set(items.map((item) => item.group).filter(Boolean))].sort((a, b) => a.localeCompare(b));
-  const result = { at: Date.now(), items, groups };
-  if (wantedKind) browserCatalogCache.byKind[wantedKind] = result;
-  else browserCatalogCache = { ...result, byKind: {} };
-  return result;
+  if (lastError) throw lastError;
+  return null;
 }
 
 function normaliseProviderCookie(value) {
@@ -351,13 +507,21 @@ function issueStreamToken(userId, item, providerContext) {
   // the write path so a long-running Movie Night session cannot grow this
   // process-local map without bound.
   const now = Date.now();
-  for (const [key, value] of streamTokens) {
-    if (!value || value.expiresAt < now) streamTokens.delete(key);
+  // Pruning the complete map for every HLS segment is O(n) per request. A
+  // short periodic sweep provides the same bound while keeping token minting
+  // effectively constant-time during playback.
+  if (now - streamTokenPruneAt >= 30 * 1000) {
+    streamTokenPruneAt = now;
+    for (const [key, value] of streamTokens) {
+      if (!value || value.expiresAt < now) streamTokens.delete(key);
+    }
   }
   const token = require('crypto').randomBytes(24).toString('base64url');
   streamTokens.set(token, {
     userId: String(userId), sourceUrl: item.sourceUrl, title: item.title,
     kind: item.kind, container: item.container || null,
+    playlistId: Number.parseInt(item.playlist_id || item.playlistId || 0, 10) || null,
+    sessionId: Number.parseInt(item.sessionId || 0, 10) || null,
     // Provider request context is deliberately held only in this server-side
     // capability map; it is never serialized into browser-visible URLs.
     providerContext: providerContext && typeof providerContext === 'object' ? {
@@ -384,6 +548,9 @@ function takeStreamToken(token, userId) {
 // request instead of weakening the role gate or putting a long-lived session
 // token in the media URL.
 async function getStreamUser(entry, req) {
+  const cacheKey = String(entry.userId);
+  const cached = streamAccessCache.get(cacheKey);
+  if (cached && cached.expiresAt > Date.now()) return cached.value;
   let user = null;
   try {
     const sessionUser = await getSessionUser(bearerToken(req));
@@ -403,7 +570,30 @@ async function getStreamUser(entry, req) {
   if (!user || user.banned) return null;
   const settings = await getSettings();
   const access = await roleAccess(user, settings);
-  return access.allowed ? { user, settings, access } : null;
+  const value = access.allowed ? { user, settings, access } : null;
+  if (value) streamAccessCache.set(cacheKey, { value, expiresAt: Date.now() + STREAM_ACCESS_CACHE_MS });
+  else streamAccessCache.delete(cacheKey);
+  return value;
+}
+
+async function watchSessionIsActive(sessionId) {
+  const id = Number.parseInt(sessionId, 10);
+  if (!Number.isSafeInteger(id) || id < 1) return true;
+  const cached = watchSessionStatusCache.get(id);
+  if (cached && cached.expiresAt > Date.now()) return cached.active;
+  try {
+    const { rows } = await db.query(
+      `SELECT 1 FROM movie_night_watch_sessions
+        WHERE id = $1 AND status = 'active'
+          AND last_seen_at > now() - interval '2 hours' LIMIT 1`, [id]
+    );
+    const active = !!rows[0];
+    watchSessionStatusCache.set(id, { active, expiresAt: Date.now() + WATCH_SESSION_CACHE_MS });
+    return active;
+  } catch (error) {
+    if (migrationError(error)) return true;
+    throw error;
+  }
 }
 
 function controlConfigured() {
@@ -430,6 +620,7 @@ function publicChannel(row) {
     title: cleanString(row.title || row.tvg_name, 180),
     group: cleanString(row.group || row.group_title, 120) || null,
     kind: cleanString(row.kind || row.stream_type, 20) || null,
+    playlist_id: Number.isSafeInteger(Number(row.playlist_id)) && Number(row.playlist_id) > 0 ? Number(row.playlist_id) : null,
     logo: /^https:\/\//i.test(String(row.logo || row.tvg_logo || '')) ? String(row.logo || row.tvg_logo) : null,
     now_playing: cleanString(row.now_playing || '', 220) || null,
   };
@@ -450,6 +641,113 @@ async function getSettings() {
 
 function migrationError(error) {
   return error && (error.code === '42P01' || error.code === '42703');
+}
+
+function playlistMethod(value) {
+  const method = String(value || '').trim().toLowerCase();
+  return method === 'xtream' || method === 'xc' ? 'xtream' : 'm3u';
+}
+
+function playlistCategories(value) {
+  if (!Array.isArray(value)) return [];
+  return [...new Set(value.map((item) => cleanString(item, 120)).filter(Boolean))].slice(0, 250);
+}
+
+function playlistUrl(value) {
+  const text = String(value || '').trim();
+  return text && validPrivateUrl(text) ? text : null;
+}
+
+function maskedPlaylist(row) {
+  const decrypt = (value) => decryptRuntimeSecret(String(value || '')) || '';
+  const hostValue = decrypt(row.host_url_enc);
+  const m3uValue = decrypt(row.playlist_url_enc);
+  let host = '';
+  let m3uHost = '';
+  try { host = hostValue ? new URL(hostValue).host : ''; } catch (_) {}
+  try { m3uHost = m3uValue ? new URL(m3uValue).host : ''; } catch (_) {}
+  return {
+    id: Number(row.id), name: cleanString(row.name, 120), method: playlistMethod(row.method),
+    enabled: row.enabled !== false, max_users: Math.max(1, Number(row.max_users) || 1),
+    sort_order: Number(row.sort_order) || 0, active_users: Math.max(0, Number(row.active_users) || 0),
+    host, m3u_host: m3uHost,
+    configured: playlistMethod(row.method) === 'xtream'
+      ? !!(hostValue && decrypt(row.username_enc) && decrypt(row.password_enc)) : !!m3uValue,
+    categories: {
+      live: playlistCategories(row.live_categories), movie: playlistCategories(row.movie_categories),
+      series: playlistCategories(row.series_categories),
+    },
+  };
+}
+
+async function beginWatchSession({ playlistId, user, channel }) {
+  const id = Number.parseInt(playlistId, 10);
+  if (!Number.isSafeInteger(id) || id < 1) return null;
+  try {
+    // An atomic insert makes the max-user limit safe when two viewers start at
+    // the same time. Stale streams are expired as part of the same statement.
+    const { rows } = await db.query(
+      `WITH chosen AS (
+         SELECT p.id
+           FROM movie_night_playlists p
+          WHERE p.id = $1 AND p.enabled = true
+            AND (SELECT COUNT(*) FROM movie_night_watch_sessions s
+                   WHERE s.playlist_id = p.id AND s.status = 'active'
+                     AND s.last_seen_at > now() - interval '2 hours') < p.max_users
+          FOR UPDATE SKIP LOCKED
+       ), inserted AS (
+         INSERT INTO movie_night_watch_sessions
+           (playlist_id, user_id, discord_id, channel_id, title)
+         SELECT c.id, $2, $3, $4, $5 FROM chosen c
+         RETURNING id
+       ) SELECT id FROM inserted`,
+      [id, user?.id || null, user?.discord_id ? String(user.discord_id) : null,
+        Number(channel?.id) || null, cleanString(channel?.title || 'Movie Night', 180) || 'Movie Night']
+    );
+    return rows[0] ? Number(rows[0].id) : 0;
+  } catch (error) {
+    if (migrationError(error)) return null;
+    throw error;
+  }
+}
+
+function touchWatchSession(sessionId) {
+  const id = Number.parseInt(sessionId, 10);
+  if (!Number.isSafeInteger(id) || id < 1) return;
+  const now = Date.now();
+  const previous = watchSessionTouchAt.get(id) || 0;
+  // HLS clients request a playlist and several segments every few seconds.
+  // Updating last_seen_at on each request creates avoidable write pressure;
+  // one heartbeat per interval is sufficient for the two-hour stale cutoff.
+  if (now - previous < WATCH_SESSION_TOUCH_MS) return;
+  watchSessionTouchAt.set(id, now);
+  watchSessionStatusCache.set(id, { active: true, expiresAt: now + WATCH_SESSION_CACHE_MS });
+  db.query(`UPDATE movie_night_watch_sessions SET last_seen_at = now()
+            WHERE id = $1 AND status = 'active'`, [id]).catch(() => {});
+}
+
+async function endWatchSessions(userId) {
+  const id = Number.parseInt(userId, 10);
+  if (!Number.isSafeInteger(id) || id < 1) return 0;
+  try {
+    const result = await db.query(
+      `UPDATE movie_night_watch_sessions
+          SET status = 'stopped', ended_at = now(), last_seen_at = now()
+        WHERE user_id = $1 AND status = 'active'`, [id]
+    );
+    // Admin/user stop must take effect immediately even though stream status
+    // checks are cached to avoid one DB SELECT per HLS segment.
+    for (const [sessionId] of watchSessionStatusCache) {
+      watchSessionStatusCache.delete(sessionId);
+    }
+    for (const [sessionId] of watchSessionTouchAt) {
+      watchSessionTouchAt.delete(sessionId);
+    }
+    return Number(result.rowCount) || 0;
+  } catch (error) {
+    if (migrationError(error)) return 0;
+    throw error;
+  }
 }
 
 async function roleAccess(user, settings) {
@@ -536,6 +834,7 @@ router.get('/access', requireAuth, async (req, res) => {
   try {
     const settings = await getSettings();
     const access = await roleAccess(req.user, settings);
+    const browserConfigured = await browserIptvConfiguredAsync();
     const canManage = req.user.role === 'admin';
     return res.json({
       visible: access.allowed || canManage,
@@ -543,8 +842,8 @@ router.get('/access', requireAuth, async (req, res) => {
       can_manage: canManage,
       enabled: settings.enabled,
       discord_linked: discordLinked(req.user),
-      streaming_configured: controlConfigured() || browserIptvConfigured(),
-      browser_configured: browserIptvConfigured(),
+      streaming_configured: controlConfigured() || browserConfigured,
+      browser_configured: browserConfigured,
     });
   } catch (error) {
     if (migrationError(error)) return res.status(503).json({ error: 'Movie Night setup has not been installed yet' });
@@ -611,11 +910,12 @@ function decodeXtreamText(value) {
 router.get('/epg/:streamId', requireAuth, requireMovieNightAccess, async (req, res) => {
   const streamId = Number.parseInt(req.params.streamId, 10);
   if (!Number.isSafeInteger(streamId) || streamId < 1) return res.status(400).json({ error: 'Invalid channel' });
-  if (!browserIptvConfigured() || !(IPTV_BASE && IPTV_USER && IPTV_PASSWORD)) {
+  const source = await playlistConnectionById(req.query.playlist_id) || await primaryPlaylistConnection();
+  if (!(source && source.base && source.username && source.password)) {
     return res.status(503).json({ error: 'Live TV guide is not configured' });
   }
   try {
-    const data = await xtreamRequest('get_short_epg', { stream_id: streamId, limit: 24 });
+    const data = await xtreamRequest('get_short_epg', { stream_id: streamId, limit: 24 }, null, source);
     const entries = Array.isArray(data?.epg_listings) ? data.epg_listings : [];
     return res.json({ stream_id: streamId, listings: entries.map((entry) => ({
       id: cleanString(entry.id || '', 120),
@@ -633,13 +933,14 @@ router.get('/epg/:streamId', requireAuth, requireMovieNightAccess, async (req, r
 });
 
 router.get('/series/:seriesId', requireAuth, requireMovieNightAccess, async (req, res) => {
-  if (!browserIptvConfigured() || !(IPTV_BASE && IPTV_USER && IPTV_PASSWORD)) {
+  const source = await playlistConnectionById(req.query.playlist_id) || await primaryPlaylistConnection();
+  if (!(source && source.base && source.username && source.password)) {
     return res.status(503).json({ error: 'Series playback is not configured' });
   }
   const seriesId = Number.parseInt(req.params.seriesId, 10);
   if (!Number.isSafeInteger(seriesId) || seriesId < 1) return res.status(400).json({ error: 'Invalid series' });
   try {
-    const data = await xtreamRequest('get_series_info', { series_id: seriesId });
+    const data = await xtreamRequest('get_series_info', { series_id: seriesId }, null, source);
     const episodes = [];
     const seasons = data && data.episodes && typeof data.episodes === 'object' ? data.episodes : {};
     Object.keys(seasons).forEach((seasonKey) => {
@@ -647,8 +948,8 @@ router.get('/series/:seriesId', requireAuth, requireMovieNightAccess, async (req
         const streamId = Number.parseInt(episode.id || episode.episode_id || episode.stream_id, 10);
         if (!Number.isSafeInteger(streamId) || streamId < 1) return;
         const extension = String(episode.container_extension || 'mp4').replace(/[^a-z0-9]/gi, '') || 'mp4';
-        const sourceUrl = `${iptvStreamOrigin()}/series/${encodeURIComponent(IPTV_USER)}/${encodeURIComponent(IPTV_PASSWORD)}/${streamId}.${extension}`;
-        const item = { id: streamId, kind: 'episode', title: cleanString(episode.title || `Episode ${index + 1}`, 180), group: `Season ${seasonKey}`, sourceUrl };
+        const sourceUrl = `${iptvStreamOrigin(source)}/series/${encodeURIComponent(source.username)}/${encodeURIComponent(source.password)}/${streamId}.${extension}`;
+        const item = { id: streamId, kind: 'episode', title: cleanString(episode.title || `Episode ${index + 1}`, 180), group: `Season ${seasonKey}`, sourceUrl, playlist_id: source.id };
         const token = issueStreamToken(req.user.id, item);
         episodes.push({ id: streamId, title: item.title, season: String(seasonKey), episode: Number(episode.episode_num || index + 1), stream_token: token });
       });
@@ -680,6 +981,13 @@ router.get('/stream/:token', async (req, res) => {
   const streamUserId = streamAccess.user.id;
   const entry = takeStreamToken(req.params.token, streamUserId);
   if (!entry || !entry.sourceUrl) return res.status(404).json({ error: 'Playback link expired' });
+  try {
+    if (!(await watchSessionIsActive(entry.sessionId))) return res.status(410).json({ error: 'This viewing session was stopped by an administrator' });
+  } catch (error) {
+    console.error('[MovieNight] watch session check failed:', error.message);
+    return res.status(503).json({ error: 'Movie Night session status is temporarily unavailable' });
+  }
+  touchWatchSession(entry.sessionId);
   const sourceUrl = cleanProviderUrl(entry.sourceUrl);
   if (!sourceUrl) return res.status(404).json({ error: 'Playback source unavailable' });
   try {
@@ -690,8 +998,17 @@ router.get('/stream/:token', async (req, res) => {
       headers: requestHeaders,
       validateStatus: (status) => status >= 200 && status < 400,
     });
-    if (isPlaylist || /mpegurl/i.test(String(response.headers['content-type'] || ''))) {
-      const playlist = String(response.data || '');
+    const contentType = String(response.headers['content-type'] || '');
+    if (isPlaylist || /mpegurl/i.test(contentType)) {
+      const playlist = typeof response.data === 'string'
+        ? response.data
+        : await new Promise((resolve, reject) => {
+          let text = '';
+          response.data.setEncoding?.('utf8');
+          response.data.on('data', (chunk) => { text += String(chunk); });
+          response.data.on('end', () => resolve(text));
+          response.data.on('error', reject);
+        });
       const effectiveSourceUrl = cleanProviderUrl(response?.request?.res?.responseUrl || response?.request?._currentUrl) || sourceUrl;
       const childContext = providerStreamContext(entry, effectiveSourceUrl, response, requestHeaders);
       const rewritten = playlist.split(/\r?\n/).map((line) => {
@@ -699,7 +1016,7 @@ router.get('/stream/:token', async (req, res) => {
           return line.replace(/URI="([^"]+)"/gi, (_, uri) => {
             const absolute = cleanProviderUrl(new URL(uri, effectiveSourceUrl).toString());
             if (!absolute) return `URI="${uri}"`;
-            const child = issueStreamToken(streamUserId, { sourceUrl: absolute, title: entry.title, kind: entry.kind }, childContext);
+            const child = issueStreamToken(streamUserId, { sourceUrl: absolute, title: entry.title, kind: entry.kind, sessionId: entry.sessionId }, childContext);
             return `URI="/api/movie-night/stream/${child}"`;
           });
         }
@@ -707,7 +1024,7 @@ router.get('/stream/:token', async (req, res) => {
         let absolute;
         try { absolute = cleanProviderUrl(new URL(line.trim(), effectiveSourceUrl).toString()); } catch (_) { absolute = null; }
         if (!absolute) return line;
-        const child = issueStreamToken(streamUserId, { sourceUrl: absolute, title: entry.title, kind: entry.kind }, childContext);
+        const child = issueStreamToken(streamUserId, { sourceUrl: absolute, title: entry.title, kind: entry.kind, sessionId: entry.sessionId }, childContext);
         return `/api/movie-night/stream/${child}`;
       }).join('\n');
       res.status(200).set({
@@ -740,13 +1057,14 @@ router.post('/play', requireAuth, requireMovieNightAccess, async (req, res) => {
     return res.status(400).json({ error: 'Choose a valid Movie Night title' });
   }
   try {
-    if (browserIptvConfigured()) {
+    const browserConnections = await playlistConnections();
+    if (browserConnections.length) {
       const kind = cleanString(req.body?.kind, 20).toLowerCase() || 'live';
       let item = null;
       if (req.body?.stream_token) {
         const tokenEntry = takeStreamToken(req.body.stream_token, req.user.id);
         if (!tokenEntry) return res.status(404).json({ error: 'This playback link has expired' });
-        item = { id: channelId, kind: tokenEntry.kind, title: tokenEntry.title, group: null, sourceUrl: tokenEntry.sourceUrl };
+        item = { id: channelId, kind: tokenEntry.kind, title: tokenEntry.title, group: null, sourceUrl: tokenEntry.sourceUrl, container: tokenEntry.container, playlist_id: tokenEntry.playlistId };
       } else {
         const catalog = await getBrowserCatalog(kind);
         item = catalog && catalog.items.find((candidate) => Number(candidate.id) === channelId && String(candidate.kind) === kind);
@@ -754,8 +1072,46 @@ router.post('/play', requireAuth, requireMovieNightAccess, async (req, res) => {
       if (!item || !item.sourceUrl) {
         return res.status(400).json({ error: kind === 'series' ? 'Choose an episode from the series list' : 'That title is no longer available' });
       }
-      const token = issueStreamToken(req.user.id, item);
-      const channel = publicChannel({ id: item.id, title: item.title, group: item.group, logo: item.logo, kind: item.kind }) || { id: channelId, title: item.title };
+      // A full playlist slot should fail over to the next matching playlist,
+      // but do that lazily. Fetching every provider's (potentially very large)
+      // catalog before trying the first slot made a click feel slow even when
+      // the primary playlist had capacity. Only inspect alternates after the
+      // atomic slot reservation says the current playlist is full.
+      const primary = { item, playlistId: item.playlist_id || req.body?.playlist_id || null };
+      let sessionId = null;
+      let chosen = null;
+      const tryCandidate = async (candidate) => {
+        try {
+          const id = await beginWatchSession({ playlistId: candidate.playlistId, user: req.user, channel: candidate.item });
+          if (id === 0) return false;
+          sessionId = id;
+          chosen = candidate;
+          return true;
+        } catch (sessionError) {
+          if (!migrationError(sessionError)) throw sessionError;
+          // Legacy environment-backed playback has no playlist table/slot;
+          // it is still a valid candidate with a null session id.
+          sessionId = null;
+          chosen = candidate;
+          return true;
+        }
+      };
+      if (!(await tryCandidate(primary))) {
+        for (const source of browserConnections) {
+          if (String(source.id || '') === String(primary.playlistId || '')) continue;
+          try {
+            const alternate = await getBrowserCatalog(kind, source);
+            const match = alternate && alternate.items.find((candidate) => String(candidate.kind) === String(kind)
+              && (String(candidate.title).toLowerCase() === String(item.title).toLowerCase()
+                || (Number(candidate.id) === channelId && !source.id)));
+            if (match && await tryCandidate({ item: match, playlistId: source.id || null })) break;
+          } catch (_) { /* try the next configured playlist */ }
+        }
+      }
+      if (!chosen) return res.status(429).json({ error: 'All available IPTV playlists are at their viewing limit or temporarily unavailable. Please wait for a slot to open.' });
+      item = chosen.item;
+      const channel = publicChannel({ id: item.id, title: item.title, group: item.group, logo: item.logo, kind: item.kind, playlist_id: chosen.playlistId }) || { id: channelId, title: item.title };
+      const token = issueStreamToken(req.user.id, { ...item, sessionId });
       await writePlaybackLog({ user: req.user, channel, action: 'play', status: 'started' });
       const streamType = /\.m3u8(?:$|\?)/i.test(String(item.sourceUrl || '')) || /m3u8/i.test(String(item.container || '')) ? 'hls' : 'file';
       return res.json({ success: true, mode: 'browser', channel, stream_type: streamType, stream_url: `/api/movie-night/stream/${token}` });
@@ -782,7 +1138,8 @@ router.post('/play', requireAuth, requireMovieNightAccess, async (req, res) => {
 
 router.post('/stop', requireAuth, requireMovieNightAccess, async (req, res) => {
   try {
-    if (browserIptvConfigured()) {
+    if (await browserIptvConfiguredAsync()) {
+      await endWatchSessions(req.user.id);
       await writePlaybackLog({ user: req.user, channel: { title: 'Movie Night' }, action: 'stop', status: 'stopped' });
       return res.json({ success: true, current: null, mode: 'browser' });
     }
@@ -842,6 +1199,195 @@ router.get('/admin/history', requireOwnerAdmin, async (req, res) => {
   } catch (error) {
     if (migrationError(error)) return res.status(503).json({ error: 'Movie Night setup has not been installed yet' });
     return res.status(500).json({ error: 'Could not load Movie Night history' });
+  }
+});
+
+// ─── Admin IPTV playlist and room controls ────────────────────────────────
+// Provider URLs and credentials are accepted only over an authenticated owner
+// request, encrypted before storage, and represented to the browser by hosts
+// and masked status only. A playlist is never returned with its secret fields.
+router.get('/admin/playlists', requireOwnerAdmin, async (_req, res) => {
+  try {
+    const { rows } = await db.query(
+      `SELECT p.id, p.name, p.method, p.playlist_url_enc, p.host_url_enc,
+              p.username_enc, p.password_enc, p.max_users, p.enabled,
+              p.sort_order, p.live_categories, p.movie_categories,
+              p.series_categories,
+              (SELECT COUNT(*) FROM movie_night_watch_sessions s
+                WHERE s.playlist_id = p.id AND s.status = 'active'
+                  AND s.last_seen_at > now() - interval '2 hours') AS active_users
+         FROM movie_night_playlists p
+        WHERE p.guild_id = $1
+        ORDER BY p.sort_order, p.id`, [GUILD_ID]
+    );
+    return res.json({ playlists: rows.map(maskedPlaylist) });
+  } catch (error) {
+    if (migrationError(error)) return res.status(503).json({ error: 'Playlist management migration is not installed yet' });
+    console.error('[MovieNight] playlist list failed:', error.message);
+    return res.status(500).json({ error: 'Could not load IPTV playlists' });
+  }
+});
+
+function playlistInput(body, current) {
+  const method = playlistMethod(body?.method || current?.method);
+  const name = cleanString(body?.name ?? current?.name, 120);
+  const maxUsers = Math.max(1, Math.min(1000, Number.parseInt(body?.max_users ?? current?.max_users, 10) || 1));
+  const enabled = body?.enabled == null ? current?.enabled !== false : body.enabled === true;
+  const sortOrder = Math.max(0, Math.min(100000, Number.parseInt(body?.sort_order ?? current?.sort_order, 10) || 0));
+  if (!name) { const e = new Error('Playlist name is required'); e.statusCode = 400; throw e; }
+  const value = (key, encryptedKey) => {
+    const clearKey = `clear_${key}`;
+    if (body && body[clearKey] === true) return '';
+    if (body && Object.prototype.hasOwnProperty.call(body, key)) {
+      const text = String(body[key] == null ? '' : body[key]).trim();
+      return text ? text : (current ? decryptRuntimeSecret(String(current[encryptedKey] || '')) || '' : '');
+    }
+    return current ? decryptRuntimeSecret(String(current[encryptedKey] || '')) || '' : '';
+  };
+  const playlistUrlValue = value('playlist_url', 'playlist_url_enc');
+  const hostValue = value('host_url', 'host_url_enc');
+  const usernameValue = value('username', 'username_enc');
+  const passwordValue = value('password', 'password_enc');
+  if (method === 'm3u') {
+    if (!playlistUrlValue || !validPrivateUrl(playlistUrlValue)) { const e = new Error('M3U playlist URL must be a valid http(s) URL'); e.statusCode = 400; throw e; }
+  } else if (!hostValue || !validPrivateUrl(hostValue) || !usernameValue || !passwordValue) {
+    const e = new Error('XC playlists require a valid host, username, and password'); e.statusCode = 400; throw e;
+  }
+  return {
+    name, method, maxUsers, enabled, sortOrder,
+    playlistUrlValue: method === 'm3u' ? playlistUrlValue : '',
+    hostValue: method === 'xtream' ? hostValue : '',
+    usernameValue: method === 'xtream' ? usernameValue : '',
+    passwordValue: method === 'xtream' ? passwordValue : '',
+    liveCategories: playlistCategories(body?.live_categories ?? current?.live_categories),
+    movieCategories: playlistCategories(body?.movie_categories ?? current?.movie_categories),
+    seriesCategories: playlistCategories(body?.series_categories ?? current?.series_categories),
+  };
+}
+
+function encryptedOrNull(value) {
+  return value ? encryptRuntimeSecret(value) : null;
+}
+
+router.post('/admin/playlists', requireOwnerAdmin, async (req, res) => {
+  try {
+    const input = playlistInput(req.body || {});
+    const { rows } = await db.query(
+      `INSERT INTO movie_night_playlists
+         (guild_id, name, method, playlist_url_enc, host_url_enc, username_enc,
+          password_enc, max_users, enabled, sort_order, live_categories,
+          movie_categories, series_categories, updated_at)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11::jsonb,$12::jsonb,$13::jsonb,now())
+       RETURNING id, name, method, max_users, enabled, sort_order,
+                 live_categories, movie_categories, series_categories`,
+      [GUILD_ID, input.name, input.method, encryptedOrNull(input.playlistUrlValue),
+        encryptedOrNull(input.hostValue), encryptedOrNull(input.usernameValue),
+        encryptedOrNull(input.passwordValue), input.maxUsers, input.enabled, input.sortOrder,
+        JSON.stringify(input.liveCategories), JSON.stringify(input.movieCategories), JSON.stringify(input.seriesCategories)]
+    );
+    await logAdminAction(req, 'movie_night_playlist_create', Number(rows[0].id), { name: input.name, method: input.method, max_users: input.maxUsers });
+    return res.status(201).json({ success: true, playlist: maskedPlaylist(rows[0]) });
+  } catch (error) {
+    if (migrationError(error)) return res.status(503).json({ error: 'Playlist management migration is not installed yet' });
+    console.error('[MovieNight] playlist create failed:', error.message);
+    return res.status(error.statusCode || 500).json({ error: error.message || 'Could not add IPTV playlist' });
+  }
+});
+
+router.put('/admin/playlists/:id', requireOwnerAdmin, async (req, res) => {
+  const id = Number.parseInt(req.params.id, 10);
+  if (!Number.isSafeInteger(id) || id < 1) return res.status(400).json({ error: 'Invalid playlist' });
+  try {
+    const found = await db.query('SELECT * FROM movie_night_playlists WHERE id = $1 AND guild_id = $2 LIMIT 1', [id, GUILD_ID]);
+    if (!found.rows[0]) return res.status(404).json({ error: 'Playlist not found' });
+    const input = playlistInput(req.body || {}, found.rows[0]);
+    const { rows } = await db.query(
+      `UPDATE movie_night_playlists SET name=$1, method=$2, playlist_url_enc=$3,
+          host_url_enc=$4, username_enc=$5, password_enc=$6, max_users=$7,
+          enabled=$8, sort_order=$9, live_categories=$10::jsonb,
+          movie_categories=$11::jsonb, series_categories=$12::jsonb, updated_at=now()
+        WHERE id=$13 AND guild_id=$14
+        RETURNING id, name, method, max_users, enabled, sort_order,
+                  live_categories, movie_categories, series_categories`,
+      [input.name, input.method, encryptedOrNull(input.playlistUrlValue), encryptedOrNull(input.hostValue),
+        encryptedOrNull(input.usernameValue), encryptedOrNull(input.passwordValue), input.maxUsers,
+        input.enabled, input.sortOrder, JSON.stringify(input.liveCategories), JSON.stringify(input.movieCategories),
+        JSON.stringify(input.seriesCategories), id, GUILD_ID]
+    );
+    await logAdminAction(req, 'movie_night_playlist_update', id, { name: input.name, method: input.method, max_users: input.maxUsers });
+    return res.json({ success: true, playlist: maskedPlaylist(rows[0]) });
+  } catch (error) {
+    if (migrationError(error)) return res.status(503).json({ error: 'Playlist management migration is not installed yet' });
+    console.error('[MovieNight] playlist update failed:', error.message);
+    return res.status(error.statusCode || 500).json({ error: error.message || 'Could not update IPTV playlist' });
+  }
+});
+
+router.delete('/admin/playlists/:id', requireOwnerAdmin, async (req, res) => {
+  const id = Number.parseInt(req.params.id, 10);
+  if (!Number.isSafeInteger(id) || id < 1) return res.status(400).json({ error: 'Invalid playlist' });
+  try {
+    const result = await db.query(
+      `UPDATE movie_night_watch_sessions SET status='stopped', ended_at=now(), last_seen_at=now()
+        WHERE playlist_id=$1 AND status='active';
+       DELETE FROM movie_night_playlists WHERE id=$1 AND guild_id=$2`, [id, GUILD_ID]
+    );
+    await logAdminAction(req, 'movie_night_playlist_delete', id, {});
+    return res.json({ success: true, deleted: Number(result?.[1]?.rowCount || result?.rowCount || 0) > 0 });
+  } catch (error) {
+    if (migrationError(error)) return res.status(503).json({ error: 'Playlist management migration is not installed yet' });
+    console.error('[MovieNight] playlist delete failed:', error.message);
+    return res.status(500).json({ error: 'Could not remove IPTV playlist' });
+  }
+});
+
+router.get('/admin/sessions', requireOwnerAdmin, async (_req, res) => {
+  try {
+    await db.query(`UPDATE movie_night_watch_sessions SET status='expired', ended_at=now()
+      WHERE status='active' AND last_seen_at <= now() - interval '2 hours'`);
+    const { rows } = await db.query(
+      `SELECT s.id, s.playlist_id, p.name AS playlist_name, s.user_id, s.discord_id,
+              s.channel_id, s.title, s.status, s.started_at, s.last_seen_at
+         FROM movie_night_watch_sessions s
+         LEFT JOIN movie_night_playlists p ON p.id=s.playlist_id
+        WHERE s.status='active' ORDER BY s.started_at DESC LIMIT 250`
+    );
+    return res.json({ sessions: rows.map((row) => ({
+      id: Number(row.id), playlist_id: row.playlist_id ? Number(row.playlist_id) : null,
+      playlist_name: cleanString(row.playlist_name || 'Legacy provider', 120), user_id: row.user_id ? Number(row.user_id) : null,
+      discord_id: cleanString(row.discord_id || '', 30) || null, channel_id: row.channel_id ? Number(row.channel_id) : null,
+      title: cleanString(row.title, 180), status: row.status, started_at: row.started_at, last_seen_at: row.last_seen_at,
+    })) });
+  } catch (error) {
+    if (migrationError(error)) return res.status(503).json({ error: 'Playlist management migration is not installed yet' });
+    return res.status(500).json({ error: 'Could not load active Movie Night sessions' });
+  }
+});
+
+router.post('/admin/sessions/:id/stop', requireOwnerAdmin, async (req, res) => {
+  const id = Number.parseInt(req.params.id, 10);
+  if (!Number.isSafeInteger(id) || id < 1) return res.status(400).json({ error: 'Invalid session' });
+  try {
+    const result = await db.query(`UPDATE movie_night_watch_sessions
+      SET status='stopped', ended_at=now(), last_seen_at=now()
+      WHERE id=$1 AND status='active'`, [id]);
+    if (!result.rowCount) return res.status(404).json({ error: 'Session is already stopped' });
+    await logAdminAction(req, 'movie_night_session_stop', id, {});
+    return res.json({ success: true });
+  } catch (error) {
+    if (migrationError(error)) return res.status(503).json({ error: 'Playlist management migration is not installed yet' });
+    return res.status(500).json({ error: 'Could not stop the Movie Night session' });
+  }
+});
+
+router.delete('/admin/history', requireOwnerAdmin, async (req, res) => {
+  try {
+    const result = await db.query('DELETE FROM movie_night_playback_log');
+    await logAdminAction(req, 'movie_night_history_clear', null, { deleted: Number(result.rowCount) || 0 });
+    return res.json({ success: true, deleted: Number(result.rowCount) || 0 });
+  } catch (error) {
+    if (migrationError(error)) return res.status(503).json({ error: 'Movie Night setup has not been installed yet' });
+    return res.status(500).json({ error: 'Could not clear the Movie Night room log' });
   }
 });
 

@@ -7,6 +7,54 @@
 
 const express = require('express');
 const router = express.Router();
+
+function normaliseSmsCode(value) {
+  if (value == null) return null;
+  const text = typeof value === 'object' ? (value.code || value.sms || value.text || '') : String(value);
+  const match = String(text).match(/\b(\d{4,10})\b/);
+  return match ? match[1] : null;
+}
+
+function normaliseSmsServices(payload) {
+  const source = payload && (payload.services || payload.data || payload);
+  if (Array.isArray(source)) return source.map((item) => {
+    if (item && typeof item === 'object') {
+      const value = item.value ?? item.id ?? item.service ?? item.name;
+      return { value: String(value ?? ''), label: String(item.label ?? item.name ?? item.title ?? value ?? '') };
+    }
+    return { value: String(item), label: String(item) };
+  }).filter((x) => x.value);
+  if (!source || typeof source !== 'object') return [];
+  return Object.entries(source).map(([value, item]) => ({
+    value: String(value), label: String(item && (item.name || item.label || item.title) || value),
+  }));
+}
+
+function normaliseSmsCountries(payload) {
+  const source = payload && (payload.countries || payload.data || payload);
+  if (Array.isArray(source)) return source.map((item) => {
+    const code = item && (item.code || item.value || item.id);
+    return { code: String(code ?? ''), name: String(item && (item.name || item.text_en || item.label) || code || '') };
+  }).filter((x) => x.code);
+  if (!source || typeof source !== 'object') return [];
+  return Object.entries(source).map(([code, item]) => ({
+    code: String(code), name: String(item && (item.text_en || item.name || item.label) || code),
+  }));
+}
+
+async function rejectDuplicateSmsNumber(number, provider, userId) {
+  const value = String(number || '').trim();
+  if (!value) return false;
+  const { rows } = await db.query(
+    `SELECT order_id FROM sms_orders
+      WHERE number = $1 AND provider = $2 AND cancelled = false
+      ORDER BY created_at DESC LIMIT 1`, [value, provider]
+  );
+  if (!rows.length) return false;
+  const error = new Error('The provider returned a number that is already active. Please try again.');
+  error.public = true; error.statusCode = 409; error.userId = userId;
+  throw error;
+}
 const db = require('../db');
 const axios = require('axios');
 const { requireAuth, requireAdmin, requireOwnerAdmin, requireDiscordLinked, requireCurrentDiscordMember } = require('../utils/auth');
@@ -34,6 +82,11 @@ const GENERATOR_PLAN_ROLE_KEY = 'GENERATOR_PLAN_ROLE_IDS';
 const GENERATOR_PLAN_TYPES = ['account', 'phone', 'both', 'combined'];
 const STALE_RESERVATION_MINUTES = 30;
 const generator2FALimiter = rateLimit({ windowMs: 15 * 60 * 1000, max: 60, name: 'generator-2fa' });
+
+function normalizeGeneratorPlanType(value, fallback = 'combined') {
+  const normalized = String(value == null ? '' : value).trim().toLowerCase();
+  return GENERATOR_PLAN_TYPES.includes(normalized) ? normalized : fallback;
+}
 
 // A generated account is a Vault account, not a browser-only receipt. Keep the
 // mapping here so the generator and the Vault agree on the destination bucket.
@@ -268,7 +321,15 @@ async function syncGeneratorPlanRole(discordId, planType) {
   }
   try {
     const role = await setDiscordMemberRole(discordId, selected, true);
-    return { synced: true, role, plan_type: planType, revoked: results.length };
+    // A mapped plan role replaces the historical combined GEN MEMBER role. If
+    // the member was granted access before plan-role mappings were configured,
+    // remove that legacy role so their Discord roles reflect exactly one plan.
+    let legacyRevoked = false;
+    try {
+      const legacy = await setDiscordMemberRoleByName(discordId, GEN_MEMBER_ROLE_NAME, false);
+      legacyRevoked = !!legacy.synced;
+    } catch (_) { /* best effort; the mapped role is still authoritative */ }
+    return { synced: true, role, plan_type: planType, revoked: results.length, legacy_revoked: legacyRevoked };
   } catch (error) {
     return { synced: false, warning: error.message || 'Discord plan role sync failed' };
   }
@@ -682,15 +743,12 @@ router.get('/sms/fivesim/services', requireAuth, requireCurrentDiscordMember, re
     const response = await axios.get(`${FIVESIM_BASE}/guest/products/usa/any`);
     const data = response.data;
 
-    const services = Object.keys(data).map(key => ({
-      value: key,
-      label: key.charAt(0).toUpperCase() + key.slice(1)
-    }));
+    const services = normaliseSmsServices(data);
 
     res.json({ success: true, services });
   } catch (error) {
     console.error('[5SIM] Services error:', error);
-    res.json({ success: false, error: 'Failed to load services' });
+    res.status(503).json({ success: false, error: 'SMS services are temporarily unavailable. Please try again.' });
   }
 });
 
@@ -701,21 +759,18 @@ router.get('/sms/fivesim/countries', requireAuth, requireCurrentDiscordMember, r
     const response = await axios.get(`${FIVESIM_BASE}/guest/countries`);
     const data = response.data;
 
-    const countries = Object.keys(data).map(code => ({
-      code: code,
-      name: data[code].text_en,
-      price: '$0.50'
-    }));
+    const countries = normaliseSmsCountries(data).map((item) => ({ ...item, price: '$0.50' }));
 
     res.json({ success: true, countries });
   } catch (error) {
     console.error('[5SIM] Countries error:', error);
-    res.json({ success: false, error: 'Failed to load countries' });
+    res.status(503).json({ success: false, error: 'SMS countries are temporarily unavailable. Please try again.' });
   }
 });
 
 router.post('/sms/fivesim/purchase', requireAuth, requireCurrentDiscordMember, async (req, res) => {
   let reservation = null;
+  let providerOrderId = null;
   try {
     const { service, country } = req.body;
     const userId = req.user.id;
@@ -737,6 +792,8 @@ router.post('/sms/fivesim/purchase', requireAuth, requireCurrentDiscordMember, a
     const data = response.data;
 
     if (data.id && data.phone) {
+      providerOrderId = data.id;
+      await rejectDuplicateSmsNumber(data.phone, 'fivesim', userId);
       await withTransaction(async (exec) => {
         await exec(`
           INSERT INTO sms_orders (order_id, provider, service_name, country, number, user_id, channel_id)
@@ -763,7 +820,17 @@ router.post('/sms/fivesim/purchase', requireAuth, requireCurrentDiscordMember, a
       res.status(502).json({ success: false, error: '5SIM did not return a number' });
     }
   } catch (error) {
+    if (providerOrderId) {
+      axios.get(`${FIVESIM_BASE}/user/cancel/${encodeURIComponent(providerOrderId)}`, {
+        headers: { 'Authorization': `Bearer ${getFivesimApiKey()}`, 'Accept': 'application/json' },
+      }).catch(() => {});
+    }
     await releaseGeneratorUse(req.user.id, reservation).catch(() => {});
+    if (error && error.code === '23505') {
+      error.public = true;
+      error.statusCode = 409;
+      error.message = 'The provider returned a number that is already active. Please try again.';
+    }
     if (error && error.public) {
       return res.status(error.statusCode || 400).json({ success: false, error: error.message });
     }
@@ -788,7 +855,8 @@ router.get('/sms/fivesim/check/:orderId', requireAuth, requireCurrentDiscordMemb
     const data = response.data;
 
     if (data.sms && data.sms.length > 0) {
-      const code = data.sms[0].code;
+      const code = normaliseSmsCode(data.sms[0].code || data.sms[0].text || data.sms[0]);
+      if (!code) return res.json({ success: true, code: null });
 
       // Update database
       await db.query(`
@@ -801,7 +869,7 @@ router.get('/sms/fivesim/check/:orderId', requireAuth, requireCurrentDiscordMemb
     }
   } catch (error) {
     console.error('[5SIM] Check error:', error);
-    res.json({ success: false });
+    res.status(502).json({ success: false, error: 'Could not check the 5SIM verification inbox' });
   }
 });
 
@@ -865,15 +933,12 @@ router.get('/sms/smspool/services', requireAuth, requireCurrentDiscordMember, re
 
     const data = response.data;
 
-    const services = Object.keys(data).map(key => ({
-      value: key,
-      label: data[key].name || key
-    }));
+    const services = normaliseSmsServices(data);
 
     res.json({ success: true, services });
   } catch (error) {
     console.error('[SMSPOOL] Services error:', error);
-    res.json({ success: false, error: 'Failed to load services' });
+    res.status(503).json({ success: false, error: 'SMS services are temporarily unavailable. Please try again.' });
   }
 });
 
@@ -888,21 +953,18 @@ router.get('/sms/smspool/countries', requireAuth, requireCurrentDiscordMember, r
 
     const data = response.data;
 
-    const countries = Object.keys(data).map(code => ({
-      code: code,
-      name: data[code].name,
-      price: '$0.50'
-    }));
+    const countries = normaliseSmsCountries(data).map((item) => ({ ...item, price: '$0.50' }));
 
     res.json({ success: true, countries });
   } catch (error) {
     console.error('[SMSPOOL] Countries error:', error);
-    res.json({ success: false, error: 'Failed to load countries' });
+    res.status(503).json({ success: false, error: 'SMS countries are temporarily unavailable. Please try again.' });
   }
 });
 
 router.post('/sms/smspool/purchase', requireAuth, requireCurrentDiscordMember, async (req, res) => {
   let reservation = null;
+  let providerOrderId = null;
   try {
     const { service, country } = req.body;
     const userId = req.user.id;
@@ -924,6 +986,8 @@ router.post('/sms/smspool/purchase', requireAuth, requireCurrentDiscordMember, a
     const data = response.data;
 
     if (data.success && data.number) {
+      providerOrderId = data.order_id;
+      await rejectDuplicateSmsNumber(data.number, 'smspool', userId);
       await withTransaction(async (exec) => {
         await exec(`
           INSERT INTO sms_orders (order_id, provider, service_name, country, number, user_id, channel_id)
@@ -950,7 +1014,18 @@ router.post('/sms/smspool/purchase', requireAuth, requireCurrentDiscordMember, a
       res.status(502).json({ success: false, error: 'SMSPool did not return a number' });
     }
   } catch (error) {
+    if (providerOrderId) {
+      axios.get(`${SMSPOOL_BASE}/sms/cancel?key=${getSmspoolApiKey()}&orderid=${encodeURIComponent(providerOrderId)}`).catch(() => {});
+    }
     await releaseGeneratorUse(req.user.id, reservation).catch(() => {});
+    if (error && error.public) {
+      return res.status(error.statusCode || 400).json({ success: false, error: error.message });
+    }
+    if (error && error.code === '23505') {
+      error.public = true;
+      error.statusCode = 409;
+      error.message = 'The provider returned a number that is already active. Please try again.';
+    }
     if (error && error.public) {
       return res.status(error.statusCode || 400).json({ success: false, error: error.message });
     }
@@ -971,18 +1046,20 @@ router.get('/sms/smspool/check/:orderId', requireAuth, requireCurrentDiscordMemb
 
     const data = response.data;
 
-    if (data.status === 3 && data.sms) {
+    if ((data.status === 3 || String(data.status) === '3' || /completed|received|success/i.test(String(data.status || ''))) && data.sms) {
+      const code = normaliseSmsCode(data.sms);
+      if (!code) return res.json({ success: true, code: null });
       await db.query(`
         UPDATE sms_orders SET code = $1, completed = true WHERE order_id = $2
-      `, [data.sms, orderId]);
+      `, [code, orderId]);
 
-      res.json({ success: true, code: data.sms });
+      res.json({ success: true, code });
     } else {
       res.json({ success: true, code: null });
     }
   } catch (error) {
     console.error('[SMSPOOL] Check error:', error);
-    res.json({ success: false });
+    res.status(502).json({ success: false, error: 'Could not check the SMSPool verification inbox' });
   }
 });
 
@@ -1186,6 +1263,11 @@ router.post('/admin/member-role', requireOwnerAdmin, async (req, res) => {
   try {
     const userId = String((req.body && req.body.user_id) || '').trim();
     const enabled = !!(req.body && req.body.enabled);
+    const rawPlanType = req.body && req.body.plan_type;
+    const planType = normalizeGeneratorPlanType(rawPlanType, 'combined');
+    if (enabled && rawPlanType != null && String(rawPlanType).trim() && !GENERATOR_PLAN_TYPES.includes(String(rawPlanType).trim().toLowerCase())) {
+      return res.status(400).json({ error: 'Invalid generator plan type' });
+    }
     if (!/^\d+$/.test(userId)) return res.status(400).json({ error: 'Valid user_id is required' });
     const { rows } = await db.query(
       'SELECT id, username, discord_id FROM web_users WHERE id = $1 AND guild_id = $2',
@@ -1203,18 +1285,19 @@ router.post('/admin/member-role', requireOwnerAdmin, async (req, res) => {
       if (enabled) {
         expiresAt = new Date(Date.now() + 30 * 24 * 60 * 60 * 1000);
         await exec(
-          `INSERT INTO generator_subscriptions (user_id, expires_at, active)
-           VALUES ($1,$2,true)`,
-          [userId, expiresAt]
+          `INSERT INTO generator_subscriptions (user_id, expires_at, active, plan_type)
+           VALUES ($1,$2,true,$3)`,
+          [userId, expiresAt, planType]
         );
       }
     });
     const discordRole = enabled
-      ? await syncGeneratorPlanRole(target.discord_id, 'combined')
+      ? await syncGeneratorPlanRole(target.discord_id, planType)
       : await revokeGeneratorPlanRoles(target.discord_id);
     await logAdminAction(req, enabled ? 'grant_gen_member' : 'revoke_gen_member', userId, {
       username: target.username,
       expires_at: expiresAt,
+      plan_type: enabled ? planType : null,
       quota: enabled ? MONTHLY_USE_LIMIT : 0,
       discord_role_synced: !!discordRole.synced,
     });
@@ -1222,8 +1305,9 @@ router.post('/admin/member-role', requireOwnerAdmin, async (req, res) => {
       success: true,
       user_id: userId,
       enabled,
+      plan_type: enabled ? planType : null,
       expires_at: expiresAt,
-      remaining: enabled ? MONTHLY_USE_LIMIT : 0,
+      remaining: enabled ? (planType === 'both' ? MONTHLY_USE_LIMIT * 2 : MONTHLY_USE_LIMIT) : 0,
       discord_role: discordRole,
     });
   } catch (err) {

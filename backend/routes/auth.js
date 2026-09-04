@@ -19,6 +19,7 @@ const { decodeImageDataUrl } = require('../utils/imageUpload');
 // one account shape is how you end up with two half-accounts.
 const { ensureDiscordAccount, freeUsername } = require('../utils/discordAccount');
 const { getDiscordMemberRoles, setDiscordMemberRole, createDiscordRole, checkDiscordAccess } = require('../utils/discordAccess');
+const { logActivity } = require('../utils/activityLog');
 
 const GUILD_ID = process.env.GUILD_ID;
 
@@ -366,6 +367,7 @@ router.get('/discord-oauth/callback', async (req, res) => {
       });
       created = r.created;
       if (created) console.log(`[Auth] Discord signup: created account ${r.user.username} for ${discordId}`);
+      if (created) logActivity({ guildId: GUILD_ID, userId: r.user.id, eventType: 'user_created', req, metadata: { method: 'discord' } });
     } catch (e) {
       console.error('[Auth] discord signup failed:', e.message);
       return fail('Could not create your account. Please try again.');
@@ -709,6 +711,7 @@ router.get('/google-oauth/callback', async (req, res) => {
     }
 
     await query('UPDATE web_users SET last_login_at = now() WHERE id = $1', [user.id]);
+    logActivity({ guildId: GUILD_ID, userId: user.id, eventType: 'login_success', req, metadata: { method: 'google' } });
     const claim = crypto.randomBytes(32).toString('hex');
     googleClaims.set(claim, { webUserId: user.id, expiresAt: Date.now() + 2 * 60 * 1000 });
     return bounce({ google_login: claim });
@@ -884,6 +887,7 @@ router.post('/login', async (req, res) => {
     }
 
     await query('UPDATE web_users SET last_login_at = now() WHERE id = $1', [user.id]);
+    logActivity({ guildId: GUILD_ID, userId: user.id, eventType: 'login_success', req, metadata: { method: 'password' } });
 
     const token = await createSession(user.id, GUILD_ID);
     res.json({ success: true, requires_2fa: false, token, user: publicUser(user) });
@@ -1074,6 +1078,7 @@ router.post('/login/verify', async (req, res) => {
 
     await query('UPDATE web_login_challenges SET consumed_at = now() WHERE id = $1', [challenge_id]);
     await query('UPDATE web_users SET last_login_at = now() WHERE id = $1', [user.id]);
+    logActivity({ guildId: GUILD_ID, userId: user.id, eventType: 'login_success', req, metadata: { method: challenge.kind || '2fa', backup_code: usedBackupCode } });
 
     const token = await createSession(user.id, GUILD_ID);
     res.json({ success: true, token, user: publicUser(user), used_backup_code: usedBackupCode });
