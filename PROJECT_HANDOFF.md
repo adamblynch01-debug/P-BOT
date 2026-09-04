@@ -672,3 +672,40 @@ Safety/operations for the next thread:
   and `git diff --check` is clean.
 - This follow-up is local only; no production files were changed, no remote
   backup was created, and no push or restart was performed.
+
+## Todo completion and production rollout (2026-09-04)
+
+- Completed and deployed the remaining work from `MOVIE NIGHT CHANGES THAT MUST BE DONE.txt`.
+- Movie Night now supports encrypted M3U or XC playlists, editable category allowlists,
+  per-playlist viewer limits, lazy fallback to the next available provider, active-session
+  inspection/stopping, and room-history clearing from the website admin panel.
+- The browser catalog path now caches empty and non-empty results, deduplicates simultaneous
+  provider fetches, loads only the selected kind, and throttles stream authorization/session
+  database checks to reduce Movie Night latency.
+- Generator plan grants accept the requested plan type and synchronize distinct Discord plan
+  roles. SMS provider payload handling, status/code parsing, surfaced UI errors, and active
+  number uniqueness were hardened.
+- Game/Vault forms now include authentication-code and bundle-specific credentials, masked
+  card rows with show/copy controls, platform artwork, and persisted selectable tag colors.
+- Added owner-visible website/login/activity logging and the activity admin panel. Styled site
+  confirmation dialogs, clipboard feedback, Ghost Vault triggers, and Movie Night controls are
+  present in the deployed static website.
+- Repository commit `2abf45b` (`Complete Movie Night admin, SMS, and activity updates`) and all
+  preceding local commits were pushed normally to `origin/main`; the working tree is clean and
+  synchronized with the remote.
+- Fresh pre-deploy production backup: `/var/backups/nullpoint/20260904-154928/`.
+- Applied `user_activity.sql`, `movie_night_playlists.sql`, and
+  `sms_number_uniqueness.sql`; deployed the website plus intended backend files; restarted only
+  `pbot-backend`.
+- Verification: `/health` is HTTP 200; unauthenticated Movie Night catalog and SMS service
+  requests return HTTP 401; deployed website/server/Movie Night hashes match local; live page
+  contains the player, IPTV admin, and activity panel. PM2 is `pbot-backend` online,
+  `superbot` online, `streaming-bot` stopped.
+- Validation passed for all 25 inline scripts, backend syntax, Movie Night stream contract,
+  auth hardening (49), server-side 2FA (26), delivery labels (29), config routes (23), and stock
+  resurrection (10). The existing purchase-gate harness remains 35/36 because its mocked
+  Discord membership branch returns `ids.map is not a function`; this is not a deployed-code
+  syntax or authentication bypass.
+- Next owner check: hard-refresh `https://nullpoint.top`, then exercise one Live TV channel,
+  movie, and series episode while signed in with the Movie Night role. Diagnose any remaining
+  playback/provider issue from sanitized browser status codes after this rollout.
