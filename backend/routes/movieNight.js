@@ -560,7 +560,10 @@ router.get('/catalog', requireAuth, requireMovieNightAccess, async (req, res) =>
   const kind = ['live', 'movie', 'series'].includes(requestedKind) ? requestedKind : '';
   const limit = Math.max(1, Math.min(MAX_CATALOG_LIMIT, Number.parseInt(req.query.limit, 10) || 40));
   try {
-    const browserCatalog = await getBrowserCatalog();
+    // Load only the selected provider feed. Fetching all live, movie, and
+    // series rows for every request makes the first Movie Night render wait on
+    // a very large Xtream response even when the user only wants Live TV.
+    const browserCatalog = await getBrowserCatalog(kind);
     if (browserCatalog) {
       const wanted = search.toLowerCase();
       const matching = browserCatalog.items.filter((item) => {
