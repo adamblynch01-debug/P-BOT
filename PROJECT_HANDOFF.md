@@ -713,7 +713,7 @@ Safety/operations for the next thread:
 ## Transition sync (2026-09-05)
 
 - This file is synchronized after the rollout. The repository is clean on `main` and matches
-  `origin/main` at commit `7197938` (`Document completed todo production rollout`).
+  `origin/main` at commit `2b77c08` (`Sync transition handoff memory`).
 - The production website and intended backend files are deployed and byte-for-byte matched to
   local at verification time. No secrets, provider credentials, tokens, or private keys were
   placed in source, logs, or this handoff.
