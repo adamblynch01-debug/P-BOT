@@ -646,3 +646,17 @@ Safety/operations for the next thread:
   `0:00`, the guide side-panel hide/show control works, and no provider URL or
   credential appears in browser-visible requests. If playback still fails,
   capture only status codes and sanitized HLS.js/browser errors.
+
+## Latest transition clarification (2026-09-04)
+
+- The owner clarified that the website was playing normally. Do not describe
+  Movie Night as unavailable unless a specific request actually returns an
+  outage or playback error.
+- The phrase `Movie Night streaming service unavailable` is a generic backend
+  fallback in `backend/routes/movieNight.js`; it was not evidence of a
+  site-wide outage in this diagnostic continuation.
+- No project code, production files, database settings, or PM2 processes were
+  changed during the diagnostic continuation. The temporary diagnostic file
+  was removed, and the repository remains clean.
+- The local repository has unpushed commits beyond `origin/main`; no push was
+  performed for this clarification. Review those commits before publishing.
