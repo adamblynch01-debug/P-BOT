@@ -754,3 +754,22 @@ Safety/operations for the next thread:
   `eff9fa536704788b4bca5260058321def92b722474da144634ef93907178443b`.
   No backend, database, or PM2 process change was needed; `streaming-bot`
   remains stopped.
+
+## Cinematic Ghost Vault redesign deployment (2026-09-06)
+
+- Replaced the private Ghost Vault presentation in `C:\Users\VENOM-NODE\nullpoint-index.html`
+  with a responsive cinematic interface inspired by the supplied Ghost Vault example:
+  animated starfield/grid/scanline, rotating ZEROPOINT core, orbiting category nodes,
+  live sector search, mobile two-column fallback, redesigned product cards, and cart view.
+- Product catalog, stock, authentication, cart persistence, pricing, and checkout remain
+  server-authoritative through the existing Vault APIs; no backend or database changes were made.
+- Validation passed: all 26 inline website scripts parse successfully. The overlay, core,
+  search, and cart hooks are present exactly once.
+- Fresh pre-deploy production backup: `/var/backups/nullpoint/20260906-053726-ghost-vault-cinematic/`.
+- Deployed the website to `/var/www/html/index.html` and verified the live response is HTTP 200,
+  `/health` is HTTP 200 with `{"status":"ok","store":"ZEROPOINT"}`, and the live page
+  contains the cinematic Ghost Vault markers.
+- Local and production `index.html` SHA-256 match:
+  `27f577d230897ca2c6025bb98230534aed73287429485b78ded079efbb0895d9`.
+- No PM2 restart was needed; `pbot-backend` and `superbot` remain online and
+  `streaming-bot` remains stopped.
