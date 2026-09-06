@@ -730,3 +730,27 @@ Safety/operations for the next thread:
 - Next thread should begin with an authenticated browser smoke test after `Ctrl+F5`: play one
   Live TV item, one movie, and one series episode; verify guide hide/show and playback status.
   If anything fails, capture only sanitized HTTP status, console, and HLS/browser error data.
+
+## Local Ghost Vault and Game Library follow-up (2026-09-06)
+
+- Restored the private Ghost Vault presentation in `nullpoint-index.html`.
+  The five-click `ZEROPOINT.WTF` title trigger and typed `ghost` trigger open
+  the new overlay; its categories, tiers, stock badges, cart, and checkout use
+  the existing backend-owned Vault catalog and authenticated cart/order APIs.
+- Game Library records now support a persisted bundle upgrade: Steam can select
+  FiveM or COD, while Xbox and Battle.net can select COD. The additional bundle
+  credential fields are saved with the Game Library record and shown as a card
+  badge.
+- Repaired the legacy admin `OPEN VAULT` entry point to open the current unified
+  Vault Pro overlay instead of referencing removed standalone auth DOM nodes.
+  Exported the bundle platform-change handlers so the generated inline controls
+  work after lazy Vault initialization.
+- Validation: all 26 inline website scripts parse; headless smoke checks opened
+  Ghost Vault via both triggers, exercised the unified Vault entry point, and
+  confirmed bundle options (`Steam: FiveM/COD`, `Xbox/Battle.net: COD`).
+- Deployed to production on 2026-09-06 from `C:\Users\VENOM-NODE\nullpoint-index.html`.
+  Fresh pre-deploy backup: `/var/backups/nullpoint/20260905-211520/`.
+  The deployed website SHA-256 is
+  `eff9fa536704788b4bca5260058321def92b722474da144634ef93907178443b`.
+  No backend, database, or PM2 process change was needed; `streaming-bot`
+  remains stopped.
