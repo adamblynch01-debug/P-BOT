@@ -811,3 +811,20 @@ Safety/operations for the next thread:
   production mutation, create a fresh dated remote backup, deploy only the intended
   website file, and do not restart PM2 unless explicitly needed. Keep `pbot-backend` and
   `superbot` online and `streaming-bot` stopped.
+
+### Ghost Vault trade-hub production deployment (2026-09-08)
+
+- Owner approved the SSH deployment of the local trade-hub build.
+- Fresh remote backup created before mutation:
+  `/var/backups/nullpoint/20260908-004617-ghost-vault-trade-hub/`.
+- Deployed `C:\Users\VENOM-NODE\nullpoint-index.html` to
+  `/var/www/html/index.html` over the documented SSH workflow.
+- Local and remote website SHA-256 match:
+  `d47777d06f512843cf7f859626f83c9ac69731e144dc3edb8ccb2396a8189a51`.
+- Live verification passed: website HTTP 200, `/health` HTTP 200 with
+  `{"status":"ok","store":"ZEROPOINT"}`, cinematic trade-hub markers present,
+  and the forbidden page-wide `gv-grid` marker absent.
+- No backend, database, or PM2 restart was performed. `pbot-backend` and `superbot`
+  remain online; `streaming-bot` remains stopped.
+- This deployment supersedes the immediately preceding note that production remained
+  on the prior Ghost Vault build. The backup above is the rollback reference.
