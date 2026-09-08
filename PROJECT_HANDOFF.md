@@ -866,3 +866,13 @@ Safety/operations for the next thread:
 - Deployed only the website HTML to `/var/www/html/index.html`; no backend, database, or PM2 restart was performed. `pbot-backend` and `superbot` remain online; `streaming-bot` remains stopped.
 - Local and remote website SHA-256 match: `dda7722922f9e578d7ae5bdf8118020b2f8ab0c5476111ae1aeef69878feedc9`.
 - Live verification passed: `https://nullpoint.top/index.html` HTTP 200, `/health` HTTP 200 with `{"status":"ok","store":"ZEROPOINT"}`, motion/contrast markers present, and the forbidden page-wide `gv-grid` marker absent.
+
+## Ghost Vault reference-fidelity correction (2026-09-08)
+
+- Ported the missing reference behavior from `Downloads\nexus-archive.html` into the existing backend-driven Ghost Vault: JavaScript elliptical core particle motion, conic-gradient radar sweep with moving blips, and reference card geometry/typography.
+- Fixed the product-listing black rectangle by changing the detail scrim from a main-content-bound absolute layer to a full-viewport fixed overlay, matching the reference transition without a visible square edge.
+- Catalog, stock, authentication, cart, pricing, and checkout remain backend-authoritative and unchanged.
+- Fresh pre-deploy backup: `/var/backups/nullpoint/20260908-183404-ghost-vault-reference-fidelity/index.html`.
+- Deployed only the website HTML; no backend, database, or PM2 restart was performed. `pbot-backend` and `superbot` remain online; `streaming-bot` remains stopped.
+- Local and remote website SHA-256 match: `a2c6f911983272dc30bca26c41a91930b97a86f8f44aa60ac3f4c63d5d94a9ce`.
+- Live verification passed: HTTP 200, `/health` returned `{"status":"ok","store":"ZEROPOINT"}`, the fixed scrim, particle loop, conic radar, and reference card markers are present, and `gv-grid` remains absent.
