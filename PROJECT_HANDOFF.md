@@ -828,3 +828,31 @@ Safety/operations for the next thread:
   remain online; `streaming-bot` remains stopped.
 - This deployment supersedes the immediately preceding note that production remained
   on the prior Ghost Vault build. The backup above is the rollback reference.
+
+## Canonical latest transition checkpoint (2026-09-08)
+
+- Treat this section as the authoritative starting point for the next thread; it
+  supersedes any earlier wording in this file that says the trade-hub build was
+  only local or that production still serves the prior Ghost Vault build.
+- Live website source and deployed file are the same:
+  `C:\Users\VENOM-NODE\nullpoint-index.html` → `/var/www/html/index.html`.
+- Current deployed website SHA-256:
+  `d47777d06f512843cf7f859626f83c9ac69731e144dc3edb8ccb2396a8189a51`.
+- Rollback backup:
+  `/var/backups/nullpoint/20260908-004617-ghost-vault-trade-hub/index.html`.
+- Live checks passed: `https://nullpoint.top/index.html` HTTP 200,
+  `https://nullpoint.top/health` HTTP 200 with
+  `{"status":"ok","store":"ZEROPOINT"}`. The live page contains the new
+  trade-hub markers and does not contain the page-wide `gv-grid` marker.
+- The Ghost Vault UI is backend-catalog-driven, shows the current 13 categories,
+  and preserves server-authoritative authentication, stock, prices, cart, and checkout.
+- No backend or database files changed and no PM2 restart occurred. Required process
+  state: `pbot-backend` online, `superbot` online, `streaming-bot` stopped.
+- Git documentation checkpoint is pushed in `origin/main` at commit
+  `7283cb8` (`Record Ghost Vault trade hub deployment`). The repository is clean and
+  synchronized. The website HTML remains outside the Git repository by design and is
+  deployed through the documented SSH workflow.
+- For future website changes: edit the canonical local HTML, validate all inline
+  scripts, create a fresh dated remote backup, deploy only the intended HTML over SSH,
+  verify local/remote hash plus HTTP/health, then append the result here and in
+  `NULLPOINT_TRANSITION_MEMORY.md`. Do not expose secrets or start `streaming-bot`.
