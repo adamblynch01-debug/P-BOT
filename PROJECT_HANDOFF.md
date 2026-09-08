@@ -798,3 +798,16 @@ Safety/operations for the next thread:
   `circle(145%)` iris reveal. Temporary test files and screenshots were removed.
 - Local SHA-256: `d47777d06f512843cf7f859626f83c9ac69731e144dc3edb8ccb2396a8189a51`.
   Production remains on the prior deployed build and no new production backup was needed.
+
+### Push and transition checkpoint (2026-09-07)
+
+- The Ghost Vault trade-hub refinement and this transition record were pushed to
+  `origin/main` in commit `75cd0db` (`Record Ghost Vault trade hub refinement`).
+- Repository state is synchronized: local `main` matches `origin/main`; no uncommitted
+  repository changes remain.
+- Production was deliberately not changed by this push. It still serves the prior
+  deployed Ghost Vault build with SHA-256 `27f577d230897ca2c6025bb98230534aed73287429485b78ded079efbb0895d9`.
+- Next thread should treat the local trade-hub build as the review candidate. Before any
+  production mutation, create a fresh dated remote backup, deploy only the intended
+  website file, and do not restart PM2 unless explicitly needed. Keep `pbot-backend` and
+  `superbot` online and `streaming-bot` stopped.
