@@ -856,3 +856,13 @@ Safety/operations for the next thread:
   scripts, create a fresh dated remote backup, deploy only the intended HTML over SSH,
   verify local/remote hash plus HTTP/health, then append the result here and in
   `NULLPOINT_TRANSITION_MEMORY.md`. Do not expose secrets or start `streaming-bot`.
+
+## Ghost Vault motion and contrast deployment (2026-09-08)
+
+- Updated `C:\Users\VENOM-NODE\nullpoint-index.html` to restore the reference-style Ghost Vault atmosphere from `Downloads\nexus-archive.html` while retaining the tighter cards requested by the owner.
+- The visual update uses a near-black center field, stronger animated purple/cyan/pink edge nebulae, brighter star and waveform layers, more visible core glow/ring motion, and faster nebula drift. Catalog, stock, authentication, cart, pricing, and checkout behavior were not changed.
+- Validation passed: all 26 non-empty inline scripts parse with zero errors.
+- Fresh pre-deploy backup: `/var/backups/nullpoint/20260908-153028-ghost-vault-motion/index.html`.
+- Deployed only the website HTML to `/var/www/html/index.html`; no backend, database, or PM2 restart was performed. `pbot-backend` and `superbot` remain online; `streaming-bot` remains stopped.
+- Local and remote website SHA-256 match: `dda7722922f9e578d7ae5bdf8118020b2f8ab0c5476111ae1aeef69878feedc9`.
+- Live verification passed: `https://nullpoint.top/index.html` HTTP 200, `/health` HTTP 200 with `{"status":"ok","store":"ZEROPOINT"}`, motion/contrast markers present, and the forbidden page-wide `gv-grid` marker absent.
