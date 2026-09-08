@@ -773,3 +773,28 @@ Safety/operations for the next thread:
   `27f577d230897ca2c6025bb98230534aed73287429485b78ded079efbb0895d9`.
 - No PM2 restart was needed; `pbot-backend` and `superbot` remain online and
   `streaming-bot` remains stopped.
+
+## Local Ghost Vault trade-hub refinement (2026-09-07)
+
+- Reworked the private Ghost Vault in `C:\Users\VENOM-NODE\nullpoint-index.html`
+  using `C:\Users\VENOM-NODE\Downloads\nexus-archive.html` as the visual reference.
+- Removed the page-wide grid and scanline layers completely. The only pattern left is
+  the requested holographic texture contained inside the rotating ZEROPOINT core.
+- Added three drifting nebulae, shooting stars, seven independently orbiting core
+  particles, random core glitch/tear events, mouse parallax, cursor glow, hover tilt,
+  staggered card reveals, card scan sweeps, and an animated core-to-card energy beam.
+- Added the typed boot sequence and RGB title reveal, live HUD readouts, canvas radar,
+  actual-catalog toast messages, bottom waveform, rare anomaly pulse, radial warp flash,
+  and circular iris product-panel reveal with an animated market-pulse chart.
+- Category cards remain driven by the backend catalog and now show real product names and
+  unique-product counts. The live catalog currently has 13 categories, so all 13 are shown;
+  no category was hidden merely to force the supplied prompt's stated count of 12 (the
+  supplied reference itself also contains 13 categories).
+- Existing backend-owned authentication, catalog, stock, price, cart persistence, and
+  checkout paths were preserved. No backend, database, PM2, or production change was made.
+- Validation: all 26 non-empty inline scripts parse. Headless desktop (1440x900) and mobile
+  (390x844) checks confirmed 13 category cards, zero page-grid/scanline elements, seven
+  particles, hover/beam behavior, 24 market bars, product rendering, and a fully opened
+  `circle(145%)` iris reveal. Temporary test files and screenshots were removed.
+- Local SHA-256: `d47777d06f512843cf7f859626f83c9ac69731e144dc3edb8ccb2396a8189a51`.
+  Production remains on the prior deployed build and no new production backup was needed.
