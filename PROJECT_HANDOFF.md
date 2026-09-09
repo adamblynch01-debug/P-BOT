@@ -876,3 +876,14 @@ Safety/operations for the next thread:
 - Deployed only the website HTML; no backend, database, or PM2 restart was performed. `pbot-backend` and `superbot` remain online; `streaming-bot` remains stopped.
 - Local and remote website SHA-256 match: `a2c6f911983272dc30bca26c41a91930b97a86f8f44aa60ac3f4c63d5d94a9ce`.
 - Live verification passed: HTTP 200, `/health` returned `{"status":"ok","store":"ZEROPOINT"}`, the fixed scrim, particle loop, conic radar, and reference card markers are present, and `gv-grid` remains absent.
+
+## Ghost Vault final card-fidelity deployment (2026-09-08)
+
+- Applied the final visual pass against `Downloads\\nexus-archive.html`: category icons now render as raw glowing glyphs (without boxed badges), category labels retain normal catalog casing, and the tighter reference card geometry remains in place.
+- The backend-driven catalog, authentication, stock, pricing, cart persistence, and checkout behavior were not changed.
+- Fresh pre-deploy backup: `/var/backups/nullpoint/20260908-192849-ghost-vault-card-fidelity/index.html`.
+- Deployed only `C:\\Users\\VENOM-NODE\\nullpoint-index.html` to `/var/www/html/index.html`.
+- Local and remote website SHA-256 match: `7bb4aa58102ec7868ce30e590da3276fc00e570d1a1368eccc169f6e0a485698`.
+- Live verification passed: website HTTP 200 and `/health` HTTP 200 with `{"status":"ok","store":"ZEROPOINT"}`; fixed full-screen scrim, moving core particles, conic radar sweep, raw-icon CSS, and reference card markers are present, and the forbidden page-wide `gv-grid` marker is absent.
+- No backend, database, or PM2 restart was performed. `pbot-backend` and `superbot` remain online; `streaming-bot` remains stopped.
+- This is the authoritative deployed UI state for the next thread. Hard-refresh the site with `Ctrl+F5` when reviewing.
