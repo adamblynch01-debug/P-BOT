@@ -54,6 +54,17 @@ The previous agent completed the code, staged a deployment, and this recovery
 turn completed production activation and verification. No reset/clean operation
 was run against the intentionally dirty backend worktree.
 
+## Latest Ghost Vault hover-motion checkpoint (2026-09-08)
+
+- The owner supplied `C:\Users\VENOM-NODE\Downloads\nexus-archive (1).html` as the correct hover-motion reference after the earlier Ghost Vault CSS spin was observed accelerating unpredictably.
+- The website now uses a deterministic `requestAnimationFrame` hover tween: one 360-degree spin over 620 ms, controlled lift/overshoot, reset to zero spin, then normal cursor-follow holographic tilt. Mouse leave cancels the tween and restores flat/idle state.
+- The Ghost Vault bottom idle data-flow waveform was removed completely. Catalog, stock, authentication, pricing, cart persistence, and checkout remain server-authoritative and unchanged.
+- Fresh rollback backup: `/var/backups/nullpoint/20260908-225123-ghost-vault-hover-reference/index.html`.
+- Production website `/var/www/html/index.html` and local `C:\Users\VENOM-NODE\nullpoint-index.html` match SHA-256 `1674c1143ce7f430b868686608dc0afa8eabac5e2ce587a3b8e167a1d744b294`.
+- Live checks passed: website HTTP 200; `/health` returned `{"status":"ok","store":"ZEROPOINT"}`; reference tween, spin reset, tilt handoff, and waveform removal markers verified.
+- No backend, database, or PM2 restart was performed. PM2 contract remains `pbot-backend` online, `superbot` online, `streaming-bot` stopped.
+- All 27 inline website scripts pass `node --check`. Use `Ctrl+F5` when reviewing the live Ghost Vault.
+
 ## Current generator pricing and allowances
 
 - EUR 1: one account generation.
@@ -531,6 +542,34 @@ Safety/operations for the next thread:
 - Temporary remote staging files were removed after deployment. The source
   repository is clean at commit `59a6251`.
 
+## Admin reference tabs deployment — 2026-09-12
+
+- Deployed the approved Shadow Store reference-style Orders, Tickets, Reviews,
+  and Coupons tab updates from `C:\Users\VENOM-NODE\nullpoint-index.html`.
+- Website-only atomic deployment to `/var/www/html/index.html`; no backend,
+  database, or PM2 restart.
+- Rollback backup: `/var/backups/nullpoint/20260912-161959-admin-reference-tabs/index.html`.
+- Local/remote SHA-256:
+  `0d5c2ff66e0965b69fc456944285b9c391e353045a2e6a6de9dd606f698d5f31`.
+- Health verified OK. Hard-refresh with `Ctrl+F5` when reviewing the admin tabs.
+
+## Admin reference tabs live deployment — 2026-09-14
+
+- The corrected local website `C:\Users\VENOM-NODE\nullpoint-index.html` was
+  deployed atomically to `/var/www/html/index.html` over SSH.
+- Fresh rollback backup: `/var/backups/nullpoint/20260914-003021-admin-reference-tabs-live/index.html`.
+- Local, VPS, and public no-cache SHA-256 match:
+  `5706225fae4ecefe7ce15dd88cc1af276c27a93957e2461a6b62b76a49bd61`.
+- Live verification passed: `https://nullpoint.top/index.html` HTTP 200,
+  `/health` returned `{"status":"ok","store":"ZEROPOINT"}`, and the
+  public page contains the compact filter bars, real support-ticket subtitle,
+  watcher-to-Logs separation, and `Create Coupon` action.
+- All 27 non-empty inline website scripts passed `node --check` before deploy.
+- No backend, database, or PM2 restart occurred. `pbot-backend` and `superbot`
+  remain online; `streaming-bot` remains stopped.
+- This is the authoritative live UI state for the Orders, Tickets, Reviews,
+  and Coupons admin tabs. Hard-refresh with `Ctrl+F5` when reviewing.
+
 ### Next-thread safety and starting point
 
 - Treat this section as superseding older notes that say deployment is pending.
@@ -887,3 +926,108 @@ Safety/operations for the next thread:
 - Live verification passed: website HTTP 200 and `/health` HTTP 200 with `{"status":"ok","store":"ZEROPOINT"}`; fixed full-screen scrim, moving core particles, conic radar sweep, raw-icon CSS, and reference card markers are present, and the forbidden page-wide `gv-grid` marker is absent.
 - No backend, database, or PM2 restart was performed. `pbot-backend` and `superbot` remain online; `streaming-bot` remains stopped.
 - This is the authoritative deployed UI state for the next thread. Hard-refresh the site with `Ctrl+F5` when reviewing.
+## Canonical latest Ghost Vault motion checkpoint (2026-09-09)
+
+- Owner supplied `C:\Users\VENOM-NODE\Downloads\meridian-core.html` and
+  `C:\Users\VENOM-NODE\Downloads\card-hover-effect.html` as the exact motion
+  references for the core and category tiles.
+- Canonical source remains `C:\Users\VENOM-NODE\nullpoint-index.html`; the
+  deployed target is `/var/www/html/index.html`. Existing backend catalog,
+  stock, auth, cart, pricing, and checkout behavior was preserved.
+- `.gv-ring-a` through `.gv-ring-d` are independent transparent-border circles
+  with their own CSS spin durations/directions. `.gv-core::before` is the
+  rotating conic-gradient sunburst; `.gv-core-hex` is the counter-rotating
+  repeating-conic spoke layer. ZEROPOINT text stays stationary and the dashed
+  outer ring is visible.
+- Removed the buggy per-frame `ghostVaultSpinIn` tile transform loop. Tiles now
+  use a fixed button hitbox and a separate `.gv-card-face` visual surface with
+  one bounded CSS hover turn, followed by stable cursor-follow tilt. This avoids
+  hover-boundary feedback that previously caused stuck or infinite rotation.
+- Validation passed: all 26 non-empty inline website scripts parse successfully.
+- Production deployment completed by uploading only the website HTML. Fresh
+  rollback backup:
+  `/var/backups/nullpoint/20260909-015103-ghost-vault-meridian-card-face/index.html`.
+- Local, remote, and public no-cache SHA-256:
+  `28749ab33a709ae11a12b5c444a780507c85f6b2af79577900f27fdde1245764`.
+- Live `/health` returned `{"status":"ok","store":"ZEROPOINT"}`. Public
+  markers for the fixed card-face animation, ring arc, dashed ring, conic rays,
+  and repeating-conic spokes were verified.
+- No backend, database, or PM2 restart occurred. Keep `pbot-backend` online,
+  `superbot` online, and `streaming-bot` stopped.
+- Next thread should begin by rereading this checkpoint, then ask the owner to
+  hard-refresh (`Ctrl+F5`) after signing in with a Discord member account and
+  verify one tile hover plus the independent core ring/ray motion.
+
+## VPS website deployment — 2026-09-09
+
+- The canonical local website `C:\Users\VENOM-NODE\nullpoint-index.html` was deployed directly to the VPS over SSH; GitHub was not used for this website upload.
+- Remote backup: `/var/backups/nullpoint/20260909-141137-reseller-panel-fix/index.html` (pre-deploy SHA-256 `28749ab33a709ae11a12b5c444a780507c85f6b2af79577900f27fdde1245764`).
+- Deployed `/var/www/html/index.html` now matches local SHA-256 `701a7bdabb5d1f1b7c8258684f3bbd5343e7ff30ad3d7e568964a8cb372879b6` and includes the reseller panel.
+- Public no-cache download matches the same hash; HTTP 200 and `/health` returned `{"status":"ok","store":"ZEROPOINT"}`.
+- No PM2 restart was performed: `pbot-backend` and `superbot` remain online; `streaming-bot` remains stopped.
+
+## Reseller panel production deployment — 2026-09-09
+
+- The reseller-role regression was caused by missing reseller overlay markup in
+  the deployed static website. The dock button and handler existed, but the
+  `#overlay-reseller` dashboard markup was absent, so clicking appeared to do
+  nothing.
+- Restored the reseller dashboard plus reseller account overlay in
+  `C:\Users\VENOM-NODE\nullpoint-index.html` and deployed only that HTML file to
+  `/var/www/html/index.html`.
+- Fresh rollback backup:
+  `/var/backups/nullpoint/20260909-141137-reseller-panel-fix/index.html`.
+- Local, remote, and public no-cache SHA-256 match:
+  `701a7bdabb5d1f1b7c8258684f3bbd5343e7ff30ad3d7e568964a8cb372879b6`.
+- HTTP 200, `/health` returned `{"status":"ok","store":"ZEROPOINT"}`, and
+  live reseller markers were verified. Owner confirmed the panel is visible and
+  working for reseller-role users.
+- No backend, database, or PM2 restart was performed. Required PM2 state:
+  `pbot-backend` online, `superbot` online, `streaming-bot` stopped.
+- This is the authoritative handoff point for the next thread. Start by
+  rereading this section; do not redeploy unless a new reseller regression is
+  reported.
+## Admin panel remake deployment — 2026-09-09
+
+- Owner supplied `D:\GROK AI PHONE\ADMIN PANEL REMAKE\shadow-store-admin 2.html` as the exact visual reference.
+- Integrated a scoped responsive Shadow Store-style dashboard shell into `C:\Users\VENOM-NODE\nullpoint-index.html`: sidebar navigation, topbar, overview telemetry, quick actions, responsive mobile layout, and preserved existing authenticated admin handlers/tabs.
+- Validation passed: all 27 non-empty inline website scripts parse successfully; live marker checks confirmed the admin remake style, topbar, overview, and 18 real admin tabs.
+- Fresh pre-deploy rollback backup: `/var/backups/nullpoint/20260909-164613-admin-panel-remake/index.html`.
+- Deployed only the website HTML atomically to `/var/www/html/index.html`.
+- Local, remote, and live website SHA-256 match: `88f75aa739ab079bdd5ba9b40587f1057bad919421e86bacc7e390816f482b6d`.
+- Live `/health` returned `{"status":"ok","store":"ZEROPOINT"}`. PM2 remains `pbot-backend` online, `superbot` online, `streaming-bot` stopped; no backend/database/PM2 restart was performed.
+
+## Admin panel clickability repair — 2026-09-09
+
+- Owner reported that the deployed admin panel loaded but all controls appeared inert.
+- Root cause: the members-only access-gate rule `body.access-restricted #access-gate ~ * { pointer-events:none; }` also disabled the visible protected admin overlay.
+- Added a narrowly scoped `#admin-clickability-fix` exception in `C:\Users\VENOM-NODE\nullpoint-index.html` so `#overlay-admin`, its clone shell, navigation, buttons, inputs, and overlay controls retain pointer events while open. Public access-gate behavior remains unchanged.
+- `openSection('admin')` and `closeSection('admin')` now toggle `admin-overlay-open` for robust state handling.
+- Fresh rollback backup: `/var/backups/nullpoint/20260909-182029-admin-click-fix-2/index.html`.
+- Deployed atomically to `/var/www/html/index.html`; local and live SHA-256: `47fbe58e1b283a5444388604f91716555ffa71eaa3d89cda2378550d53e45475`.
+- Live `/health` returned HTTP 200 with `{"status":"ok","store":"ZEROPOINT"}`. `pbot-backend` and `superbot` remain online; `streaming-bot` remains stopped; no backend/database/PM2 restart was performed.
+- Next review: hard-refresh with `Ctrl+F5`, sign in, then test sidebar navigation, a source tab, search, logout, and one real admin tab. Do not expose the panel password in chat.
+
+## Admin panel sidebar-nav collision fix — 2026-09-10
+
+- A prior Codex session crashed mid-task (`stream disconnected before completion`) while comparing the deployed admin panel against `D:\GROK AI PHONE\ADMIN PANEL REMAKE\shadow-store-admin 2.html` after the owner reported the panel still didn't visually match the reference despite the 2026-09-09 clickability fix. Its partial edit had already landed on disk and in production (SHA-256 `89b4e89344de230af359cca333603a3d5399aad47b0ed21f1eee17ae995971e8`) but was never verified or documented in either handoff file.
+- Root cause found by enumerating the live DOM's actually-matching CSS rules (not by reading the stylesheet): the site's own primary navbar defines a bare tag selector `nav { position:fixed; top:0; left:0; right:0; z-index:100; display:flex; justify-content:space-between; ... }`. The admin shell's sidebar nav is a real `<nav class="nav">` element, so it inherited that fixed full-width top-bar layout instead of stacking its nav-section groups vertically inside the 260px sidebar — this, not a containing-block/specificity issue, was the actual cause of the "wide top menu" look reported in the owner's screenshot.
+- Added `#overlay-admin .admin-clone-shell nav.nav { position:static !important; ... }` (resetting position/display/top/left/right/z-index/justify-content/align-items/gap/background/backdrop-filter/border-bottom back to the reference's intended block-flow values) plus the same vault-pattern `.section-header`/`.section-body` collapse used by `#overlay-vault`, in a new `<style id="admin-shell-layout-fix">` block right after `#admin-clickability-fix` in `C:\Users\VENOM-NODE\nullpoint-index.html`.
+- Verified with a headless Playwright render (Python Playwright at `C:\Program Files\Python312\Scripts\playwright`, driven via `C:\Program Files\Python312\python.exe`) of the local file before deploying — screenshot confirmed pixel-accurate match to the reference: left sidebar with Shadow Store logo, grouped nav sections, topbar with breadcrumb/search/admin menu, and dashboard stat cards.
+- Validation: all 27 non-empty inline website scripts parse with zero errors.
+- Fresh pre-deploy rollback backup: `/var/backups/nullpoint/20260910-223937-admin-sidebar-nav-fix/index.html` (pre-fix SHA-256 `89b4e89344de230af359cca333603a3d5399aad47b0ed21f1eee17ae995971e8`).
+- Deployed only the website HTML atomically to `/var/www/html/index.html`. Local, remote, and public no-cache SHA-256 match: `f548488864c7eaf0baec1d0cf744045966754a61161ca772c75d9e847ef9757d`.
+- Live verification passed: website HTTP 200, `/health` returned `{"status":"ok","store":"ZEROPOINT"}`. No backend, database, or PM2 restart was performed. `pbot-backend` and `superbot` remain online; `streaming-bot` remains stopped.
+- This is the authoritative deployed admin-panel UI state for the next thread. Hard-refresh with `Ctrl+F5` when reviewing. If any other reference-fidelity gap remains (detail panel, table views, other admin tabs beyond the dashboard), diagnose with the same method: enumerate the live DOM's matching CSS rules rather than reading the stylesheet, since this file has multiple UI systems sharing generic class/tag names.
+
+## Admin panel tab-routing and dashboard persistence fix — 2026-09-11
+
+- Owner reported that clicking sidebar tabs changed the underlying content but left the Dashboard rendered on top.
+- Root cause: the admin-clone bridge had an incomplete route map. Sidebar names such as `settings`, `smsapi`, `suppliers`, `iptv`, `logs`, `banlogs`, `announcements`, and `aiogen` fell back to the dashboard view; legacy admin-tab names were also being inferred from the sidebar name.
+- Updated `C:\Users\VENOM-NODE\nullpoint-index.html` with explicit sidebar-view and legacy-tab maps. View switching now sets `hidden`, `aria-hidden`, and an inline display value so exactly one admin view can render at a time; the selected main content also scrolls to the top.
+- Validation: all 24 sidebar entries passed a headless Playwright transition test. Every entry produced exactly one visible view, the dashboard was hidden outside Dashboard, and the selected sidebar item matched the active view. All 27 non-empty inline scripts parsed successfully.
+- Fresh rollback backup: `/var/backups/nullpoint/20260911-013454-admin-tab-routing-fix/index.html`.
+- Deployed only the website HTML to `/var/www/html/index.html`; local and remote SHA-256 match: `c6c4b73d60db91fd5ecd17364b8f0077d108534981ba9c4423a1fb8f1812f682`.
+- Live verification: website HTTP 200 and `/health` returned `{"status":"ok","store":"ZEROPOINT"}`. No backend/database change or PM2 restart was performed; `pbot-backend` and `superbot` remain online, and `streaming-bot` remains stopped.
+- Hard-refresh the website with `Ctrl+F5` before reviewing the admin panel.
+- Companion transition-memory file `NULLPOINT_TRANSITION_MEMORY.md` was updated with the same section for redundancy.
