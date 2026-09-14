@@ -1051,3 +1051,12 @@ Safety/operations for the next thread:
 - Fresh rollback backup: `/var/backups/nullpoint/20260914-010951-admin-filter-row-native-select-fix/index.html`.
 - Local, VPS, and public no-cache SHA-256 match: `71b3ba6975a3fafa3d8a05a157609da0d6950f102535999a87018bdce8f4061d`.
 - All 29 inline website scripts parse. No backend, database, or PM2 restart occurred; `pbot-backend` and `superbot` remain online, and `streaming-bot` remains stopped.
+
+## Coupons filter status-row correction — 2026-09-14
+
+- Updated the Coupons admin toolbar to show separate same-row Active, Expired, and Scheduled dropdowns beside Search and Refresh, matching the supplied Shadow Store reference.
+- Each status control remains a native direct child of the single `.filter-bar`; the custom dropdown upgrader is skipped for these admin controls. Selecting a Hide option independently excludes that status from the server-backed table results.
+- Local headless verification confirmed the row contains `couponsSearch`, `couponsActiveFilter`, `couponsExpiredFilter`, `couponsScheduledFilter`, and Refresh, with no `.gx-select-wrap` wrappers.
+- Fresh rollback backup: `/var/backups/nullpoint/20260914-014410-coupons-filter-status-row/index.html`.
+- Local, VPS, and public no-cache SHA-256 match: `91b00626d413980811d225b8e8eb8e24bd31f1c848ef6af7e5c3e8e026e67dc6`.
+- All 29 inline website scripts parse; `/health` is HTTP 200. No backend, database, or PM2 restart occurred; `pbot-backend` and `superbot` remain online, and `streaming-bot` remains stopped.
