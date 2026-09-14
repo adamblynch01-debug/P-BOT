@@ -1031,3 +1031,14 @@ Safety/operations for the next thread:
 - Live verification: website HTTP 200 and `/health` returned `{"status":"ok","store":"ZEROPOINT"}`. No backend/database change or PM2 restart was performed; `pbot-backend` and `superbot` remain online, and `streaming-bot` remains stopped.
 - Hard-refresh the website with `Ctrl+F5` before reviewing the admin panel.
 - Companion transition-memory file `NULLPOINT_TRANSITION_MEMORY.md` was updated with the same section for redundancy.
+
+## Admin filter-bar permanent CSS fix — 2026-09-14
+
+- Fixed the Orders, Tickets, Reviews, and Coupons filter toolbars by adding a final stylesheet override after all existing CSS. The override forces each `.filter-bar` into a horizontal flex row with wrapping, compact auto-width selects (140–200px), compact search inputs (up to 260px), and neutralizes framework `w-full` sizing inside toolbars.
+- The affected controls remain a single parent `.filter-bar`; no per-select row/column wrappers were introduced.
+- Removed the separate `Account Generator` item from the admin sidebar. `AIO Generator` remains available; the underlying generator tab and handlers were not removed.
+- Deployed only `C:\Users\VENOM-NODE\nullpoint-index.html` atomically to `/var/www/html/index.html`.
+- Fresh rollback backup: `/var/backups/nullpoint/20260914-005030-admin-filter-row-fix/index.html`.
+- Local, VPS, and public no-cache SHA-256 match: `c05611e45f6e8911b3487911c42d529bd9fdadc8173869ec3bd286621c2093db`.
+- Validation passed: all 29 inline website scripts parsed; live page contains the final filter override and AIO Generator entry, has no sidebar `data-view="generator"` item, and `/health` returned HTTP 200 with `{"status":"ok","store":"ZEROPOINT"}`.
+- No backend, database, or PM2 restart occurred. `pbot-backend` and `superbot` remain online; `streaming-bot` remains stopped.
