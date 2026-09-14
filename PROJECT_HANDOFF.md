@@ -1042,3 +1042,12 @@ Safety/operations for the next thread:
 - Local, VPS, and public no-cache SHA-256 match: `c05611e45f6e8911b3487911c42d529bd9fdadc8173869ec3bd286621c2093db`.
 - Validation passed: all 29 inline website scripts parsed; live page contains the final filter override and AIO Generator entry, has no sidebar `data-view="generator"` item, and `/health` returned HTTP 200 with `{"status":"ok","store":"ZEROPOINT"}`.
 - No backend, database, or PM2 restart occurred. `pbot-backend` and `superbot` remain online; `streaming-bot` remains stopped.
+
+## Admin filter-bar native-select correction — 2026-09-14
+
+- Browser verification found the global custom-dropdown MutationObserver was wrapping admin filter selects in full-width `.gx-select-wrap gx-full` containers after insertion, despite the final toolbar CSS.
+- Updated the admin reference-view builder to mark only `.filter-bar select` controls with `data-gx-skip="1"` before the custom-dropdown upgrader runs. Orders, Tickets, Reviews, and Coupons now retain native select elements as direct children of one horizontal `.filter-bar` parent.
+- Local headless verification confirmed all four toolbars use `display:flex`, `flex-direction:row`, `flex-wrap:wrap`, compact auto-width selects, and no `.gx-select-wrap` children.
+- Fresh rollback backup: `/var/backups/nullpoint/20260914-010951-admin-filter-row-native-select-fix/index.html`.
+- Local, VPS, and public no-cache SHA-256 match: `71b3ba6975a3fafa3d8a05a157609da0d6950f102535999a87018bdce8f4061d`.
+- All 29 inline website scripts parse. No backend, database, or PM2 restart occurred; `pbot-backend` and `superbot` remain online, and `streaming-bot` remains stopped.
